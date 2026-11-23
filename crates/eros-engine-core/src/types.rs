@@ -174,6 +174,18 @@ pub enum UserAction {
     /// The user asks her to marry them (spec 2026-11-23 §7): the judge
     /// decides, a refusal drops nothing, and no event is placed.
     Propose,
+    /// The user asks her into a hot spring with them; a together action, as
+    /// `sauna_together` (spec 2026-11-23-hot-spring-fight-challenge-bet-
+    /// design.md §4).
+    HotSpringTogether,
+    /// The user asks her to fight beside them; a together action that only a
+    /// `fantasy` persona can have (spec 2026-11-23 §4).
+    FightTogether,
+    /// The user challenges her, or proposes a bet: social actions whose
+    /// answer says whether she takes it up; no winner is decided, and a
+    /// refusal drops nothing (spec 2026-11-23 §4).
+    Challenge,
+    Bet,
     Custom {
         text: String,
     },
@@ -259,6 +271,8 @@ impl UserAction {
             UserAction::ShowerTogether => Some(EventKind::ShoweringTogether),
             UserAction::BathTogether => Some(EventKind::BathingTogether),
             UserAction::SaunaTogether => Some(EventKind::SaunaTogether),
+            UserAction::HotSpringTogether => Some(EventKind::HotSpringTogether),
+            UserAction::FightTogether => Some(EventKind::FightingTogether),
             UserAction::ToiletTogether => Some(EventKind::UsingToiletTogether),
             UserAction::SmokeTogether => Some(EventKind::SmokingTogether),
             UserAction::FallAsleepTogether => Some(EventKind::AsleepTogether),
@@ -294,7 +308,7 @@ impl UserAction {
     /// giving something to keep is friendship, every physical gesture is
     /// romance. A refused tip drops nothing (spec 2026-10-11 §6), nor does
     /// seeing through a bluff, a threat or a trick (spec 2026-11-08 §2.2), nor
-    /// does turning down a date or a proposal.
+    /// does turning down a date, a proposal, a challenge or a bet.
     pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
             UserAction::Give { .. } | UserAction::Gift { .. } => Some(AffinityLine::Bond),
@@ -303,6 +317,8 @@ impl UserAction {
             | UserAction::Threaten
             | UserAction::Trick
             | UserAction::Propose
+            | UserAction::Challenge
+            | UserAction::Bet
             | UserAction::Date { .. } => None,
             _ => Some(AffinityLine::Chemistry),
         }
@@ -764,6 +780,47 @@ mod tests {
             UserAction::Propose,
         ] {
             assert_eq!(a.consumed(), None, "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §4.
+    #[test]
+    fn hot_spring_and_fight_together_name_their_events() {
+        for (a, wire, kind) in [
+            (
+                UserAction::HotSpringTogether,
+                "hot_spring_together",
+                EventKind::HotSpringTogether,
+            ),
+            (
+                UserAction::FightTogether,
+                "fight_together",
+                EventKind::FightingTogether,
+            ),
+        ] {
+            let v = serde_json::json!({ "type": wire });
+            assert_eq!(serde_json::to_value(&a).unwrap(), v);
+            assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+            assert_eq!(a.together_kind(), Some(kind), "{a:?}");
+            assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
+            assert!(!a.speaks_emotionally(), "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §4: social
+    /// actions that place nothing and cost nothing when turned down.
+    #[test]
+    fn a_challenge_and_a_bet_are_social_actions() {
+        for (a, wire) in [
+            (UserAction::Challenge, "challenge"),
+            (UserAction::Bet, "bet"),
+        ] {
+            let v = serde_json::json!({ "type": wire });
+            assert_eq!(serde_json::to_value(&a).unwrap(), v);
+            assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+            assert_eq!(a.together_kind(), None, "{a:?}");
+            assert_eq!(a.refusal_line(), None, "{a:?}");
+            assert!(!a.speaks_emotionally(), "{a:?}");
         }
     }
 

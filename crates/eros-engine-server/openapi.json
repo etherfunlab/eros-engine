@@ -5703,7 +5703,7 @@
       },
       "EventKindDto": {
         "type": "string",
-        "description": "A kind of life event. `taking_space`, `fell_out`, `traveling_together`,\n`bathing_together`, `on_a_date`, `showering_together`, `sauna_together`\nand the twelve kinds from `using_toilet_together` to `drinking_together`\nare placed by the engine, never drawn: they appear in responses only, and\na `kinds` filter that lists one is rejected.",
+        "description": "A kind of life event. `taking_space`, `fell_out`, `traveling_together`,\n`bathing_together`, `on_a_date`, `showering_together`, `sauna_together`\nthe twelve kinds from `using_toilet_together` to `drinking_together`,\n`hot_spring_together` and `fighting_together` are placed by the engine, never drawn: they appear in responses only, and\na `kinds` filter that lists one is rejected.",
         "enum": [
           "police_encounter",
           "animal_encounter",
@@ -5793,7 +5793,9 @@
           "stargazing_together",
           "horse_riding_together",
           "streaking_together",
-          "drinking_together"
+          "drinking_together",
+          "hot_spring_together",
+          "fighting_together"
         ]
       },
       "EventView": {
@@ -8246,7 +8248,7 @@
       },
       "UserActionDto": {
         "type": "object",
-        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip`, `bluff`, `threaten`, `trick` or `propose` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe. A `date` asks her\nout; accepted, it runs in a session of its own for its `duration`, and\nnothing else is sent to the persona's text sessions meanwhile. An accepted\n`shower_together`, `bath_together` or `sauna_together` starts a\n`showering_together` (30 minutes), `bathing_together` (30 minutes) or\n`sauna_together` (one hour) event, ending the incident under way; on a\ndate it starts none. Twelve more together actions do the same:\n`toilet_together` → `using_toilet_together`, `smoke_together` →\n`smoking_together`, `smoke_weed_together` → `smoking_weed_together` and\n`streak_together` → `streaking_together` (30 minutes each);\n`sex_together` → `having_sex_together`, `walk_together` →\n`walking_together`, `jog_together` → `jogging_together`, `yoga_together`\n→ `yoga_together`, `stargaze_together` → `stargazing_together`,\n`ride_horse_together` → `horse_riding_together` and `drink_together` →\n`drinking_together` (one hour each); `fall_asleep_together` →\n`asleep_together` (one to four hours, and she still answers). An accepted\n`smoke_together`, `smoke_weed_together` or `drink_together` also counts as\na `give` of one cigarette, herb or alcohol. `propose` asks her to marry\nthe user and starts no event.",
+        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\nthe line the action touches (`give` and `gift` → bond, every physical or custom action →\nchemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `challenge` or\n`bet` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe. A `date` asks her\nout; accepted, it runs in a session of its own for its `duration`, and\nnothing else is sent to the persona's text sessions meanwhile. An accepted\n`shower_together`, `bath_together` or `sauna_together` starts a\n`showering_together` (30 minutes), `bathing_together` (30 minutes) or\n`sauna_together` (one hour) event, ending the incident under way; on a\ndate it starts none. Twelve more together actions do the same:\n`toilet_together` → `using_toilet_together`, `smoke_together` →\n`smoking_together`, `smoke_weed_together` → `smoking_weed_together` and\n`streak_together` → `streaking_together` (30 minutes each);\n`sex_together` → `having_sex_together`, `walk_together` →\n`walking_together`, `jog_together` → `jogging_together`, `yoga_together`\n→ `yoga_together`, `stargaze_together` → `stargazing_together`,\n`ride_horse_together` → `horse_riding_together` and `drink_together` →\n`drinking_together` (one hour each); `fall_asleep_together` →\n`asleep_together` (one to four hours, and she still answers). An accepted\n`smoke_together`, `smoke_weed_together` or `drink_together` also counts as\na `give` of one cigarette, herb or alcohol. `hot_spring_together` starts\n`hot_spring_together` (one hour) and `fight_together` starts\n`fighting_together` (one to two hours); a `fight_together` to a persona\nwhose `setting` is not `fantasy` is refused and costs nothing. `propose`\nasks her to marry the user and starts no event. `challenge` and `bet`\nask whether she takes the user up on it; no winner is decided and a\nrefusal costs nothing.",
         "required": [
           "type"
         ],
@@ -8377,6 +8379,10 @@
           "streak_together",
           "drink_together",
           "propose",
+          "hot_spring_together",
+          "fight_together",
+          "challenge",
+          "bet",
           "custom",
           "tip",
           "gift",

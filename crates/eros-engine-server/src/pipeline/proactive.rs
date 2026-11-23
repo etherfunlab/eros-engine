@@ -370,7 +370,7 @@ fn kind_cue(
         | SaunaTogether | UsingToiletTogether | SmokingTogether | AsleepTogether
         | HavingSexTogether | WalkingTogether | SmokingWeedTogether | JoggingTogether
         | YogaTogether | StargazingTogether | HorseRidingTogether | StreakingTogether
-        | DrinkingTogether => {
+        | DrinkingTogether | HotSpringTogether | FightingTogether => {
             unreachable!("{kind:?} is never told")
         }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),

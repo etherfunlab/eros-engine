@@ -20743,6 +20743,48 @@ data: [DONE]\n\n";
         }
     }
 
+    /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §4.
+    #[test]
+    fn hot_spring_and_fight_are_picture_turns_and_a_challenge_or_bet_is_not() {
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
+        use eros_engine_core::types::UserAction::{
+            Bet, Challenge, FightTogether, HotSpringTogether,
+        };
+        let mut cases = Vec::new();
+        for a in [HotSpringTogether, FightTogether] {
+            cases.extend([
+                (a.clone(), Accept, ReplyText, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyImage, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyText, false, None),
+                (a.clone(), Refuse, ReplyTextImage, true, Some(ReplyText)),
+                (a, Refuse, ReplyText, true, None),
+            ]);
+        }
+        for a in [Challenge, Bet] {
+            assert!(!is_picture_action(&a), "{a:?}");
+            cases.extend([
+                (a.clone(), Accept, ReplyText, true, None),
+                (a.clone(), Accept, ReplyTextImage, true, None),
+                (a, Refuse, ReplyText, true, None),
+            ]);
+        }
+        for (a, response, ty, available, want) in cases {
+            let mut input = fixture_decision_input();
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a.clone());
+            }
+            let mut plan = pde::decide(&input);
+            plan.action_response = Some(response);
+            plan.action_type = ty;
+            assert_eq!(
+                picture_action(&input.event, &plan, available),
+                want,
+                "{a:?} {response:?} {ty:?} {available}"
+            );
+        }
+    }
+
     #[test]
     fn apply_forced_refusal_turns_only_an_accept() {
         use eros_engine_core::types::ActionResponse::{Accept, Refuse};

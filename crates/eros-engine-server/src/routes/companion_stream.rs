@@ -184,6 +184,10 @@ pub enum UserActionKind {
     StreakTogether,
     DrinkTogether,
     Propose,
+    HotSpringTogether,
+    FightTogether,
+    Challenge,
+    Bet,
     Custom,
     Tip,
     Gift,
@@ -333,7 +337,8 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
 /// the line the action touches (`give` and `gift` → bond, every physical or custom action →
-/// chemistry); a refused `tip`, `bluff`, `threaten`, `trick` or `propose` costs nothing.
+/// chemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `challenge` or
+/// `bet` costs nothing.
 /// An accepted `gift` joins the persona's items or wardrobe. A `date` asks her
 /// out; accepted, it runs in a session of its own for its `duration`, and
 /// nothing else is sent to the persona's text sessions meanwhile. An accepted
@@ -351,8 +356,13 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// `drinking_together` (one hour each); `fall_asleep_together` →
 /// `asleep_together` (one to four hours, and she still answers). An accepted
 /// `smoke_together`, `smoke_weed_together` or `drink_together` also counts as
-/// a `give` of one cigarette, herb or alcohol. `propose` asks her to marry
-/// the user and starts no event.
+/// a `give` of one cigarette, herb or alcohol. `hot_spring_together` starts
+/// `hot_spring_together` (one hour) and `fight_together` starts
+/// `fighting_together` (one to two hours); a `fight_together` to a persona
+/// whose `setting` is not `fantasy` is refused and costs nothing. `propose`
+/// asks her to marry the user and starts no event. `challenge` and `bet`
+/// ask whether she takes the user up on it; no winner is decided and a
+/// refusal costs nothing.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UserActionDto {
     #[serde(rename = "type")]
@@ -464,6 +474,10 @@ impl UserActionDto {
             UserActionKind::StreakTogether => UserAction::StreakTogether,
             UserActionKind::DrinkTogether => UserAction::DrinkTogether,
             UserActionKind::Propose => UserAction::Propose,
+            UserActionKind::HotSpringTogether => UserAction::HotSpringTogether,
+            UserActionKind::FightTogether => UserAction::FightTogether,
+            UserActionKind::Challenge => UserAction::Challenge,
+            UserActionKind::Bet => UserAction::Bet,
             UserActionKind::Custom => UserAction::Custom {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom")?,
@@ -4950,6 +4964,39 @@ mod validate_payload_tests {
 
     /// Spec 2026-11-20-together-actions-state-in-picture-and-genome-routes-
     /// design.md §5.
+    /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §4.
+    #[test]
+    fn hot_spring_fight_challenge_and_bet_map_one_to_one() {
+        for (wire, kind, want) in [
+            (
+                "hot_spring_together",
+                UserActionKind::HotSpringTogether,
+                UserAction::HotSpringTogether,
+            ),
+            (
+                "fight_together",
+                UserActionKind::FightTogether,
+                UserAction::FightTogether,
+            ),
+            (
+                "challenge",
+                UserActionKind::Challenge,
+                UserAction::Challenge,
+            ),
+            ("bet", UserActionKind::Bet, UserAction::Bet),
+        ] {
+            let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
+                .unwrap_or_else(|e| panic!("{wire}: {e}"));
+            assert_eq!(dto.to_core().unwrap(), want, "{wire}");
+            let view = UserActionView::from_metadata_action(
+                &serde_json::json!({"type": wire, "response": "refuse"}),
+            )
+            .unwrap_or_else(|| panic!("history parses a stored {wire}"));
+            assert_eq!(view.response, Some(ActionResponseDto::Refuse));
+            assert_eq!(view.action.kind, kind);
+        }
+    }
+
     #[test]
     fn the_together_actions_map_one_to_one() {
         for (wire, kind, want) in [

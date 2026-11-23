@@ -51,8 +51,8 @@ const MAX_EVENT_KEY_CHARS: usize = 128;
 
 /// A kind of life event. `taking_space`, `fell_out`, `traveling_together`,
 /// `bathing_together`, `on_a_date`, `showering_together`, `sauna_together`
-/// and the twelve kinds from `using_toilet_together` to `drinking_together`
-/// are placed by the engine, never drawn: they appear in responses only, and
+/// the twelve kinds from `using_toilet_together` to `drinking_together`,
+/// `hot_spring_together` and `fighting_together` are placed by the engine, never drawn: they appear in responses only, and
 /// a `kinds` filter that lists one is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -146,6 +146,8 @@ pub enum EventKindDto {
     HorseRidingTogether,
     StreakingTogether,
     DrinkingTogether,
+    HotSpringTogether,
+    FightingTogether,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -256,6 +258,8 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::HorseRidingTogether => EventKind::HorseRidingTogether,
             EventKindDto::StreakingTogether => EventKind::StreakingTogether,
             EventKindDto::DrinkingTogether => EventKind::DrinkingTogether,
+            EventKindDto::HotSpringTogether => EventKind::HotSpringTogether,
+            EventKindDto::FightingTogether => EventKind::FightingTogether,
         }
     }
 }
@@ -352,6 +356,8 @@ impl From<EventKind> for EventKindDto {
             EventKind::HorseRidingTogether => EventKindDto::HorseRidingTogether,
             EventKind::StreakingTogether => EventKindDto::StreakingTogether,
             EventKind::DrinkingTogether => EventKindDto::DrinkingTogether,
+            EventKind::HotSpringTogether => EventKindDto::HotSpringTogether,
+            EventKind::FightingTogether => EventKindDto::FightingTogether,
         }
     }
 }
@@ -2616,6 +2622,26 @@ mod tests {
 
     /// `taking_space` and `fell_out` are placed by the writers, never drawn:
     /// the DTO carries them for responses only.
+    /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §5.
+    #[test]
+    fn the_hot_spring_and_the_fight_are_placed_kinds_on_the_wire() {
+        for (kind, wire) in [
+            (EventKind::HotSpringTogether, "hot_spring_together"),
+            (EventKind::FightingTogether, "fighting_together"),
+        ] {
+            let dto = EventKindDto::from(kind);
+            assert_eq!(serde_json::to_value(dto).unwrap(), json!(wire));
+            assert_eq!(EventKind::from(dto), kind);
+            assert!(
+                serde_json::from_value::<DrawEventRequest>(
+                    json!({"event_key": "k", "kinds": [wire]})
+                )
+                .is_err(),
+                "{wire}"
+            );
+        }
+    }
+
     #[test]
     fn special_kinds_are_rejected_in_the_kinds_filter() {
         for kinds in [
