@@ -1,7 +1,7 @@
 # Modern-only kinds, the `focused` tone, four together actions and the user's gender in a picture — Design
 
 - **Date:** 2026-11-24
-- **Status:** Draft
+- **Status:** Approved
 - **Type:** Engine change. No migration. Additive wire change: four new
   action types, four new event kinds (placed, never drawn), one optional
   request field (`user_gender`), one new `metadata.tone` value. One new
