@@ -1593,8 +1593,18 @@ pub(crate) fn persona_traits(
         Employment, EventCategory, EventKind, Health, Outdoorsy, PersonaTraits, Setting,
     };
     let art = &persona.genome.art_metadata;
+    let female = meta_str(persona, "gender") == Some("female");
+    let species = species_word(persona);
+    let machine = species.as_deref().is_some_and(is_machine_species);
+    // Her period (spec 2026-11-24-period-cycle-design.md §4): the card's
+    // switch when it is a boolean, else a human has one and any other species
+    // has none.
+    let human = species
+        .as_deref()
+        .is_none_or(|w| w.is_empty() || w == "human");
+    let card_period = art.get("period").and_then(|v| v.as_bool());
     PersonaTraits {
-        female: meta_str(persona, "gender") == Some("female"),
+        female,
         health: meta_str(persona, "health")
             .and_then(Health::parse)
             .unwrap_or_default(),
@@ -1630,7 +1640,8 @@ pub(crate) fn persona_traits(
         outdoorsy: meta_str(persona, "outdoorsy")
             .and_then(Outdoorsy::parse)
             .unwrap_or_default(),
-        machine: species_word(persona).is_some_and(|w| is_machine_species(&w)),
+        machine,
+        period: female && !machine && card_period.unwrap_or(human),
     }
 }
 
@@ -5711,6 +5722,7 @@ mod tests {
                 },
                 outdoorsy: Default::default(),
                 machine: false,
+                period: true,
             }
         );
         p.genome.art_metadata =
@@ -5718,6 +5730,49 @@ mod tests {
         assert_eq!(persona_traits(&p), PersonaTraits::default());
         p.genome.art_metadata = serde_json::json!({});
         assert_eq!(persona_traits(&p), PersonaTraits::default());
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §4.
+    #[test]
+    fn period_trait_follows_the_card() {
+        use serde_json::json;
+        let has_period =
+            |gender: Option<&str>, species: Option<&str>, period: Option<serde_json::Value>| {
+                let mut art = serde_json::Map::new();
+                if let Some(g) = gender {
+                    art.insert("gender".into(), json!(g));
+                }
+                if let Some(sp) = species {
+                    art.insert("species".into(), json!(sp));
+                }
+                if let Some(v) = period {
+                    art.insert("period".into(), v);
+                }
+                let mut p = fixture_persona();
+                p.genome.art_metadata = serde_json::Value::Object(art);
+                persona_traits(&p).period
+            };
+        let f = Some("female");
+        for (gender, species, period, want) in [
+            (f, None, None, true),
+            (f, Some("human"), None, true),
+            (f, Some(" "), None, true),
+            (f, Some("elf"), None, false),
+            (f, Some("elf"), Some(json!(true)), true),
+            (f, None, Some(json!(false)), false),
+            (f, Some("robot"), Some(json!(true)), false),
+            (f, Some("android"), Some(json!(true)), false),
+            (Some("male"), None, Some(json!(true)), false),
+            (None, None, Some(json!(true)), false),
+            (f, None, Some(json!("yes")), true),
+            (f, Some("elf"), Some(json!("yes")), false),
+        ] {
+            assert_eq!(
+                has_period(gender, species, period.clone()),
+                want,
+                "{gender:?} {species:?} {period:?}"
+            );
+        }
     }
 
     #[test]

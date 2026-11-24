@@ -214,6 +214,23 @@ pub enum EventKind {
     HikingTogether,
 }
 
+/// Where a row under way sits: at most one event is live in each slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slot {
+    Foreground,
+    Background,
+    Cycle,
+}
+
+/// Every kind (`ALL`, then `SPECIAL`) that occupies `slot`.
+pub fn kinds_in(slot: Slot) -> Vec<EventKind> {
+    EventKind::ALL
+        .into_iter()
+        .chain(EventKind::SPECIAL)
+        .filter(|k| k.slot() == slot)
+        .collect()
+}
+
 impl EventKind {
     /// Every drawable kind, in draw order.
     pub const ALL: [EventKind; 70] = [
@@ -465,6 +482,17 @@ impl EventKind {
 
     pub fn is_background(self) -> bool {
         self.category().is_background()
+    }
+
+    /// The slot a row of this kind occupies while it is under way: the cycle
+    /// for `period` and `period_scare`, the background for every other `body`
+    /// or `trip` kind, the foreground for the rest.
+    pub fn slot(self) -> Slot {
+        match self {
+            EventKind::Period | EventKind::PeriodScare => Slot::Cycle,
+            k if k.is_background() => Slot::Background,
+            _ => Slot::Foreground,
+        }
     }
 
     /// Where the kind happens, as `outdoorsy` reads it (spec
@@ -877,8 +905,8 @@ impl Outdoorsy {
 /// none of them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PersonaTraits {
-    /// `art_metadata.gender` is `"female"`: the gate on `period` and the
-    /// shopping finds, and what takes `out_shopping` offline.
+    /// `art_metadata.gender` is `"female"`: the gate on the shopping finds
+    /// and `pregnancy_scare`, and what takes `out_shopping` offline.
     pub female: bool,
     pub health: Health,
     pub prefer_trip: bool,
@@ -909,11 +937,24 @@ pub struct PersonaTraits {
     pub habits: Habits,
     /// `art_metadata.outdoorsy`: scales the outdoor and indoor kinds.
     pub outdoorsy: Outdoorsy,
-    /// `art_metadata.species` is `robot` or `android`: never draws `period`,
-    /// `period_scare`, `pregnancy_scare` or `using_toilet` (spec 2026-11-19-
-    /// vehicles-actions-species-design.md §5; spec 2026-11-20-together-actions-
-    /// state-in-picture-and-genome-routes-design.md §4).
+    /// `art_metadata.species` is `robot` or `android`: never draws
+    /// `pregnancy_scare` or `using_toilet`, and never has a period (spec
+    /// 2026-11-19-vehicles-actions-species-design.md §5; spec 2026-11-20-
+    /// together-actions-state-in-picture-and-genome-routes-design.md §4).
     pub machine: bool,
+    /// She has a period (spec 2026-11-24-period-cycle-design.md §4): a female
+    /// human unless the card says `period: false`, a female of another
+    /// species that is no machine only when it says `period: true`. The gate
+    /// on `period` and `period_scare`, and what gives her a cycle.
+    pub period: bool,
+}
+
+impl PersonaTraits {
+    /// `Some(health)` for a persona with a period: what the cycle reads to
+    /// size it. `None` for one with no cycle.
+    pub fn cycle_health(&self) -> Option<Health> {
+        self.period.then_some(self.health)
+    }
 }
 
 fn passes_gate(
@@ -935,8 +976,8 @@ fn passes_gate(
         EventKind::SmokingWeed => persona.habits.drug == Some(true),
         EventKind::WantToQuitJob => persona.employed != Employment::Free,
         EventKind::SawBag | EventKind::SawClothes => persona.female,
-        EventKind::Period => persona.female && !persona.machine,
-        EventKind::PeriodScare => persona.female && !persona.machine && rung >= CONFIDE_MIN_RUNG,
+        EventKind::Period => persona.period,
+        EventKind::PeriodScare => persona.period && rung >= CONFIDE_MIN_RUNG,
         EventKind::PregnancyScare => persona.female && !persona.machine && rung >= DESIRE_MIN_RUNG,
         EventKind::UsingToilet => !persona.machine,
         _ => true,
@@ -1461,6 +1502,7 @@ mod tests {
     fn female() -> PersonaTraits {
         PersonaTraits {
             female: true,
+            period: true,
             ..Default::default()
         }
     }
@@ -3952,6 +3994,7 @@ mod tests {
     fn a_machine_never_draws_the_period_kinds() {
         let machine = PersonaTraits {
             machine: true,
+            period: false,
             ..female()
         };
         for k in [Period, PeriodScare, PregnancyScare] {
@@ -4077,5 +4120,95 @@ mod tests {
             pick_with(&machine, None, 3, &[], &[Bathing], rolls(0.0, 0.0)),
             Some(Bathing)
         );
+    }
+
+    #[test]
+    fn the_period_trait_gates_period_and_its_scare() {
+        let no_period = PersonaTraits {
+            period: false,
+            ..female()
+        };
+        // The trait alone decides, not gender: a persona the card gives a
+        // period draws it.
+        let card_period = PersonaTraits {
+            period: true,
+            ..Default::default()
+        };
+        for k in [Period, PeriodScare] {
+            assert_eq!(
+                pick_with(&no_period, None, 3, &[], &[k], rolls(0.0, 0.0)),
+                None,
+                "{k:?}"
+            );
+            assert_eq!(
+                pick_with(&card_period, None, 3, &[], &[k], rolls(0.0, 0.0)),
+                Some(k),
+                "{k:?}"
+            );
+        }
+        // `pregnancy_scare` keeps reading gender.
+        assert_eq!(
+            pick_with(
+                &card_period,
+                None,
+                3,
+                &[],
+                &[PregnancyScare],
+                rolls(0.0, 0.0)
+            ),
+            None
+        );
+        assert_eq!(
+            pick_with(&no_period, None, 3, &[], &[PregnancyScare], rolls(0.0, 0.0)),
+            Some(PregnancyScare)
+        );
+    }
+
+    #[test]
+    fn cycle_health_is_the_health_of_a_persona_with_a_period() {
+        assert_eq!(PersonaTraits::default().cycle_health(), None);
+        for health in [Health::Weak, Health::Normal, Health::Strong] {
+            let traits = PersonaTraits {
+                health,
+                period: true,
+                ..Default::default()
+            };
+            assert_eq!(traits.cycle_health(), Some(health));
+            let none = PersonaTraits {
+                health,
+                ..Default::default()
+            };
+            assert_eq!(none.cycle_health(), None);
+        }
+    }
+
+    #[test]
+    fn slots() {
+        for k in [Period, PeriodScare] {
+            assert_eq!(k.slot(), Slot::Cycle, "{k:?}");
+        }
+        for k in [Sick, LongTrip, TravelingTogether] {
+            assert_eq!(k.slot(), Slot::Background, "{k:?}");
+        }
+        for k in [PregnancyScare, Asleep, OnADate] {
+            assert_eq!(k.slot(), Slot::Foreground, "{k:?}");
+        }
+        // The three slots partition every kind, `ALL` and `SPECIAL` alike.
+        let mut all: Vec<EventKind> = EventKind::ALL
+            .into_iter()
+            .chain(EventKind::SPECIAL)
+            .collect();
+        let mut parted: Vec<EventKind> = [Slot::Foreground, Slot::Background, Slot::Cycle]
+            .into_iter()
+            .flat_map(kinds_in)
+            .collect();
+        all.sort_by_key(|k| k.as_str());
+        parted.sort_by_key(|k| k.as_str());
+        assert_eq!(all, parted);
+        // A slot other than the cycle still follows the category.
+        for k in kinds_in(Slot::Background) {
+            assert!(k.is_background(), "{k:?}");
+        }
+        assert!(Period.is_background());
     }
 }
