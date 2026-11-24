@@ -8213,6 +8213,14 @@
             ],
             "description": "ISO 3166-1 alpha-2 country, as the client received it. Absent ⇒ derived\nfrom `user_timezone`; unknown ⇒ no public holidays."
           },
+          "user_gender": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The user's gender, `male` or `female`. Read by the image composer alone,\nand only for a picture of something she does with the user; any other\nvalue reads as absent. Takes no part in any judgment or gate.",
+            "example": "male"
+          },
           "user_region": {
             "type": [
               "string",

@@ -1868,6 +1868,7 @@ mod tests {
                     image: None,
                     quote: Default::default(),
                     user_locale: Default::default(),
+                    user_gender: None,
                     action,
                     outfit: None,
                 },

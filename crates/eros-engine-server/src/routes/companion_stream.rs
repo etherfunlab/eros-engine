@@ -579,7 +579,6 @@ pub enum UserGender {
 impl UserGender {
     /// `"male"` / `"female"` exactly; anything else, a non-string included,
     /// is `None`.
-    #[allow(dead_code)]
     pub(crate) fn read(raw: Option<&serde_json::Value>) -> Option<Self> {
         match raw?.as_str()? {
             "male" => Some(Self::Male),
@@ -635,6 +634,12 @@ pub struct StreamSendRequest {
     /// only beside `user_country`; unknown ⇒ national holidays.
     #[serde(default)]
     pub user_region: Option<String>,
+    /// The user's gender, `male` or `female`. Read by the image composer alone,
+    /// and only for a picture of something she does with the user; any other
+    /// value reads as absent. Takes no part in any judgment or gate.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, example = "male")]
+    pub user_gender: Option<serde_json::Value>,
     /// Optional action this turn carries besides the text (see
     /// [`UserActionDto`]). With an action, `content` may be empty.
     #[serde(default)]
@@ -1208,6 +1213,7 @@ pub async fn send_message_stream(
     let quote = resolve_quote(&chat_repo, session_id, req.reply_to_message_id).await?;
 
     let persisted_metadata = build_user_row_metadata(&req, quote.as_ref());
+    let user_gender = UserGender::read(req.user_gender.as_ref());
     let params_value = serde_json::to_value(crate::routes::companion_async::QueuedTurnParams {
         tier: req.tier.clone(),
         memory_scope: req.memory_scope,
@@ -1220,6 +1226,7 @@ pub async fn send_message_stream(
         user_timezone: crate::holiday::bounded_raw(req.user_timezone.as_deref()),
         user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
         user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
+        user_gender,
         action: req.action.clone(),
         outfit: validated_outfit(req.outfit.as_deref()).ok().flatten(),
         byok: req.byok.as_ref().map(|b| crate::byok::QueuedByok {
@@ -1274,6 +1281,7 @@ pub async fn send_message_stream(
                         req.user_country.as_deref(),
                         req.user_region.as_deref(),
                     ),
+                    user_gender,
                     action: req.action.as_ref().and_then(|a| a.to_core().ok()),
                     outfit: validated_outfit(req.outfit.as_deref()).ok().flatten(),
                 };
@@ -1532,6 +1540,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_send_body_takes_any_user_gender_without_failing() {
+        for g in [
+            json!("male"),
+            json!("other"),
+            json!(1),
+            json!(true),
+            json!(null),
+        ] {
+            let body = json!({"content": "hi", "client_msg_id": "c1", "user_gender": g});
+            let req: StreamSendRequest = serde_json::from_value(body).unwrap();
+            // The wire value is kept as sent; reading it is `UserGender::read`'s job.
+            assert_eq!(
+                UserGender::read(req.user_gender.as_ref()),
+                (g == json!("male")).then_some(UserGender::Male),
+                "{g}"
+            );
+        }
+        let absent: StreamSendRequest =
+            serde_json::from_value(json!({"content": "hi", "client_msg_id": "c1"})).unwrap();
+        assert!(absent.user_gender.is_none());
+
+        let req: StreamSendRequest = serde_json::from_value(
+            json!({"content": "hi", "client_msg_id": "c1", "user_gender": "male"}),
+        )
+        .unwrap();
+        let meta = build_user_row_metadata(&req, None);
+        assert!(
+            meta.as_ref().and_then(|m| m.get("user_gender")).is_none(),
+            "the gender is not written to the user row: {meta:?}"
+        );
+    }
+
     fn req_with_tier(tier: Option<&str>) -> StreamSendRequest {
         StreamSendRequest {
             content: "hi".into(),
@@ -1547,6 +1588,7 @@ mod tests {
             user_timezone: None,
             user_country: None,
             user_region: None,
+            user_gender: None,
             action: None,
             byok: None,
             outfit: None,
@@ -4679,6 +4721,7 @@ mod validate_payload_tests {
             user_timezone: None,
             user_country: None,
             user_region: None,
+            user_gender: None,
             action: None,
             byok: None,
             outfit: None,
@@ -4780,6 +4823,7 @@ mod validate_payload_tests {
             user_timezone: None,
             user_country: None,
             user_region: None,
+            user_gender: None,
             action: None,
             byok: None,
             outfit: None,

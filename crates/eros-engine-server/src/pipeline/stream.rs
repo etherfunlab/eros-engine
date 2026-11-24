@@ -4412,7 +4412,6 @@ pub(crate) fn picture_state_of(
 /// a kind `[此刻状态]` names is one she shares with the user, resolved with
 /// `starting` as `picture_state_of` does (spec 2026-11-24-focused-tone-four-
 /// together-actions-and-user-gender-design.md §7.2). Pure.
-#[allow(dead_code)]
 pub(crate) fn partner_gender_of(
     current: &eros_engine_store::events::CurrentEvents,
     starting: Option<eros_engine_core::events::EventKind>,
@@ -5004,6 +5003,9 @@ pub struct PersistedUserMessage {
     /// The user's locale as the request carried it, resolved
     /// (spec 2026-09-26 §4.1). Feeds `[now]`.
     pub user_locale: crate::holiday::UserLocale,
+    /// The user's gender as the request stated it. Only the image composer
+    /// reads it (spec 2026-11-24 §7).
+    pub user_gender: Option<crate::routes::companion_stream::UserGender>,
     /// The action this turn carries besides the text (spec 2026-10-05).
     pub action: Option<eros_engine_core::types::UserAction>,
     /// The outfit the caller named for this turn (spec 2026-10-12 §6).
@@ -6225,10 +6227,11 @@ pub(crate) fn run_stream_with(
                 // is stored only with her answer, and never on a date (spec
                 // 2026-11-20-together-actions-state-in-picture-and-genome-
                 // routes-design.md §5).
-                let picture_state = picture_state_of(
-                    &current,
-                    accepted_together(user_msg.action.as_ref(), plan.action_response),
-                );
+                let placed = accepted_together(user_msg.action.as_ref(), plan.action_response);
+                let picture_state = picture_state_of(&current, placed);
+                // The user's gender, when what she is doing is something she
+                // shares with them (spec 2026-11-24 §7.2).
+                let partner_gender = partner_gender_of(&current, placed, user_msg.user_gender);
                 let mut image_only_done = false;
                 let mut image_only_produced: Vec<crate::pipeline::post_process::ProducedMessage> =
                     Vec::new();
@@ -6256,7 +6259,7 @@ pub(crate) fn run_stream_with(
                         user_msg.session_id,
                         body_state.as_deref(),
                         picture_state.as_deref(),
-                        None,
+                        partner_gender,
                     )
                     .await;
                     let subject = img.subject;
@@ -6631,7 +6634,7 @@ pub(crate) fn run_stream_with(
                                 session_id_c,
                                 body_state_c.as_deref(),
                                 picture_state_c.as_deref(),
-                                None,
+                                partner_gender,
                             )
                             .await
                         })))
@@ -6832,7 +6835,7 @@ pub(crate) fn run_stream_with(
                                     user_msg.session_id,
                                     body_state.as_deref(),
                                     picture_state.as_deref(),
-                                    None,
+                                    partner_gender,
                                 )
                                 .await
                             }
@@ -6848,7 +6851,7 @@ pub(crate) fn run_stream_with(
                                     user_msg.session_id,
                                     body_state.as_deref(),
                                     picture_state.as_deref(),
-                                    None,
+                                    partner_gender,
                                 )
                                 .await
                             }
@@ -8792,6 +8795,7 @@ mod tests {
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -9176,6 +9180,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -9276,6 +9281,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -9415,6 +9421,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -9562,6 +9569,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -9675,6 +9683,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -9779,6 +9788,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -9893,6 +9903,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -10091,6 +10102,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -10240,6 +10252,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -10340,6 +10353,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: Some("红色旗袍".into()),
             },
@@ -10454,6 +10468,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -10552,6 +10567,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: Some(eros_engine_core::types::UserAction::Kiss),
                 outfit: None,
             },
@@ -11188,6 +11204,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -11316,6 +11333,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -11427,6 +11445,7 @@ data: [DONE]\n\n";
                 }),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: Some(action),
                 outfit: outfit.map(String::from),
             },
@@ -11780,6 +11799,7 @@ data: [DONE]\n\n";
                 image: image.then(Default::default),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: Some(action),
                 outfit: None,
             },
@@ -12111,6 +12131,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -12305,6 +12326,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -12451,6 +12473,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -12624,6 +12647,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -12811,6 +12835,7 @@ data: [DONE]\n\n";
                 image: Some(crate::routes::companion_stream::ImageReplyParams::default()),
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -12986,6 +13011,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -13866,6 +13892,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -13996,6 +14023,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -14519,6 +14547,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -14665,6 +14694,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -14834,6 +14864,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -14953,6 +14984,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -15071,6 +15103,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -15185,6 +15218,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -15298,6 +15332,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -15429,6 +15464,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -15633,6 +15669,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -15761,6 +15798,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -15886,6 +15924,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -16072,6 +16111,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -16275,6 +16315,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -16427,6 +16468,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -16566,6 +16608,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -16727,6 +16770,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -16883,6 +16927,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -16993,6 +17038,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -17128,6 +17174,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -17260,6 +17307,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -17418,6 +17466,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -17615,6 +17664,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -17764,6 +17814,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -17922,6 +17973,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -18103,6 +18155,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -18336,6 +18389,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -18488,6 +18542,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -18623,6 +18678,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -18800,6 +18856,7 @@ data: [DONE]\n\n";
                     trigger: None,
                 }),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -18920,6 +18977,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -19057,6 +19115,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 // Tip action: the rule PDE's action branch always replies (never
                 // Ghost), so the live-burst path is guaranteed to run.
                 action: Some(eros_engine_core::types::UserAction::Tip { amount_usd: 1.0 }),
@@ -19212,6 +19271,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: Some(eros_engine_core::types::UserAction::Tip { amount_usd: 1.0 }),
                 outfit: None,
             },
@@ -19452,6 +19512,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -19570,6 +19631,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -19715,6 +19777,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -19812,6 +19875,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -20919,6 +20983,7 @@ data: [DONE]\n\n";
             image: None,
             quote: None,
             user_locale: Default::default(),
+            user_gender: None,
             action: None,
             outfit: None,
         }
@@ -22091,6 +22156,7 @@ data: [DONE]\n\n";
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -24062,6 +24128,7 @@ data: [DONE]\n\n"
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -24303,6 +24370,7 @@ data: [DONE]\n\n"
             image: None,
             quote: Default::default(),
             user_locale: Default::default(),
+            user_gender: None,
             action: Some(eros_engine_core::types::UserAction::Kiss),
             outfit: None,
         };
@@ -24516,6 +24584,7 @@ data: [DONE]\n\n"
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: Some(action),
                 outfit,
             },
@@ -25319,6 +25388,7 @@ data: [DONE]\n\n"
                 image,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -27131,6 +27201,7 @@ data: [DONE]\n\n"
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action,
                 outfit: None,
             },
@@ -27754,6 +27825,7 @@ data: [DONE]\n\n"
                 image,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: Some(action),
                 outfit: None,
             },
@@ -28651,6 +28723,7 @@ data: [DONE]\n\n"
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: None,
                 outfit: None,
             },
@@ -28788,6 +28861,156 @@ data: [DONE]\n\n"
                 .await
                 .unwrap();
         assert_eq!(Some(date_ends), s.activity.ends_at, "the date goes on");
+    }
+
+    /// A date scene's one turn: an accepted `sauna_together` with a picture,
+    /// the body carrying `user_gender` when `gender` is given. The scene and
+    /// the turn's user row.
+    async fn sauna_picture_turn(
+        pool: &PgPool,
+        verdict_action: &str,
+        gender: Option<&str>,
+    ) -> (DateScene, Uuid) {
+        let s = date_scene(
+            pool,
+            serde_json::json!({
+                "action": verdict_action, "inner_state": "", "action_response": "accept",
+            }),
+            "[tasks.chat_image_prompt_compose]\nmodel=\"composer\"\n",
+        )
+        .await;
+        let mut body = serde_json::json!({
+            "content": "",
+            "action": {"type": "sauna_together"},
+            "image": {},
+        });
+        if let Some(g) = gender {
+            body["user_gender"] = serde_json::json!(g);
+        }
+        let (frames, umid) = s.send(1, body).await;
+        assert!(
+            frames.iter().any(|f| f["type"] == "image_request"),
+            "{frames:?}"
+        );
+        (s, umid)
+    }
+
+    /// The user message of the turn's one composer call.
+    async fn the_composer_payload(mock: &wiremock::MockServer) -> String {
+        let reqs: Vec<_> = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("\"model\":\"composer\""))
+            .collect();
+        assert_eq!(reqs.len(), 1, "one composer call");
+        composer_payload(&reqs[0])
+    }
+
+    /// The `partner_gender` of the turn's one compose audit row.
+    async fn audited_partner_gender(pool: &PgPool) -> serde_json::Value {
+        let inputs: serde_json::Value =
+            sqlx::query_scalar("SELECT inputs FROM engine.chat_images_events")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        inputs["partner_gender"].clone()
+    }
+
+    /// Spec 2026-11-24 §7: the gender on the send body reaches the composer
+    /// and its audit snapshot for a picture of something she does with the
+    /// user, and stays in the turn's queue snapshot.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_together_action_tells_the_composer_the_users_gender(pool: PgPool) {
+        let (s, umid) = sauna_picture_turn(&pool, "reply_text", Some("male")).await;
+        let payload = the_composer_payload(&s.mock).await;
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起蒸桑拿\n\n[对方]\n男性\n"),
+            "{payload}"
+        );
+        assert_eq!(audited_partner_gender(&pool).await, "男性");
+        let params: serde_json::Value = sqlx::query_scalar(
+            "SELECT params FROM engine.chat_turn_queue WHERE user_message_id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(params["user_gender"], "male", "{params}");
+    }
+
+    /// The picture-only turn composes in its own place; it hears the gender
+    /// as well.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_picture_only_turn_tells_the_composer_the_users_gender(pool: PgPool) {
+        let (s, _) = sauna_picture_turn(&pool, "reply_image", Some("female")).await;
+        let payload = the_composer_payload(&s.mock).await;
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起蒸桑拿\n\n[对方]\n女性\n"),
+            "{payload}"
+        );
+        assert_eq!(audited_partner_gender(&pool).await, "女性");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn without_a_gender_the_composer_request_is_as_before(pool: PgPool) {
+        let (s, umid) = sauna_picture_turn(&pool, "reply_text", None).await;
+        let payload = the_composer_payload(&s.mock).await;
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起蒸桑拿\n\n[最近场景]"),
+            "{payload}"
+        );
+        assert!(!payload.contains("[对方]"), "{payload}");
+        assert_eq!(audited_partner_gender(&pool).await, "");
+        let params: serde_json::Value = sqlx::query_scalar(
+            "SELECT params FROM engine.chat_turn_queue WHERE user_message_id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(params.get("user_gender").is_none(), "{params}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_users_gender_never_reaches_the_judge_or_the_chat_prompt(pool: PgPool) {
+        let (s, umid) = sauna_picture_turn(&pool, "reply_text", Some("female")).await;
+        assert!(the_composer_payload(&s.mock)
+            .await
+            .contains("[对方]\n女性\n"));
+
+        let bodies: Vec<String> = s
+            .mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let judge: Vec<_> = bodies.iter().filter(|b| b.contains("pde/judge")).collect();
+        let chat: Vec<_> = bodies
+            .iter()
+            .filter(|b| b.contains("deepseek/x") && b.contains("\"stream\":true"))
+            .collect();
+        assert!(!judge.is_empty() && !chat.is_empty(), "{bodies:?}");
+        for body in judge.into_iter().chain(chat) {
+            assert!(!body.contains("女性"), "{body}");
+            assert!(!body.contains("user_gender"), "{body}");
+        }
+
+        // Nor is it written to the user row.
+        let metadata: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT metadata FROM engine.chat_messages WHERE id = $1")
+                .bind(umid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let metadata = metadata.unwrap_or_default().to_string();
+        assert!(
+            !metadata.contains("user_gender") && !metadata.contains("female"),
+            "{metadata}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -29150,6 +29373,7 @@ data: [DONE]\n\n"
                 image: None,
                 quote: Default::default(),
                 user_locale: Default::default(),
+                user_gender: None,
                 action: Some(action),
                 outfit: None,
             },
