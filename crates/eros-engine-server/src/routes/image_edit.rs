@@ -335,6 +335,7 @@ fn edit_turn_plan(action: ActionType) -> ActionPlan {
         image_ref: ImageRef::Previous,
         aspect_ratio: None,
         action_response: None,
+        refusal_free: false,
     }
 }
 

@@ -609,6 +609,7 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
         image_ref: ImageRef::Previous,
         aspect_ratio: None,
         action_response: None,
+        refusal_free: false,
     };
     let repo = eros_engine_store::events::EventRepo { pool: &state.pool };
     let current = repo

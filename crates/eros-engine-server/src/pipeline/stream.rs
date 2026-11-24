@@ -3110,10 +3110,12 @@ fn build_pde_ctx(
     // incompatible pair cannot have, spec 2026-11-08-strip-and-world-setting-
     // design.md §2.1, and so is a together action, spec 2026-11-20-
     // together-actions-state-in-picture-and-genome-routes-design.md §5 and
-    // 2026-11-23-twelve-together-actions-and-propose-design.md §4.1, §5; a
-    // date the gate turns down, spec 2026-11-12-activity-sub-session-
-    // design.md §4.3; a proposal or break-up the status does not allow, spec
-    // 2026-11-23-affinity-50-design.md §8) states the outcome, not the reason.
+    // 2026-11-23-twelve-together-actions-and-propose-design.md §4.1, §5;
+    // sex or water her period's roll refused, spec 2026-11-24-period-cycle-
+    // design.md §8; a date the gate turns down, spec 2026-11-12-activity-sub-
+    // session-design.md §4.3; a proposal or break-up the status does not
+    // allow, spec 2026-11-23-affinity-50-design.md §8) states the outcome,
+    // not the reason.
     let action_line = match &input.event {
         eros_engine_core::types::Event::UserMessage {
             action: Some(a), ..
@@ -5411,6 +5413,18 @@ pub(crate) fn run_stream_with(
         // challenge-bet-design.md §4, 2026-11-24-focused-tone-four-together-
         // actions-and-user-gender-design.md §6): refused, and free.
         let world_refused = pde::world_ruled_out(&input.event, traits.setting);
+        // During her period sex and the water actions are rolled (spec
+        // 2026-11-24-period-cycle-design.md §8): refused, and free. The rule-
+        // outs above come first and keep their own outcomes. A late period
+        // is not her period.
+        let on_period = current
+            .cycle
+            .as_ref()
+            .is_some_and(|c| c.kind == eros_engine_core::events::EventKind::Period);
+        let period_refused = !strip_refused
+            && !together_refused
+            && !world_refused
+            && pde::period_refuses(&input.event, on_period, rand::thread_rng().gen());
         // A date she cannot go on (spec 2026-11-12-activity-sub-session-
         // design.md §4.3): she is offline, or a `mid` one is asked below bond
         // tier 2. On the decayed affinity this turn reads. Another date of
@@ -5452,6 +5466,7 @@ pub(crate) fn run_stream_with(
             || strip_refused
             || together_refused
             || world_refused
+            || period_refused
             || date_refused
             || status_refused;
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
@@ -5607,6 +5622,11 @@ pub(crate) fn run_stream_with(
                 plan.action_response,
             );
         }
+        // A refusal her period's roll ruled drops no line (spec 2026-11-24-
+        // period-cycle-design.md §8). The roll cannot be recomputed later, so
+        // the plan carries it to post-process: after every `plan_for`, which
+        // builds a plan without it.
+        plan.refusal_free = period_refused;
         // An accepted strip undresses her this turn (spec 2026-11-08-strip-and-
         // world-setting-design.md §2.2), over the judge and a named outfit:
         // after every `plan_for`, which would put a named outfit back.
@@ -7624,6 +7644,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: aspect.map(str::to_string),
             action_response: None,
+            refusal_free: false,
         }
     }
 
@@ -11672,6 +11693,31 @@ data: [DONE]\n\n";
         image: bool,
         art: Option<serde_json::Value>,
     ) -> (Vec<ProtocolFrame>, String, Uuid) {
+        let (frames, mock, umid) =
+            run_together_turn_mock(pool, action, response, compatible, events, image, art).await;
+        let composer = mock
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("\"model\":\"composer\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (frames, composer, umid)
+    }
+
+    /// [`run_together_turn_in`] returning the mock, for request inspection,
+    /// in place of the composer bodies.
+    async fn run_together_turn_mock(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        response: Option<&str>,
+        compatible: bool,
+        events: &[EventSeed],
+        image: bool,
+        art: Option<serde_json::Value>,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -11807,16 +11853,7 @@ data: [DONE]\n\n";
         )
         .collect()
         .await;
-        let composer = mock
-            .received_requests()
-            .await
-            .expect("recorded requests")
-            .iter()
-            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
-            .filter(|b| b.contains("\"model\":\"composer\""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        (frames, composer, umid)
+        (frames, mock, umid)
     }
 
     /// `(event_key, session_id, started_at, ends_at)` of every event of `kind`.
@@ -12023,6 +12060,72 @@ data: [DONE]\n\n";
         let placed = events_of_kind(&pool, "cycling_together").await;
         assert_eq!(placed.len(), 1, "{placed:?}");
         assert_eq!(placed[0].0, format!("action:{umid}:cycling_together"));
+    }
+
+    /// One `sex_together` turn of a female human with `events` seeded, on
+    /// romance-compatible scopes, the judge answering `judge` (`None`: no
+    /// judge, so the rule engine accepts). Returns whether the turn was
+    /// refused, once it has checked that the judge was told 「这次你不会答应」
+    /// exactly then, that an accept placed the event and a refusal did not,
+    /// and that neither dropped a line.
+    async fn period_sex_turn(pool: &PgPool, events: &[EventSeed], judge: Option<&str>) -> bool {
+        let (frames, mock, umid) = run_together_turn_mock(
+            pool,
+            eros_engine_core::types::UserAction::SexTogether,
+            judge,
+            true,
+            events,
+            false,
+            Some(serde_json::json!({"gender": "female"})),
+        )
+        .await;
+        let refused = action_response_of(&frames) == "refuse";
+        if judge.is_some() {
+            let reqs = mock.received_requests().await.unwrap();
+            assert_eq!(
+                judge_request(&reqs).contains("这次你不会答应"),
+                refused,
+                "the judge is told exactly when the turn refuses"
+            );
+        }
+        let key = format!("action:{umid}:having_sex_together");
+        let placed = events_of_kind(pool, "having_sex_together")
+            .await
+            .into_iter()
+            .filter(|(k, ..)| *k == key)
+            .count();
+        assert_eq!(placed, usize::from(!refused), "refused={refused}");
+        let (context, _) = turn_affinity_row(pool, umid).await;
+        assert!(
+            context.get("tier_drop").is_none(),
+            "refused={refused}: {context}"
+        );
+        refused
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §8: during her period a
+    /// `sex_together` is rolled before the judge, and with no judge too. The
+    /// judge accepts, so a refusal is the roll's; the roll is random, so the
+    /// turns run until both outcomes have been seen. Her period started 28
+    /// days and an hour ago: the next one began an hour before the turn.
+    /// With no `period` row nothing is rolled.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn her_period_turns_sex_down_before_the_judge(pool: PgPool) {
+        let day = 24 * 60;
+        let period = [ev("period", 28 * day + 60, -(25 * day + 60))];
+        for judge in [Some("accept"), None] {
+            let mut seen = [false; 2];
+            for _ in 0..40 {
+                seen[usize::from(period_sex_turn(&pool, &period, judge).await)] = true;
+                if seen == [true; 2] {
+                    break;
+                }
+            }
+            assert_eq!(seen, [true; 2], "{judge:?}: [accepted, refused]");
+        }
+        for _ in 0..8 {
+            assert!(!period_sex_turn(&pool, &[], Some("accept")).await);
+        }
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
