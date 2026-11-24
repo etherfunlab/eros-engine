@@ -3154,7 +3154,8 @@ mod tests {
 
     /// Spec 2026-11-08-strip-and-world-setting-design.md §4; spec
     /// 2026-11-16-prune-life-events-design.md §4.3; spec
-    /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §4.
+    /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
+    /// §4, §6.
     const MODERN_ONLY: [EventKind; 21] = [
         OnACruise,
         OnABus,

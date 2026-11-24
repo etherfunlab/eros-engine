@@ -108,16 +108,18 @@ pub fn together_ruled_out(event: &Event, machine: bool) -> bool {
 
 /// Whether this turn's action is one the persona's world does not have,
 /// ruled out before the judge (spec 2026-11-23-hot-spring-fight-challenge-
-/// bet-design.md §4): a `fight_together` when `setting` is not `fantasy`.
-/// Such a refusal drops no line.
+/// bet-design.md §4; spec 2026-11-24-focused-tone-four-together-actions-and-
+/// user-gender-design.md §6): a together action whose event does not fit
+/// `setting`, so a `fight_together` outside `fantasy` and a `cycle_together`
+/// in it. Such a refusal drops no line.
 pub fn world_ruled_out(event: &Event, setting: crate::events::Setting) -> bool {
     matches!(
         event,
         Event::UserMessage {
-            action: Some(UserAction::FightTogether),
+            action: Some(action),
             ..
-        }
-    ) && setting != crate::events::Setting::Fantasy
+        } if action.together_kind().is_some_and(|kind| !kind.fits(setting))
+    )
 }
 
 /// Whether this turn's status ask is ruled out before the judge (spec
@@ -1300,6 +1302,29 @@ mod tests {
             );
         }
         assert!(!world_ruled_out(&user_msg("hi"), Setting::Modern));
+    }
+
+    /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
+    /// design.md §6.
+    #[test]
+    fn a_cycle_together_needs_a_modern_world() {
+        use crate::events::Setting;
+        let cycle = action_msg(UserAction::CycleTogether);
+        assert!(world_ruled_out(&cycle, Setting::Fantasy));
+        assert!(!world_ruled_out(&cycle, Setting::Modern));
+        assert!(!world_ruled_out(&cycle, Setting::default())); // absent reads modern
+        for a in [
+            UserAction::WorkoutTogether,
+            UserAction::SwimTogether,
+            UserAction::HikeTogether,
+            UserAction::JogTogether,
+            UserAction::ShowerTogether,
+            UserAction::Kiss,
+        ] {
+            for s in [Setting::Modern, Setting::Fantasy] {
+                assert!(!world_ruled_out(&action_msg(a.clone()), s), "{a:?} {s:?}");
+            }
+        }
     }
 
     /// Spec 2026-11-23-affinity-50-design.md §6.5, §8: a proposal is put
