@@ -548,20 +548,18 @@ async fn status_ask_waits(
 
 /// Whether her period is under way at `now` (spec
 /// 2026-11-24-period-cycle-design.md §9): the cycle state is `period`, not a
-/// `period_scare`. `false` for a persona with no period.
+/// `period_scare`. `false` for a persona with no period, with no read.
 async fn on_period(
     state: &AppState,
     instance_id: Uuid,
     persona: &CompanionPersona,
     now: DateTime<Utc>,
 ) -> Result<bool, AppError> {
+    let Some(health) = crate::prompt::persona_traits(persona).cycle_health() else {
+        return Ok(false);
+    };
     let cycle = (EventRepo { pool: &state.pool })
-        .current(
-            instance_id,
-            None,
-            now,
-            crate::prompt::persona_traits(persona).cycle_health(),
-        )
+        .current(instance_id, None, now, Some(health))
         .await?
         .cycle;
     Ok(cycle.is_some_and(|c| c.kind == EventKind::Period))
