@@ -566,6 +566,39 @@ impl UserActionView {
     }
 }
 
+/// The user's gender as a chat request states it. Only the image composer
+/// reads it (spec 2026-11-24-focused-tone-four-together-actions-and-user-
+/// gender-design.md §7).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserGender {
+    Male,
+    Female,
+}
+
+impl UserGender {
+    /// `"male"` / `"female"` exactly; anything else, a non-string included,
+    /// is `None`.
+    #[allow(dead_code)]
+    pub(crate) fn read(raw: Option<&serde_json::Value>) -> Option<Self> {
+        match raw?.as_str()? {
+            "male" => Some(Self::Male),
+            "female" => Some(Self::Female),
+            _ => None,
+        }
+    }
+
+    /// The word the composer's `[对方]` section carries.
+    #[allow(dead_code)]
+    pub(crate) fn zh(self) -> &'static str {
+        match self {
+            Self::Male => "男性",
+            Self::Female => "女性",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct StreamSendRequest {
     pub content: String,
@@ -1467,6 +1500,39 @@ mod tests {
     use serde_json::{json, Value};
     use sqlx::PgPool;
     use tower::Service;
+
+    #[test]
+    fn user_gender_reads_two_words_and_nothing_else() {
+        assert_eq!(
+            UserGender::read(Some(&json!("male"))),
+            Some(UserGender::Male)
+        );
+        assert_eq!(
+            UserGender::read(Some(&json!("female"))),
+            Some(UserGender::Female)
+        );
+        for raw in [
+            json!("Male"),
+            json!(" male"),
+            json!("other"),
+            json!(""),
+            json!(1),
+            json!(true),
+            json!(null),
+            json!({"g": "male"}),
+        ] {
+            assert_eq!(UserGender::read(Some(&raw)), None, "{raw}");
+        }
+        assert_eq!(UserGender::read(None), None);
+        assert_eq!(
+            (UserGender::Male.zh(), UserGender::Female.zh()),
+            ("男性", "女性")
+        );
+        assert_eq!(
+            serde_json::to_value(UserGender::Female).unwrap(),
+            json!("female")
+        );
+    }
 
     fn req_with_tier(tier: Option<&str>) -> StreamSendRequest {
         StreamSendRequest {
