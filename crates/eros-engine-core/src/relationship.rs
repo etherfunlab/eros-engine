@@ -169,37 +169,37 @@ pub struct ComposedRelation {
 const COMPOSED: [[(&str, &str); 5]; 5] = [
     [
         ("", ""),
-        ("fond_stranger", "有好感的陌生人"),
+        ("intriguing_stranger", "初识心动对象"),
         ("heady_stranger", "让你上头的陌生人"),
-        ("fling", "露水情人"),
-        ("love_at_first_sight", "一见倾心的人"),
+        ("headlong_lover", "闪恋爱人"),
+        ("instant_obsession", "骤燃挚爱"),
     ],
     [
         ("casual_friend", "普通朋友"),
-        ("flirty_friend", "有点暧昧的朋友"),
-        ("secret_crush", "暗恋的朋友"),
-        ("friend_and_lover", "朋友以上的情人"),
-        ("new_flame", "热恋的人"),
+        ("budding_flame", "暧昧对象"),
+        ("friend_and_crush", "迷恋对象"),
+        ("passionate_flame", "热恋对象"),
+        ("ardent_beloved", "热烈爱人"),
     ],
     [
-        ("good_friend", "好朋友"),
-        ("more_than_friends", "友达以上"),
-        ("almost_lovers", "恋人未满"),
-        ("close_lover", "亲密的情人"),
-        ("inseparable", "难分难舍的人"),
+        ("trusted_friend", "亲近好友"),
+        ("intimate_spark", "微醺密友"),
+        ("heartfelt_crush", "心上密友"),
+        ("tender_lover", "相依恋人"),
+        ("cherished_love", "深情挚爱"),
     ],
     [
-        ("confidant", "知己"),
+        ("kindred_spirit", "知音"),
         ("knowing_confidant", "心照不宣的知己"),
         ("smitten_confidant", "暗生情愫的知己"),
         ("heart_lover", "知心爱人"),
         ("beloved", "挚爱"),
     ],
     [
-        ("kindred_spirit", "灵魂之交"),
+        ("lifelong_kindred_spirit", "莫逆之交"),
         ("stirred_kindred", "动了心的灵魂之交"),
         ("platonic_love", "柏拉图式的爱人"),
-        ("soul_lover", "灵魂爱人"),
+        ("destined_lover", "灵犀恋人"),
         ("destined", "命中注定的人"),
     ],
 ];
@@ -419,8 +419,8 @@ mod tests {
         assert_eq!(
             composed_relation(3, 2).unwrap(),
             ComposedRelation {
-                key: "more_than_friends",
-                zh: "友达以上"
+                key: "intimate_spark",
+                zh: "微醺密友"
             }
         );
         assert_eq!(

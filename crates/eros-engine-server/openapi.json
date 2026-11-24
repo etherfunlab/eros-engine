@@ -4124,7 +4124,7 @@
               "string",
               "null"
             ],
-            "description": "Key of what the two real tiers add up to (`good_friend`,\n`more_than_friends`, ...), or `null` at `(1, 1)`. The pair's\ncompatibility is not applied here."
+            "description": "Key of what the two real tiers add up to (`trusted_friend`,\n`intimate_spark`, ...), or `null` at `(1, 1)`. The pair's\ncompatibility is not applied here."
           },
           "ghost_streak": {
             "type": "integer",

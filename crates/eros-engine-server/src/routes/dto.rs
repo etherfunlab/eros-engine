@@ -52,8 +52,8 @@ pub struct AffinitySnapshot {
     pub relationship_status: String,
     /// Whether a cold war is on.
     pub cold_war: bool,
-    /// Key of what the two real tiers add up to (`good_friend`,
-    /// `more_than_friends`, ...), or `null` at `(1, 1)`. The pair's
+    /// Key of what the two real tiers add up to (`trusted_friend`,
+    /// `intimate_spark`, ...), or `null` at `(1, 1)`. The pair's
     /// compatibility is not applied here.
     pub composed_relation: Option<String>,
 }
@@ -246,7 +246,7 @@ mod tests {
         let json = serde_json::to_value(AffinitySnapshot::from(a)).unwrap();
         assert_eq!(json["relationship_status"], "peer");
         assert_eq!(json["cold_war"], true);
-        assert_eq!(json["composed_relation"], "more_than_friends");
+        assert_eq!(json["composed_relation"], "intimate_spark");
     }
 
     #[test]

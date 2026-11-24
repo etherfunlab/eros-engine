@@ -2977,7 +2977,7 @@ mod tests {
         }
         assert_eq!(s.kinds().await, vec![pending("sleep_together")]);
         let prompt = only_prompt(&mock).await;
-        assert!(prompt.contains("论感情，你们现在是恋人未满"), "{prompt}");
+        assert!(prompt.contains("论感情，你们现在是心上密友"), "{prompt}");
         // The recorded scope itself, not a wider one: it has no warmth axis,
         // so the warm pair's pet-name line stays out.
         assert!(!prompt.contains("可以用一些亲昵的称呼"), "{prompt}");
@@ -2997,7 +2997,7 @@ mod tests {
         }
         assert_eq!(bond_only.kinds().await, vec![pending("travel_together")]);
         let prompt = only_prompt(&mock).await;
-        assert!(prompt.contains("论感情，你们现在是好朋友"), "{prompt}");
+        assert!(prompt.contains("论感情，你们现在是亲近好友"), "{prompt}");
 
         let unrecorded = scene_with_lines(&pool, 0.5, 0.5).await;
         unrecorded.set_status("partner", false).await;
@@ -3008,7 +3008,7 @@ mod tests {
         }
         assert_eq!(unrecorded.kinds().await, vec![pending("travel_together")]);
         let prompt = only_prompt(&mock).await;
-        assert!(prompt.contains("论感情，你们现在是恋人未满"), "{prompt}");
+        assert!(prompt.contains("论感情，你们现在是心上密友"), "{prompt}");
         // Every axis is in scope, warmth included.
         assert!(prompt.contains("可以用一些亲昵的称呼"), "{prompt}");
     }
@@ -3027,8 +3027,8 @@ mod tests {
         }
         assert!(s.cold_war().await);
         let prompt = only_prompt(&mock).await;
-        assert!(prompt.contains("你是用户的好朋友"), "{prompt}");
-        assert!(!prompt.contains("恋人未满"), "{prompt}");
+        assert!(prompt.contains("你是用户的亲近好友"), "{prompt}");
+        assert!(!prompt.contains("心上密友"), "{prompt}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
