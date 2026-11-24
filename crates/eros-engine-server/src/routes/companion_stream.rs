@@ -569,7 +569,6 @@ impl UserActionView {
 /// The user's gender as a chat request states it. Only the image composer
 /// reads it (spec 2026-11-24-focused-tone-four-together-actions-and-user-
 /// gender-design.md §7).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserGender {
@@ -590,7 +589,6 @@ impl UserGender {
     }
 
     /// The word the composer's `[对方]` section carries.
-    #[allow(dead_code)]
     pub(crate) fn zh(self) -> &'static str {
         match self {
             Self::Male => "男性",

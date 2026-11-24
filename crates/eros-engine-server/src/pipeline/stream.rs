@@ -3835,14 +3835,18 @@ pub(crate) fn compose_user_payload(
         body_state,
         None,
         None,
+        None,
     )
 }
 
 /// [`compose_user_payload`] with the `[同框人物]` section after `[此刻穿着]`
 /// when a second person is in the picture (spec 2026-10-26-group-two-person-
-/// image-design.md §3), and the `[此刻状态]` section after `[身体状态]` when
+/// image-design.md §3), the `[此刻状态]` section after `[身体状态]` when
 /// `current_state` names what she is doing (spec 2026-11-20-together-actions-
-/// state-in-picture-and-genome-routes-design.md §7); byte-identical without.
+/// state-in-picture-and-genome-routes-design.md §7), and the `[对方]` section
+/// right after it when `partner_gender` names the user's gender (spec
+/// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
+/// §7.2); byte-identical without.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compose_user_payload_with(
     appearance: &str,
@@ -3853,12 +3857,18 @@ pub(crate) fn compose_user_payload_with(
     aspect_ratio: &str,
     body_state: &str,
     current_state: Option<&str>,
+    partner_gender: Option<&str>,
     companion: Option<&ImageCompanionContext>,
 ) -> String {
     let state = current_state
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| format!("[此刻状态]\n{s}\n\n"))
+        .unwrap_or_default();
+    let partner = partner_gender
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("[对方]\n{s}\n\n"))
         .unwrap_or_default();
     let companion = companion
         .map(|c| {
@@ -3879,7 +3889,7 @@ pub(crate) fn compose_user_payload_with(
         })
         .unwrap_or_default();
     format!(
-        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n{companion}[身体状态]\n{body_state}\n\n{state}[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
+        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n{companion}[身体状态]\n{body_state}\n\n{state}{partner}[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
     )
 }
 
@@ -3908,11 +3918,14 @@ pub(crate) fn compose_inputs_json(
         body_state,
         None,
         None,
+        None,
     )
 }
 
 /// [`compose_inputs_json`] with the state she was shown in (`current_state`,
-/// the empty string when none) and the second person the composer was shown.
+/// the empty string when none), the partner's gender it was shown
+/// (`partner_gender`, the empty string when none) and the second person the
+/// composer was shown.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compose_inputs_json_with(
     persona: &eros_engine_core::persona::CompanionPersona,
@@ -3923,6 +3936,7 @@ pub(crate) fn compose_inputs_json_with(
     aspect_ratio: Option<&str>,
     body_state: Option<&str>,
     current_state: Option<&str>,
+    partner_gender: Option<&str>,
     companion: Option<&ImageCompanionContext>,
 ) -> serde_json::Value {
     let mut v = serde_json::json!({
@@ -3932,6 +3946,7 @@ pub(crate) fn compose_inputs_json_with(
         "clothing": clothing.map(str::trim).unwrap_or(""),
         "body_state": body_state.map(str::trim).unwrap_or(""),
         "current_state": current_state.map(str::trim).unwrap_or(""),
+        "partner_gender": partner_gender.map(str::trim).unwrap_or(""),
         "recent_scene": recent_scene.trim(),
         "latest_user_msg": latest_user_msg.trim(),
         "style": style,
@@ -4067,11 +4082,12 @@ pub(crate) fn render_compose_payload(
         body_state,
         None,
         None,
+        None,
     )
 }
 
-/// [`render_compose_payload`] with what she is doing and the second person of
-/// a group picture.
+/// [`render_compose_payload`] with what she is doing, the user's gender and
+/// the second person of a group picture.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_compose_payload_with(
     persona: &eros_engine_core::persona::CompanionPersona,
@@ -4082,6 +4098,7 @@ pub(crate) fn render_compose_payload_with(
     style: &str,
     body_state: Option<&str>,
     current_state: Option<&str>,
+    partner_gender: Option<&str>,
     companion: Option<&ImageCompanionContext>,
 ) -> String {
     let appearance = crate::prompt::meta_str(persona, "appearance")
@@ -4116,6 +4133,7 @@ pub(crate) fn render_compose_payload_with(
         ar,
         body_state,
         current_state,
+        partner_gender,
         companion,
     )
 }
@@ -4357,6 +4375,27 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// The background and foreground kinds a picture reads from the events
+/// `current` holds, with the kind being started this moment (`starting`, not
+/// stored yet) counted as live: a background kind stands in for the
+/// background, any other for the foreground.
+fn picture_kinds(
+    current: &eros_engine_store::events::CurrentEvents,
+    starting: Option<eros_engine_core::events::EventKind>,
+) -> (
+    Option<eros_engine_core::events::EventKind>,
+    Option<eros_engine_core::events::EventKind>,
+) {
+    let mut background = current.background.as_ref().map(|e| e.kind);
+    let mut foreground = current.foreground.as_ref().map(|e| e.kind);
+    match starting {
+        Some(kind) if kind.is_background() => background = Some(kind),
+        Some(kind) => foreground = Some(kind),
+        None => {}
+    }
+    (background, foreground)
+}
+
 /// What the composer's `[此刻状态]` says of the events `current` holds, with
 /// the kind being started this moment (`starting`, not stored yet) counted as
 /// live: a background kind stands in for the background, any other for the
@@ -4365,14 +4404,26 @@ pub(crate) fn picture_state_of(
     current: &eros_engine_store::events::CurrentEvents,
     starting: Option<eros_engine_core::events::EventKind>,
 ) -> Option<String> {
-    let mut background = current.background.as_ref().map(|e| e.kind);
-    let mut foreground = current.foreground.as_ref().map(|e| e.kind);
-    match starting {
-        Some(kind) if kind.is_background() => background = Some(kind),
-        Some(kind) => foreground = Some(kind),
-        None => {}
-    }
+    let (background, foreground) = picture_kinds(current, starting);
     crate::prompt::current_state(background, foreground)
+}
+
+/// What the composer's `[对方]` says: the user's gender when one is given and
+/// a kind `[此刻状态]` names is one she shares with the user, resolved with
+/// `starting` as `picture_state_of` does (spec 2026-11-24-focused-tone-four-
+/// together-actions-and-user-gender-design.md §7.2). Pure.
+#[allow(dead_code)]
+pub(crate) fn partner_gender_of(
+    current: &eros_engine_store::events::CurrentEvents,
+    starting: Option<eros_engine_core::events::EventKind>,
+    gender: Option<crate::routes::companion_stream::UserGender>,
+) -> Option<&'static str> {
+    let (background, foreground) = picture_kinds(current, starting);
+    let shared = [background, foreground]
+        .into_iter()
+        .flatten()
+        .any(|kind| kind.is_shared());
+    gender.filter(|_| shared).map(|g| g.zh())
 }
 
 /// What she is doing at a picture's moment, as the composer reads it: the
@@ -4407,7 +4458,8 @@ pub(crate) async fn state_for_picture(
 /// throughout: a model error, timeout, or empty reply degrades to an empty
 /// subject — there is nothing left to fall back to — and never blocks the
 /// image turn. `compose_image_prompt` turns that empty subject into a plain
-/// persona-appearance portrait prompt (#212).
+/// persona-appearance portrait prompt (#212). `partner_gender` is the user's
+/// gender, the composer's `[对方]` section.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_delegated_image_prompt(
     state: &AppState,
@@ -4420,8 +4472,9 @@ pub(crate) async fn build_delegated_image_prompt(
     session_id: Uuid,
     body_state: Option<&str>,
     current_state: Option<&str>,
+    partner_gender: Option<&str>,
 ) -> DelegatedImagePrompt {
-    build_delegated_image_prompt_with(
+    build_delegated_image_prompt_for(
         state,
         persona,
         plan,
@@ -4432,7 +4485,9 @@ pub(crate) async fn build_delegated_image_prompt(
         session_id,
         body_state,
         current_state,
+        partner_gender,
         None,
+        compose_source(plan.action_type),
     )
     .await
 }
@@ -4465,6 +4520,7 @@ pub(crate) async fn build_delegated_image_prompt_with(
         session_id,
         body_state,
         current_state,
+        None,
         companion,
         compose_source(plan.action_type),
     )
@@ -4490,7 +4546,8 @@ pub(crate) fn compose_source(a: ActionType) -> &'static str {
 /// [`build_delegated_image_prompt_with`] with the audit `source` named by the
 /// caller: `event` for a life event's picture (spec 2026-10-26-event-message-
 /// image-design.md §6). `current_state` is what she is doing, the composer's
-/// `[此刻状态]` section.
+/// `[此刻状态]` section; `partner_gender` is the user's gender, its `[对方]`
+/// section.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_delegated_image_prompt_for(
     state: &AppState,
@@ -4503,6 +4560,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
     session_id: Uuid,
     body_state: Option<&str>,
     current_state: Option<&str>,
+    partner_gender: Option<&str>,
     companion: Option<&ImageCompanionContext>,
     source: &'static str,
 ) -> DelegatedImagePrompt {
@@ -4529,6 +4587,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
                     &style_str,
                     body_state,
                     current_state,
+                    partner_gender,
                     companion,
                 ),
                 "chat_image_prompt_compose",
@@ -4628,6 +4687,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
                 inputs.aspect_ratio.as_deref(),
                 body_state,
                 current_state,
+                partner_gender,
                 companion,
             ),
             subject: (!final_subject.is_empty()).then_some(final_subject.as_str()),
@@ -6196,6 +6256,7 @@ pub(crate) fn run_stream_with(
                         user_msg.session_id,
                         body_state.as_deref(),
                         picture_state.as_deref(),
+                        None,
                     )
                     .await;
                     let subject = img.subject;
@@ -6570,6 +6631,7 @@ pub(crate) fn run_stream_with(
                                 session_id_c,
                                 body_state_c.as_deref(),
                                 picture_state_c.as_deref(),
+                                None,
                             )
                             .await
                         })))
@@ -6770,6 +6832,7 @@ pub(crate) fn run_stream_with(
                                     user_msg.session_id,
                                     body_state.as_deref(),
                                     picture_state.as_deref(),
+                                    None,
                                 )
                                 .await
                             }
@@ -6785,6 +6848,7 @@ pub(crate) fn run_stream_with(
                                     user_msg.session_id,
                                     body_state.as_deref(),
                                     picture_state.as_deref(),
+                                    None,
                                 )
                                 .await
                             }
@@ -10720,6 +10784,68 @@ data: [DONE]\n\n";
                 .await
                 .unwrap();
         assert_eq!(inputs["current_state"], "短途旅游；在坐火车", "{inputs}");
+    }
+
+    /// Spec 2026-11-24 §7.2-7.3: the gender a caller hands over reaches the
+    /// composer right after the state, and the audit snapshot.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_delegated_prompt_hands_the_partner_gender_to_the_composer(pool: PgPool) {
+        use wiremock::matchers::path as wm_path;
+        use wiremock::{Mock, MockServer};
+
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .respond_with(composer_ok())
+            .mount(&mock)
+            .await;
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let mut persona = test_persona_with_appearance("freckled");
+        persona.instance.id = instance_id;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+
+        let img = build_delegated_image_prompt(
+            &state,
+            &persona,
+            &img_plan(None),
+            None,
+            "在公园",
+            "拍张照",
+            user_id,
+            session_id,
+            None,
+            Some("和对方一起慢跑"),
+            Some("男性"),
+        )
+        .await;
+        assert_eq!(img.subject, "SUBJECT");
+        let reqs = mock.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "the composer is the only provider call");
+        let payload = composer_payload(&reqs[0]);
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起慢跑\n\n[对方]\n男性\n\n[最近场景]"),
+            "{payload}"
+        );
+        let inputs: serde_json::Value =
+            sqlx::query_scalar("SELECT inputs FROM engine.chat_images_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(inputs["current_state"], "和对方一起慢跑", "{inputs}");
+        assert_eq!(inputs["partner_gender"], "男性", "{inputs}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -23433,6 +23559,7 @@ data: [DONE]\n\n"
                 "3:4",
                 "（无）",
                 None,
+                None,
                 None
             ),
             base
@@ -23451,6 +23578,7 @@ data: [DONE]\n\n"
             "realistic",
             "3:4",
             "（无）",
+            None,
             None,
             Some(&ctx),
         );
@@ -23481,6 +23609,7 @@ data: [DONE]\n\n"
                 "3:4",
                 "（无）",
                 None,
+                None,
                 None
             ),
             base
@@ -23500,6 +23629,7 @@ data: [DONE]\n\n"
                 "3:4",
                 "（无）",
                 Some("  "),
+                None,
                 None
             ),
             base
@@ -23518,12 +23648,159 @@ data: [DONE]\n\n"
             "（无）",
             Some("洗澡中"),
             None,
+            None,
         );
         assert!(
             with.contains("[身体状态]\n（无）\n\n[此刻状态]\n洗澡中\n\n[最近场景]"),
             "{with}"
         );
         assert_eq!(with.matches("[此刻状态]").count(), 1, "{with}");
+    }
+
+    #[test]
+    fn the_partner_section_follows_the_state_section() {
+        let payload = |state: Option<&str>, partner: Option<&str>| {
+            compose_user_payload_with(
+                "freckled",
+                "（无）",
+                "（无）",
+                "（无）",
+                "realistic",
+                "3:4",
+                "（无）",
+                state,
+                partner,
+                None,
+            )
+        };
+        let with = payload(Some("和对方一起慢跑"), Some("男性"));
+        assert!(
+            with.contains("[此刻状态]\n和对方一起慢跑\n\n[对方]\n男性\n\n[最近场景]"),
+            "{with}"
+        );
+        assert_eq!(with.matches("[对方]").count(), 1, "{with}");
+        let without = payload(Some("和对方一起慢跑"), None);
+        assert!(!without.contains("[对方]"), "{without}");
+        assert_eq!(with.replace("[对方]\n男性\n\n", ""), without);
+        assert_eq!(payload(Some("和对方一起慢跑"), Some("  ")), without);
+        assert_eq!(payload(Some("和对方一起慢跑"), Some("")), without);
+    }
+
+    #[test]
+    fn the_partner_gender_needs_a_gender_and_a_shared_kind() {
+        use crate::routes::companion_stream::UserGender::{Female, Male};
+        use eros_engine_core::events::EventKind::{self, *};
+        let held = |foreground: Option<EventKind>, background: Option<EventKind>| {
+            eros_engine_store::events::CurrentEvents {
+                foreground: foreground.map(live_event),
+                background: background.map(live_event),
+                at: chrono::DateTime::UNIX_EPOCH,
+            }
+        };
+        assert_eq!(
+            partner_gender_of(&held(Some(JoggingTogether), None), None, Some(Male)),
+            Some("男性")
+        );
+        assert_eq!(
+            partner_gender_of(
+                &held(Some(TakingSelfie), Some(TravelingTogether)),
+                None,
+                Some(Female)
+            ),
+            Some("女性")
+        );
+        assert_eq!(
+            partner_gender_of(&held(None, None), Some(HikingTogether), Some(Male)),
+            Some("男性")
+        );
+        assert_eq!(
+            partner_gender_of(&held(Some(OnADate), None), None, Some(Female)),
+            Some("女性")
+        );
+        assert_eq!(
+            partner_gender_of(&held(Some(JoggingTogether), None), None, None),
+            None
+        );
+        assert_eq!(
+            partner_gender_of(&held(Some(TakingSelfie), Some(ShortTrip)), None, Some(Male)),
+            None
+        );
+        assert_eq!(partner_gender_of(&held(None, None), None, Some(Male)), None);
+        // The starting kind takes its slot's place as `picture_state_of` has
+        // it: a foreground kind replaces the foreground, a background kind
+        // the background.
+        assert_eq!(
+            partner_gender_of(
+                &held(Some(JoggingTogether), None),
+                Some(TakingSelfie),
+                Some(Male)
+            ),
+            None
+        );
+        assert_eq!(
+            partner_gender_of(
+                &held(Some(TakingSelfie), Some(TravelingTogether)),
+                Some(ShortTrip),
+                Some(Male)
+            ),
+            None
+        );
+        assert_eq!(
+            partner_gender_of(
+                &held(Some(TakingSelfie), Some(ShortTrip)),
+                Some(TravelingTogether),
+                Some(Female)
+            ),
+            Some("女性")
+        );
+    }
+
+    #[test]
+    fn the_compose_snapshot_records_the_partner_gender() {
+        let persona = test_persona_with_appearance("freckled");
+        let with = compose_inputs_json_with(
+            &persona,
+            None,
+            "s",
+            "m",
+            "anime",
+            None,
+            None,
+            Some("和对方一起慢跑"),
+            Some("女性"),
+            None,
+        );
+        assert_eq!(with["partner_gender"], "女性");
+        assert_eq!(with["current_state"], "和对方一起慢跑");
+        let without = compose_inputs_json_with(
+            &persona, None, "s", "m", "anime", None, None, None, None, None,
+        );
+        assert_eq!(without["partner_gender"], "");
+        let wrapper = compose_inputs_json(&persona, None, "s", "m", "anime", None, None);
+        assert_eq!(wrapper["partner_gender"], "");
+    }
+
+    #[test]
+    fn render_compose_payload_with_carries_the_partner() {
+        let persona = test_persona_with_appearance("freckled");
+        let out = render_compose_payload_with(
+            &persona,
+            None,
+            "在天台",
+            "拍张照",
+            None,
+            "anime",
+            None,
+            Some("和对方一起慢跑"),
+            Some("男性"),
+            None,
+        );
+        assert!(
+            out.contains(
+                "[身体状态]\n（无）\n\n[此刻状态]\n和对方一起慢跑\n\n[对方]\n男性\n\n[最近场景]\n在天台"
+            ),
+            "{out}"
+        );
     }
 
     #[test]
@@ -23543,6 +23820,7 @@ data: [DONE]\n\n"
             "3:4",
             "（无）",
             Some("洗澡中"),
+            None,
             Some(&ctx),
         );
         assert_eq!(
@@ -23669,6 +23947,7 @@ data: [DONE]\n\n"
             None,
             Some("短途旅游；在坐火车"),
             None,
+            None,
         );
         assert!(
             out.contains(
@@ -23693,10 +23972,12 @@ data: [DONE]\n\n"
             None,
             Some("洗澡中"),
             None,
+            None,
         );
         assert_eq!(with["current_state"], "洗澡中");
-        let without =
-            compose_inputs_json_with(&persona, None, "s", "m", "anime", None, None, None, None);
+        let without = compose_inputs_json_with(
+            &persona, None, "s", "m", "anime", None, None, None, None, None,
+        );
         assert_eq!(without["current_state"], "");
         let wrapper = compose_inputs_json(&persona, None, "s", "m", "anime", None, None);
         assert_eq!(wrapper["current_state"], "");
