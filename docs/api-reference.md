@@ -1555,7 +1555,7 @@ words, and that is the ignore path (below).
 | Field | Rules |
 |---|---|
 | `response` | required: `"accept"` or `"decline"`; anything else is a `422` |
-| `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating her reply. Her ask itself was generated with the engine's default scopes. The engine keeps nothing between calls |
+| `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating her reply. Her ask itself was generated under the scopes the pair's replies had recorded (romance-compatible when none was recorded). The engine keeps nothing between calls |
 
 1:1 text sessions only. One transaction answers the choice and pays for it: an
 accept makes it `accepted`, a decline `declined`. What an answer does depends on

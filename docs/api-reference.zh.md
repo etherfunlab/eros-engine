@@ -1199,7 +1199,7 @@ engine 不接收也不保存用户的性别或性取向。
 | 字段 | 规则 |
 |---|---|
 | `response` | 必填：`"accept"` 或 `"decline"`；其他取值返回 `422` |
-| `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成她的回应。她那条请求本身用的是 engine 默认的 scope。engine 在两次调用之间不保存任何东西 |
+| `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成她的回应。她那条请求本身用的是这一对的回复记录下来的 scope（没有记录时按浪漫相容处理）。engine 在两次调用之间不保存任何东西 |
 
 只服务 1:1 文字 session。一个事务里完成回答并付清代价：接受让选择变为 `accepted`，拒绝变为 `declined`。回答带来什么，取决于 `kind`：
 

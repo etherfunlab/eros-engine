@@ -1216,7 +1216,8 @@ When a trigger fires, in order:
 
 1. **Her words.** The companion chat model generates the request through the same proactive
    path as an event message (persona, history window, memory recall, `[now]`; no judge, no
-   streaming, no user row), with the engine's default scopes. The stage cue is the final `user`
+   streaming, no user row), under the scopes the pair's replies recorded, the ones her ordinary
+   replies read; a pair with none recorded reads as romance-compatible. The stage cue is the final `user`
    turn and is never persisted; the cue of every kind is in
    [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge). The message is an
    ordinary assistant row, `assistant_action_type = 'proactive'`,
@@ -1331,7 +1332,8 @@ which moves the streak anchor: the turns that started a cold war do not count to
 and its end starts a fresh streak for every ask.
 
 **What she says.** When a streak starts it, she says so in one proactive message through the same
-path as an ask, with no choice row: `metadata.proactive = 'cold_war'` (the history routes'
+path as an ask, under the engine's default scopes and with no choice row:
+`metadata.proactive = 'cold_war'` (the history routes'
 `occasion`), on the cue
 
 ```
@@ -1526,7 +1528,7 @@ pending ask closes the runway.
 
 **Her ask.** It is delivered as every ask is: her words first, then the choice row beside
 them, no tier gap, the same 24-hour window and the same `life_choice` field on the affinity
-delta. Her ask is generated with the engine's default scopes, on the cue
+delta. Her ask is generated on the cue
 `（你们最近越来越亲密，你很想和对方一起洗个澡。你决定主动开口，问对方愿不愿意和你一起洗，希望对方给你一个答复。）`;
 her replies at resolution use the resolution request's own scopes.
 

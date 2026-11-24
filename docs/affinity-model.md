@@ -522,8 +522,9 @@ status underneath unchanged.
   ([above](#life-choice-drops-and-the-cold-war-halving)). She asks nothing warm
   (`confess`, `partner_up`, `propose`, her sleep ask, `bathe_together`,
   `travel_together`), and from a breakable status she can ask to break up.
-- **She says so** when a streak starts it, in one proactive message with no
-  choice row, `metadata.proactive = 'cold_war'`. The flag is committed first: a
+- **She says so** when a streak starts it, in one proactive message generated
+  under the engine's default scopes, with no choice row,
+  `metadata.proactive = 'cold_war'`. The flag is committed first: a
   failed or blank message leaves it on, and she says nothing. A cold war started
   by a refused break-up has no message of its own, and ending one writes none.
 
