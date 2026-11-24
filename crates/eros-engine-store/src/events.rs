@@ -665,9 +665,12 @@ impl EventRepo<'_> {
         ))
     }
 
-    /// The newest false alarm told in this session that ended by `at`, while
+    /// The false alarm told in this session that ended last by `at`, while
     /// the session holds no assistant row with text written after it ended
-    /// (spec 2026-10-16-life-events-offline-and-scares-design.md §5.2).
+    /// (spec 2026-10-16-life-events-offline-and-scares-design.md §5.2). Last
+    /// to end, not last to start: a late period lasts days and a
+    /// `pregnancy_scare` can start and end inside it (spec
+    /// 2026-11-24-period-cycle-design.md §6).
     pub async fn unresolved_scare(
         &self,
         session_id: Uuid,
@@ -685,7 +688,7 @@ impl EventRepo<'_> {
                    FROM engine.persona_events \
                   WHERE instance_id = $2 AND session_id = $1 AND kind = ANY($4) \
                     AND ends_at <= $3 AND started_at > $3 - make_interval(hours => $5) \
-                  ORDER BY started_at DESC, id DESC \
+                  ORDER BY ends_at DESC, id DESC \
                   LIMIT 1 \
              ) \
              SELECT scare.id, scare.kind, scare.session_id, scare.started_at, scare.ends_at, \
@@ -2315,6 +2318,47 @@ mod tests {
                 .await
                 .unwrap(),
             Some(here)
+        );
+    }
+
+    /// A `pregnancy_scare` that started and ended inside a late period does
+    /// not stand for it: her reply after the first is no reply after the
+    /// second (spec 2026-11-24-period-cycle-design.md §6).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_scare_that_ended_last_is_the_one_resolved(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let (late_from, late_to) = (t("2026-03-01T12:00:00Z"), t("2026-03-05T08:00:00Z"));
+        let told_late = row(&pool, s, "assistant", "2026-03-01T12:00:00Z", false).await;
+        seed(
+            &pool,
+            span(i, s, "late", PeriodScare, late_from, late_to),
+            Some(told_late),
+        )
+        .await;
+        let told_pregnancy = row(&pool, s, "assistant", "2026-03-02T10:00:00Z", false).await;
+        seed(
+            &pool,
+            span(
+                i,
+                s,
+                "pregnancy",
+                PregnancyScare,
+                t("2026-03-02T10:00:00Z"),
+                t("2026-03-02T11:00:00Z"),
+            ),
+            Some(told_pregnancy),
+        )
+        .await;
+        // After the pregnancy scare ended, before the late period did.
+        row(&pool, s, "assistant", "2026-03-03T12:00:00Z", false).await;
+        let got = EventRepo { pool: &pool }
+            .unresolved_scare(s, i, t("2026-03-05T12:00:00Z"))
+            .await
+            .unwrap()
+            .expect("the late period is unresolved");
+        assert_eq!(
+            (got.kind, got.started_at, got.ends_at),
+            (PeriodScare, late_from, late_to)
         );
     }
 
