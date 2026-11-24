@@ -1201,7 +1201,7 @@ the committed, time-decayed state, and every kind also needs:
   `asked_at`, so action turns during its wait do count. The turn that converts an ignored ask is
   the first of the new streak. Asking consumes the streak: the next ask needs fresh judged turns.
 - **A clear runway.** No session of the persona has a pending choice, and the persona has no
-  [date](activities.md) under way. She has one life, so at most one ask is pending at a time: once
+  [date](activities.md) and no stored separation (`taking_space`) under way. She has one life, so at most one ask is pending at a time: once
   one kind has asked, the later checks of the same turn find the runway closed. A date's own turns
   are never judged turns, so they never trigger one.
 - **The right session.** A 1:1 text session of a genome persona. A voice session never triggers,
