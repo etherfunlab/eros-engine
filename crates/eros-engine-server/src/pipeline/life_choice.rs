@@ -2997,7 +2997,7 @@ mod tests {
         }
         assert_eq!(bond_only.kinds().await, vec![pending("travel_together")]);
         let prompt = only_prompt(&mock).await;
-        assert!(prompt.contains("论感情，你们现在是亲近好友"), "{prompt}");
+        assert!(prompt.contains("论感情，你们现在是死党"), "{prompt}");
 
         let unrecorded = scene_with_lines(&pool, 0.5, 0.5).await;
         unrecorded.set_status("partner", false).await;
@@ -3027,7 +3027,7 @@ mod tests {
         }
         assert!(s.cold_war().await);
         let prompt = only_prompt(&mock).await;
-        assert!(prompt.contains("你是用户的亲近好友"), "{prompt}");
+        assert!(prompt.contains("你是用户的死党"), "{prompt}");
         assert!(!prompt.contains("恋人未满"), "{prompt}");
     }
 

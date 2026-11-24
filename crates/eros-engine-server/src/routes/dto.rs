@@ -52,7 +52,7 @@ pub struct AffinitySnapshot {
     pub relationship_status: String,
     /// Whether a cold war is on.
     pub cold_war: bool,
-    /// Key of what the two real tiers add up to (`trusted_friend`,
+    /// Key of what the two real tiers add up to (`best_buddy`,
     /// `more_than_friends`, ...), or `null` at `(1, 1)`. The pair's
     /// compatibility is not applied here.
     pub composed_relation: Option<String>,

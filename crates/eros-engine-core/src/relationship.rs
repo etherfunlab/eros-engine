@@ -72,7 +72,7 @@ impl RelationshipStatus {
             Self::Dating => "伴侣",
             Self::Partner => "伙伴",
             Self::Peer => "同事",
-            Self::Fwb => "伙伴，也是情人",
+            Self::Fwb => "床伴",
             Self::Situationship => "同事，私下在交往",
             Self::Engaged => "已订婚",
             Self::Ex => "前任",
@@ -169,23 +169,23 @@ pub struct ComposedRelation {
 const COMPOSED: [[(&str, &str); 5]; 5] = [
     [
         ("", ""),
-        ("intriguing_stranger", "初识心动对象"),
+        ("flirtatious_stranger", "眉来眼去的人"),
         ("heady_stranger", "让你上头的陌生人"),
         ("fling", "露水情人"),
         ("love_at_first_sight", "一见倾心的人"),
     ],
     [
         ("casual_friend", "普通朋友"),
-        ("budding_flame", "暧昧对象"),
-        ("friend_and_crush", "迷恋对象"),
-        ("passionate_flame", "热恋对象"),
-        ("ardent_beloved", "热烈爱人"),
+        ("flirtatious_buddy", "暧昧搭子"),
+        ("cherished_crush", "心头好"),
+        ("fast_burning_lover", "干柴烈火之人"),
+        ("dizzying_blind_love", "神魂颠倒之人"),
     ],
     [
-        ("trusted_friend", "亲近好友"),
+        ("best_buddy", "死党"),
         ("more_than_friends", "友达以上"),
         ("almost_lovers", "恋人未满"),
-        ("tender_lover", "相依恋人"),
+        ("fond_close_sweetheart", "两情相悦的人"),
         ("inseparable", "难分难舍的人"),
     ],
     [
@@ -410,7 +410,7 @@ mod tests {
                 }
                 let r = composed_relation(b, c).unwrap();
                 assert!(keys.insert(r.key), "duplicate key {}", r.key);
-                for word in ["伴侣", "伙伴", "同事", "前任", "未婚"] {
+                for word in ["伴侣", "伙伴", "同事", "前任", "未婚", "床伴"] {
                     assert!(!r.zh.contains(word), "{} uses a status word", r.zh);
                 }
             }
