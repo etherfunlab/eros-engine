@@ -44,8 +44,11 @@
 # While an event is live, one more labeled section ([此刻状态]) says what she is
 # doing (the background, then the incident, joined by "；"); a custom prompt
 # should show it, and let it win over [此刻穿着] where the two disagree. The
-# section is absent when nothing is live. Omit the block entirely
-# and image turns stay unavailable. Fail-open: on failure / timeout / empty
+# section is absent when nothing is live.
+# When the chat request carries user_gender and an event she shares with the
+# user is live, one more labeled section ([对方]) gives the partner's gender
+# (男性 / 女性). A custom prompt should say the partner is drawn as that gender.
+# Omit the block entirely and image turns stay unavailable. Fail-open: on failure / timeout / empty
 # reply it falls back to an empty subject (a plain persona-appearance
 # portrait), so it never blocks the image turn (and never advances any
 # round-robin cursor on non-image turns).

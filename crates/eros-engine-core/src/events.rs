@@ -517,6 +517,40 @@ impl EventKind {
         matches!(self, EventKind::TakingSelfie | EventKind::Strip)
     }
 
+    /// Whether she does it with the user: the date, the trip together and
+    /// every kind a together action places (spec
+    /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
+    /// §7.2).
+    pub fn is_shared(self) -> bool {
+        use EventKind::*;
+        matches!(
+            self,
+            TravelingTogether
+                | OnADate
+                | BathingTogether
+                | ShoweringTogether
+                | SaunaTogether
+                | UsingToiletTogether
+                | SmokingTogether
+                | AsleepTogether
+                | HavingSexTogether
+                | WalkingTogether
+                | SmokingWeedTogether
+                | JoggingTogether
+                | YogaTogether
+                | StargazingTogether
+                | HorseRidingTogether
+                | StreakingTogether
+                | DrinkingTogether
+                | HotSpringTogether
+                | FightingTogether
+                | WorkingOutTogether
+                | SwimmingTogether
+                | CyclingTogether
+                | HikingTogether
+        )
+    }
+
     /// Offline kinds make the persona unreachable while they last
     /// (spec 2026-10-16-life-events-offline-and-scares-design.md §2). Whether
     /// `out_shopping` does depends on the persona (spec 2026-10-19-life-events-
@@ -3182,6 +3216,16 @@ mod tests {
 
     /// Spec 2026-11-19-vehicles-actions-species-design.md §3.
     const FANTASY_ONLY: [EventKind; 2] = [OnTheRoad, FightingTogether];
+
+    #[test]
+    fn the_shared_kinds_are_the_date_and_everything_done_together() {
+        for k in EventKind::ALL.into_iter().chain(EventKind::SPECIAL) {
+            let expected = k == OnADate || k.as_str().ends_with("_together");
+            assert_eq!(k.is_shared(), expected, "{k:?}");
+        }
+        assert!(TravelingTogether.is_shared() && HikingTogether.is_shared());
+        assert!(!TakingSelfie.is_shared() && !ShortTrip.is_shared());
+    }
 
     #[test]
     fn modern_only_kinds_never_fit_fantasy() {

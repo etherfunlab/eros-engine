@@ -57,6 +57,10 @@ pub(crate) struct QueuedTurnParams {
     pub user_country: Option<String>,
     #[serde(default)]
     pub user_region: Option<String>,
+    /// The user's gender as the request stated it, for the image composer
+    /// alone (spec 2026-11-24 §7.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_gender: Option<crate::routes::companion_stream::UserGender>,
     #[serde(default)]
     pub action: Option<crate::routes::companion_stream::UserActionDto>,
     /// The validated outfit (spec 2026-10-12 §6.2).
@@ -206,6 +210,7 @@ pub async fn send_message_async(
         user_timezone: crate::holiday::bounded_raw(req.user_timezone.as_deref()),
         user_country: crate::holiday::bounded_raw(req.user_country.as_deref()),
         user_region: crate::holiday::bounded_raw(req.user_region.as_deref()),
+        user_gender: crate::routes::companion_stream::UserGender::read(req.user_gender.as_ref()),
         action: req.action.clone(),
         outfit,
         byok: None,
@@ -690,6 +695,24 @@ mod tests {
         assert_eq!(params.outfit.as_deref(), Some("红色旗袍"));
         let legacy: super::QueuedTurnParams = serde_json::from_value(json!({})).unwrap();
         assert_eq!(legacy.outfit, None);
+    }
+
+    #[test]
+    fn queued_params_carry_the_user_gender_and_old_rows_parse_without_it() {
+        use crate::routes::companion_stream::UserGender;
+        let params = super::QueuedTurnParams {
+            user_gender: Some(UserGender::Female),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["user_gender"], json!("female"));
+        let back: super::QueuedTurnParams = serde_json::from_value(value).unwrap();
+        assert_eq!(back.user_gender, Some(UserGender::Female));
+
+        let legacy: super::QueuedTurnParams = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(legacy.user_gender, None);
+        let bare = serde_json::to_value(super::QueuedTurnParams::default()).unwrap();
+        assert!(bare.get("user_gender").is_none(), "{bare}");
     }
 
     #[test]
