@@ -779,7 +779,7 @@ pub fn apply_output_regex(
     }
 }
 
-/// Per-turn base probabilities of the chat tones (`tones` on
+/// Per-turn probabilities of the chat tones (`tones` on
 /// `[tasks.chat_companion]`). An unknown tone name fails the parse.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -6335,6 +6335,7 @@ temperature = 0.8
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
         cfg.validate_tones().unwrap();
         assert_eq!(cfg.tone_emotional_probability(), 0.0);
+        assert_eq!(cfg.tone_focused_probability(), 0.0);
     }
 
     #[test]
