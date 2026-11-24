@@ -191,11 +191,11 @@ Stories 需要**全部条件**同时成立——且按构造骑在 World Memorie
 | 角色 | 经由 instance 取 `persona_genomes`：名字、人格、backstory（canon） |
 | 当前 insight + digest | `persona_story_insights` 行（`last_run_at IS NULL` ⇒ 首轮初始化） |
 | 近期事件（12 条） | `persona_story_events`，按时间顺序——保连贯性、防重复 |
-| 亲密度快照 | 最新会话的六轴 + bond + chemistry + 两条线的档位名——仅供参考 |
+| 亲密度快照 | 最新会话的六轴 + bond + chemistry + 两条线的档位名——仅供参考——以及它的[关系状态](affinity-model.zh.md#关系状态)和冷战标记，这两项是引擎记录的事实 |
 | 聊天证据 | 该 (owner, instance) 最近 `context_days`（默认 7 天）内的「用户→回复」配对，按轮数上限截断；角色主动发的消息（事件消息、生活选择的消息、问候）不算证据，[约会](activities.zh.md)里的回合也不算 |
 | 生活事件（30 条） | 同一窗口内开始的、以及此刻仍在进行的 `persona_events`：标签、类别、相对时间（`3 天前开始，持续 2 小时`），讲述过的附上她讲述时的原文。`taking_space` / `fell_out` 只取未归档会话里的；讲述原文在已归档会话里的不给原文；虚惊要结束后才给，并带上结果；`bathing_together`、`showering_together`、`having_sex_together`、`streaking_together`、`using_toilet_together`、`asleep_together` 和 `on_a_date` 一律不给，它们只留在对话里 |
 | 在途背景 | 上述生活事件里此刻仍在进行的那个背景，单独再列一次 |
-| 分开请求（10 条） | 这对关系未归档会话里、窗口内的 `life_choices`：她的原话和结果（同意并分开多久、拒绝、忽略、一直没回、还在等） |
+| 关系选择（10 条） | 这对关系未归档会话里、窗口内种类为 `confess`、`partner_up`、`propose`、`break_up` 的 `life_choices`，以及存量的 `ask_for_space`：她的原话和结果（同意，存量的分开再带上分开多久；拒绝；忽略；一直没回；还在等） |
 
 | 输出 | 去向 |
 |------|------|
@@ -211,9 +211,10 @@ insight 字段列表是**固定扁平的类型列集合**（从第一天起就�
 的形式交付；运营方的 `filter_prompt` 只能控制各栏位内容的*丰富程度*，不能改
 动字段列表本身。
 
-生活事件和分开请求是引擎记录的事实，位于故事的上游。一条固定规则告诉导演这些事已经发生：
-可以拿来展开（分手之后更新 `romance_history`，提出分开之后更新 `user_relationship`），
-但不得改写、否认或挪动时间，也不得与她讲述时的原文矛盾。导演写的任何内容都不得与在途背景矛盾；
+生活事件和关系选择是引擎记录的事实，位于故事的上游。一条固定规则告诉导演这些事已经发生：
+可以拿来展开（分手之后更新 `romance_history`；告白、求婚或分手之后更新 `user_relationship`），
+但不得改写、否认或挪动时间，也不得与她讲述时的原文矛盾。另一条规则说明关系状态和冷战同样是引擎记录的：
+`user_relationship` 不得与它们矛盾。状态为 `none` 时引擎还没有记录，以聊天记录为准。导演写的任何内容都不得与在途背景矛盾；
 digest 不必提它，提到时写成有终点的事——回复在 `[now]` 下已经实时读到背景。
 故事导演和 World Memories 导演都不写事件，也不改角色的事件设定。
 

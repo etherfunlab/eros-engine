@@ -239,7 +239,7 @@ weight = min(turns, cap(duration)) × AFFINITY_ACTIVITY_TURN_SHARE
 上限设为 `0` 时，这种时长的约会什么都不挪动。非法值保持默认并打一条警告。
 
 写入从结算时存储的状态开始，经过时间衰减，所以约会期间被拒动作降掉的档仍然降着。每一项原始分都乘 `weight`，跨线惩罚也一样；
-负分乘 `AFFINITY_NEG_FACTOR`；正分乘这条线结算时所在档的档位衰减；阈值门、clamp、demo 加成和分开之后的放缓都和回合上一样，
+负分乘 `AFFINITY_NEG_FACTOR`；正分乘这条线结算时所在档的档位衰减；阈值门、clamp、demo 加成和冷战减半都和回合上一样，
 没有规则微调。结论里的 `warmth` 和 `patience` 等级覆写存储的等级，两个端点重新派生。各步骤见
 [affinity-model.zh.md](affinity-model.zh.md#写入管线仅线轴基础对从不进入)。
 

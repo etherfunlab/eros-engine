@@ -226,11 +226,11 @@ takes no roster slot from an instance that has a genome.
 | Persona | `persona_genomes` via instance: name, personality, backstory (canon) |
 | Current insight + digest | `persona_story_insights` row (`last_run_at IS NULL` ⇒ first-round init) |
 | Recent events (12) | `persona_story_events`, chronological — continuity + repetition guard |
-| Affinity snapshot | latest session's six axes + bond + chemistry + both tier labels — advisory only |
+| Affinity snapshot | latest session's six axes + bond + chemistry + both tier labels — advisory only — plus its [relationship status](affinity-model.md#relationship-status) and cold-war flag, which are engine-recorded fact |
 | Chat evidence | user→reply pairs of this (owner, instance), last `context_days` (default 7), capped by turn count; messages the persona sent on her own (event and life-choice messages, greetings) are not evidence, nor are the turns of a [date](activities.md) |
 | Life events (30) | `persona_events` of the instance started in the same window, plus any under way: label, category, relative time (`3 天前开始，持续 2 小时`), and the message she told it in, if any. `taking_space` / `fell_out` only from unarchived sessions; the narration of an event told in an archived session is left out; a false alarm only once it has ended, with its outcome; never a `bathing_together`, a `showering_together`, a `having_sex_together`, a `streaking_together`, a `using_toilet_together`, an `asleep_together` or an `on_a_date`, which live in the conversation only |
 | Background under way | the one of those life events that is a background under way, repeated on its own |
-| Ask-for-space choices (10) | `life_choices` of the pair's unarchived sessions in the window: her ask and its outcome (accepted with the separation's length, declined, ignored, unanswered, still waiting) |
+| Relationship choices (10) | `life_choices` of kinds `confess`, `partner_up`, `propose` and `break_up`, and stored `ask_for_space` ones, of the pair's unarchived sessions in the window: her ask and its outcome (accepted, with a stored separation's length; declined; ignored; unanswered; still waiting) |
 
 | Output | Where it goes |
 |--------|---------------|
@@ -249,9 +249,11 @@ field list itself.
 
 Life events and choices are engine-recorded facts, upstream of the story. A
 fixed rule tells the director they have happened: it may build on them (a
-breakup feeds `romance_history`, an ask for space feeds `user_relationship`)
-but not rewrite, deny or move them, nor contradict what she said when she told
-them. Nothing it writes may contradict the background under way; the digest
+breakup feeds `romance_history`; a confession, a proposal or a break-up feeds
+`user_relationship`) but not rewrite, deny or move them, nor contradict what she
+said when she told them. A second rule names the relationship status and the
+cold war as engine-recorded too: `user_relationship` must not contradict them.
+At `none` the engine has recorded nothing yet, and the chat decides. Nothing it writes may contradict the background under way; the digest
 need not mention it, and when it does, writes it as something that ends, since
 the reply already reads the background live under `[now]`. Neither the story
 nor the World Memories director writes events or changes a persona's event

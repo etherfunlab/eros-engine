@@ -82,7 +82,7 @@ spawn post_process     tokio::spawn — runs concurrent with response return:
 
 **Ghost-streak reset** is handled by the orchestrator before spawning post-process: on Reply the streak is cleared in a single idempotent UPDATE; on Ghost the orchestrator calls `AffinityRepo::record_ghost` instead. The `persist_with_event` repo method itself never touches the streak.
 
-**Offline.** While an offline life event of the persona is under way (`away_from_phone`, `busy`, `in_battle`, `asleep`, the two gatherings, `having_sex`, a female persona's `out_shopping`, or the separation she asked for), a text turn without a user action or `image.force` ghosts before the PDE, unless the deployment turned ghosting off (`ghosting = false` in `[tasks.pde_decision]`): the row is marked ghosted and the ghost frames are yielded, and neither the judge nor `record_ghost` runs. See [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
+**Offline.** While an offline life event of the persona is under way (`away_from_phone`, `busy`, `in_battle`, `asleep`, the two gatherings, `having_sex`, a female persona's `out_shopping`, or a stored separation), a text turn without a user action or `image.force` ghosts before the PDE, unless the deployment turned ghosting off (`ghosting = false` in `[tasks.pde_decision]`): the row is marked ghosted and the ghost frames are yielded, and neither the judge nor `record_ghost` runs. See [ghost-mechanics.md](ghost-mechanics.md#ghosting-the-engine-imposes).
 
 **PDE action list.** The judge's (or rule engine's) per-turn action is one of
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`.
@@ -194,6 +194,7 @@ crates/
 │       ├── needs.rs          # the persona's four needs and her habits (levels + time carry-forward)
 │       ├── pde.rs            # rules-based action decision
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
+│       ├── relationship.rs   # relationship status, cold-war streaks, composed relation
 │       ├── scope.rs          # per-request injection scope (InsightMode / MemoryScope)
 │       └── types.rs          # ActionType / Event / DecisionInput / ConversationSignals
 ├── eros-engine-llm/
@@ -208,9 +209,9 @@ crates/
 │       ├── chat.rs           # ChatRepo
 │       ├── events.rs         # EventRepo (persona_events: life events under way, history, offline stretches, false alarms)
 │       ├── group.rs          # GroupRepo (group sessions, membership)
-│       ├── life_choices.rs   # LifeChoiceRepo (the persona's life choices: rows, pending, resolve, slowdown window)
+│       ├── life_choices.rs   # LifeChoiceRepo (the persona's life choices: rows, pending, resolve, streak anchor)
 │       ├── activity.rs       # ActivityRepo (dates: opening one, the settlement claim, the date's transcript)
-│       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost, persist_life_choice_drop_in_tx)
+│       ├── affinity.rs       # AffinityRepo (persist_with_event, record_ghost, persist_life_choice_drop_in_tx, relationship status and cold war)
 │       ├── memory.rs         # MemoryRepo (Profile/Relationship layers)
 │       ├── insight.rs        # InsightEventRepo (human_insights_events audit rows)
 │       ├── human_fact.rs     # HumanFactRepo (the user's fact ledger: dedup upsert, export keyset)
@@ -240,10 +241,10 @@ crates/
 
 ## Sub-pages
 
-- [Affinity model](affinity-model.md) — 6 dimensions, graded write pipeline, time decay, relationship labels
+- [Affinity model](affinity-model.md) — 6 dimensions, graded write pipeline, time decay, relationship labels, relationship status and cold war
 - [Ghost mechanics](ghost-mechanics.md) — score formula + protection rules + worked examples
 - [Group chat](group-chat.md) — one user, up to three personas, the director, the speaker relay
-- [Life events and needs](life-events-needs.md) — the persona's needs and their drift, the event draw, backgrounds, offline kinds, false alarms, the ask-for-space and romantic choices
+- [Life events and needs](life-events-needs.md) — the persona's needs and their drift, the event draw, backgrounds, offline kinds, false alarms, the life choices and the cold war
 - [Activities](activities.md) — a date as a sub-session: the invitation and its gate, date turns, what pauses, settlement, the memory it leaves
 - [Memory layers](memory-layers.md) — profile vs relationship, Voyage, pgvector retrieval
 - [Deploying](deploying.md) — Docker, bring-your-own Postgres / IdP
