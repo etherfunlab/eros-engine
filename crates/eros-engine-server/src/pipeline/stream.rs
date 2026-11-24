@@ -4375,37 +4375,41 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-/// The background and foreground kinds a picture reads from the events
+/// The background, cycle and foreground kinds a picture reads from the events
 /// `current` holds, with the kind being started this moment (`starting`, not
-/// stored yet) counted as live: a background kind stands in for the
-/// background, any other for the foreground.
+/// stored yet) counted as live: it stands in for the slot `slot()` gives it
+/// (spec 2026-11-24-period-cycle-design.md §7).
 fn picture_kinds(
     current: &eros_engine_store::events::CurrentEvents,
     starting: Option<eros_engine_core::events::EventKind>,
 ) -> (
     Option<eros_engine_core::events::EventKind>,
     Option<eros_engine_core::events::EventKind>,
+    Option<eros_engine_core::events::EventKind>,
 ) {
+    use eros_engine_core::events::Slot;
     let mut background = current.background.as_ref().map(|e| e.kind);
+    let mut cycle = current.cycle.as_ref().map(|e| e.kind);
     let mut foreground = current.foreground.as_ref().map(|e| e.kind);
-    match starting {
-        Some(kind) if kind.is_background() => background = Some(kind),
-        Some(kind) => foreground = Some(kind),
-        None => {}
+    if let Some(kind) = starting {
+        *match kind.slot() {
+            Slot::Background => &mut background,
+            Slot::Cycle => &mut cycle,
+            Slot::Foreground => &mut foreground,
+        } = Some(kind);
     }
-    (background, foreground)
+    (background, cycle, foreground)
 }
 
 /// What the composer's `[此刻状态]` says of the events `current` holds, with
 /// the kind being started this moment (`starting`, not stored yet) counted as
-/// live: a background kind stands in for the background, any other for the
-/// foreground. Pure.
+/// live in its slot. Pure.
 pub(crate) fn picture_state_of(
     current: &eros_engine_store::events::CurrentEvents,
     starting: Option<eros_engine_core::events::EventKind>,
 ) -> Option<String> {
-    let (background, foreground) = picture_kinds(current, starting);
-    crate::prompt::current_state(background, foreground)
+    let (background, cycle, foreground) = picture_kinds(current, starting);
+    crate::prompt::current_state(background, cycle, foreground)
 }
 
 /// What the composer's `[对方]` says: the user's gender when one is given and
@@ -4417,7 +4421,7 @@ pub(crate) fn partner_gender_of(
     starting: Option<eros_engine_core::events::EventKind>,
     gender: Option<crate::routes::companion_stream::UserGender>,
 ) -> Option<&'static str> {
-    let (background, foreground) = picture_kinds(current, starting);
+    let (background, _, foreground) = picture_kinds(current, starting);
     let shared = [background, foreground]
         .into_iter()
         .flatten()
@@ -23957,6 +23961,46 @@ data: [DONE]\n\n"
         );
     }
 
+    /// Spec 2026-11-24-period-cycle-design.md §7: her cycle sits between the
+    /// background and the foreground, and a cycle kind being started takes
+    /// the cycle's place.
+    #[test]
+    fn the_picture_state_carries_her_cycle() {
+        use eros_engine_core::events::EventKind::*;
+        let epoch = chrono::DateTime::UNIX_EPOCH;
+        let on_period = eros_engine_store::events::CurrentEvents {
+            foreground: Some(live_event(OnATrain)),
+            background: Some(live_event(ShortTrip)),
+            cycle: Some(eros_engine_store::events::CycleEvent {
+                kind: Period,
+                started_at: epoch,
+                ends_at: epoch,
+                message_id: None,
+            }),
+            ..eros_engine_store::events::CurrentEvents::none(epoch)
+        };
+        assert_eq!(
+            picture_state_of(&on_period, None).as_deref(),
+            Some("短途旅游；月经中；在坐火车")
+        );
+        assert_eq!(
+            picture_state_of(&on_period, Some(TakingSelfie)).as_deref(),
+            Some("短途旅游；月经中；刚拍了张自拍")
+        );
+        let background_only = eros_engine_store::events::CurrentEvents {
+            background: Some(live_event(ShortTrip)),
+            ..eros_engine_store::events::CurrentEvents::none(epoch)
+        };
+        assert_eq!(
+            picture_state_of(&background_only, Some(Period)).as_deref(),
+            Some("短途旅游；月经中")
+        );
+        assert_eq!(
+            picture_state_of(&on_period, Some(PeriodScare)).as_deref(),
+            Some("短途旅游；月经没来；在坐火车")
+        );
+    }
+
     /// Only an accepted together action names a kind for the picture; on a
     /// date it takes `on_a_date`'s place there (spec 2026-11-20-together-
     /// actions-state-in-picture-and-genome-routes-design.md §5).
@@ -25244,12 +25288,14 @@ data: [DONE]\n\n"
             turn_mins_ago,
             image,
             true,
+            None,
         )
         .await
     }
 
     /// [`run_event_turn_with`] under a model config whose ghosting switch
-    /// (`[tasks.pde_decision].ghosting`) is `ghosting`.
+    /// (`[tasks.pde_decision].ghosting`) is `ghosting`, and, when given, with
+    /// the genome's `art_metadata`.
     #[allow(clippy::too_many_arguments)]
     async fn run_event_turn_in(
         pool: &PgPool,
@@ -25260,6 +25306,7 @@ data: [DONE]\n\n"
         turn_mins_ago: i32,
         image: Option<crate::routes::companion_stream::ImageReplyParams>,
         ghosting: bool,
+        art: Option<serde_json::Value>,
     ) -> NeedsTurn {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
@@ -25293,7 +25340,15 @@ data: [DONE]\n\n"
             .await;
 
         let user_id = Uuid::new_v4();
-        let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let (genome_id, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        if let Some(art) = art {
+            sqlx::query("UPDATE engine.persona_genomes SET art_metadata = $2 WHERE id = $1")
+                .bind(genome_id)
+                .bind(art)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
         let mut state = crate::routes::companion::test_state(pool.clone());
         let toml = if verdict.is_some() {
             format!(
@@ -25788,6 +25843,7 @@ data: [DONE]\n\n"
             0,
             None,
             false,
+            None,
         )
         .await;
         let reqs = t.mock.received_requests().await.unwrap();
@@ -25892,15 +25948,27 @@ data: [DONE]\n\n"
         assert!(!chat_request_body(&reqs).contains("- 刚才："));
     }
 
+    /// A scare under way is her cycle state: a female human whose period is
+    /// due inside the scare's window (spec 2026-11-24-period-cycle-design.md
+    /// §6, §7).
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn while_the_scare_lasts_nothing_says_it_is_false(pool: PgPool) {
-        let t = run_event_turn(
+        let day = 24 * 60;
+        let t = run_event_turn_in(
             &pool,
             &[],
-            &[ev_here("period_scare", 10, 50)],
+            // Her period started 27 days ago, so the next is due in a day;
+            // the scare ends a day after that.
+            &[
+                ev("period", 27 * day, -24 * day),
+                ev_here("period_scare", 10, 2 * day),
+            ],
             &[],
             Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
             0,
+            None,
+            true,
+            Some(serde_json::json!({"gender": "female"})),
         )
         .await;
         let reqs = t.mock.received_requests().await.unwrap();

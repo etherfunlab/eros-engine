@@ -949,6 +949,11 @@ async fn plan_event(
     let ever_had_sex = event_repo
         .ever(instance_id, &events::EventKind::SEX)
         .await?;
+    // Her cycle at the draw (spec 2026-11-24-period-cycle-design.md §5, §7):
+    // the rows the draw reads, and whether her period is under way.
+    let current = event_repo
+        .current(instance_id, None, now, traits.cycle_health())
+        .await?;
     let Some(drawn) = events::draw(
         &DrawInput {
             now,
@@ -959,7 +964,7 @@ async fn plan_event(
             allowed: &allowed,
             ever_had_sex,
             romance_compatible,
-            cycle: Default::default(),
+            cycle: current.cycle_rows,
         },
         rolls,
     ) else {
@@ -987,8 +992,12 @@ async fn plan_event(
 
     let background = history
         .iter()
-        .find(|e| e.kind.is_background() && e.ends_at > now)
+        .find(|e| e.kind.slot() == events::Slot::Background && e.ends_at > now)
         .map(|e| e.kind);
+    let on_period = current
+        .cycle
+        .as_ref()
+        .is_some_and(|c| c.kind == EventKind::Period);
     // Her picture: a kind about a photo, a caller that handles images, and a
     // configured composer (spec 2026-10-26-event-message-image-design.md §3).
     let image = req
@@ -1047,6 +1056,7 @@ async fn plan_event(
                 kind: drawn.kind,
                 lasts: drawn.lasts,
                 background,
+                on_period,
                 image,
                 outfit,
             },
@@ -1978,6 +1988,56 @@ mod tests {
         );
     }
 
+    /// Spec 2026-11-24-period-cycle-design.md §7.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incident_during_her_period_opens_with_it(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        set_art(&pool, instance_id, json!({"gender": "female"})).await;
+        let started = Utc::now() - chrono::Duration::hours(12);
+        EventRepo { pool: &pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: "period",
+                    kind: EventKind::Period,
+                    started_at: started,
+                    ends_at: started + chrono::Duration::days(3),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "肚子痛还遇到一只小猫").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            req("k1", Some(vec![EventKindDto::AnimalEncounter])),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.event.is_some());
+        let c = calls(&mock).await;
+        let msgs = c[0]["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.last().unwrap()["content"],
+            json!("（你正在经期。你刚在路上遇到了一只小动物。）")
+        );
+        assert!(
+            c[0].to_string()
+                .contains("- 正在经历：月经中（约 2 天后结束）"),
+            "{}",
+            c[0]
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn period_is_drawn_only_for_a_female_persona(pool: PgPool) {
         let user_id = Uuid::new_v4();
@@ -1992,6 +2052,155 @@ mod tests {
         assert!(out.event.is_none());
         assert!(calls(&mock).await.is_empty());
         set_art(&pool, instance_id, json!({"gender": "female"})).await;
+        let out = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.5))
+            .await
+            .unwrap();
+        assert_eq!(out.event.map(|e| e.kind), Some(EventKindDto::Period));
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §5: `period` is drawn only
+    /// without an anchor, and lasts the days her health gives.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_second_period_is_never_drawn(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        set_art(&pool, instance_id, json!({"gender": "female"})).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "那个来了，肚子好痛").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let only = |key: &str| req(key, Some(vec![EventKindDto::Period]));
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            only("k1"),
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let first = out.event.expect("her first period");
+        assert_eq!(first.kind, EventKindDto::Period);
+        assert_eq!(first.ends_at - first.started_at, chrono::Duration::days(3));
+        // The row moves back in time rather than the draw forward: a told
+        // event is stored at the clock. Forty days on, every cooldown has
+        // passed and the period her cycle derives has ended.
+        for (key, days) in [("k2", 10), ("k3", 40)] {
+            sqlx::query(
+                "UPDATE engine.persona_events \
+                    SET started_at = $2, ends_at = $2 + interval '3 days' \
+                  WHERE session_id = $1 AND kind = 'period'",
+            )
+            .bind(session_id)
+            .bind(first.started_at - chrono::Duration::days(days))
+            .execute(&pool)
+            .await
+            .unwrap();
+            let out = draw_event_at(
+                &state,
+                session_id,
+                user_id,
+                only(key),
+                Utc::now(),
+                rolls(0.5),
+            )
+            .await
+            .unwrap();
+            assert!(out.event.is_none(), "{days} days on");
+        }
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §6.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_scare_is_drawn_before_the_due_moment_and_outlives_it(pool: PgPool) {
+        use chrono::SubsecRound;
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        set_art(&pool, instance_id, json!({"gender": "female"})).await;
+        rung_two(&pool, session_id, user_id, instance_id).await;
+        let now = Utc::now().trunc_subsecs(6);
+        // Her period started 27 days ago: the next one is due tomorrow.
+        let anchor = now - chrono::Duration::days(27);
+        EventRepo { pool: &pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: "anchor",
+                    kind: EventKind::Period,
+                    started_at: anchor,
+                    ends_at: anchor + chrono::Duration::days(3),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mock = MockServer::start().await;
+        mount_streamed(&mock, &["按日子该来了"]).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+
+        let resp = draw_event_stream_at(
+            &state,
+            session_id,
+            user_id,
+            req("s1", Some(vec![EventKindDto::PeriodScare])),
+            now,
+            events::Rolls {
+                category: 0.5,
+                kind: 0.5,
+                duration: 0.0,
+            },
+        )
+        .await
+        .unwrap();
+        let frames = read_sse(resp).await;
+        let scare = &frames[0]["event"];
+        assert_eq!(scare["kind"], "period_scare", "{frames:?}");
+        let ends_at: DateTime<Utc> = scare["ends_at"].as_str().unwrap().parse().unwrap();
+        assert_eq!(ends_at, now + chrono::Duration::hours(48));
+        assert_eq!(scare["offline"], false);
+
+        // An hour into the scare, an incident still happens.
+        let resp = draw_event_stream_at(
+            &state,
+            session_id,
+            user_id,
+            req("s2", Some(vec![EventKindDto::AnimalEncounter])),
+            now + chrono::Duration::hours(1),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let frames = read_sse(resp).await;
+        assert_eq!(frames[0]["event"]["kind"], "animal_encounter", "{frames:?}");
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §4.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_species_draws_period_only_when_her_card_says_so(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "那个来了").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let only = || req("k", Some(vec![EventKindDto::Period]));
+        set_art(
+            &pool,
+            instance_id,
+            json!({"gender": "female", "species": "elf"}),
+        )
+        .await;
+        let out = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.5))
+            .await
+            .unwrap();
+        assert!(out.event.is_none());
+        set_art(
+            &pool,
+            instance_id,
+            json!({"gender": "female", "species": "elf", "period": true}),
+        )
+        .await;
         let out = draw_event_at(&state, session_id, user_id, only(), Utc::now(), rolls(0.5))
             .await
             .unwrap();

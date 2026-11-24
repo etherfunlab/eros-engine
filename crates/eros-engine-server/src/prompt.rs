@@ -1187,13 +1187,15 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
 }
 
 /// What she is doing, as the image composer reads it: the labels of what is
-/// live, the background first, then the foreground incident, joined by `；`.
-/// `None` when neither is.
+/// live, the background first, then her cycle (spec 2026-11-24-period-cycle-
+/// design.md §7), then the foreground incident, joined by `；`. `None` when
+/// none is.
 pub(crate) fn current_state(
     background: Option<eros_engine_core::events::EventKind>,
+    cycle: Option<eros_engine_core::events::EventKind>,
     foreground: Option<eros_engine_core::events::EventKind>,
 ) -> Option<String> {
-    let labels: Vec<&str> = [background, foreground]
+    let labels: Vec<&str> = [background, cycle, foreground]
         .into_iter()
         .flatten()
         .map(event_label)
@@ -1243,11 +1245,35 @@ pub(crate) fn event_when_text(
     }
 }
 
+/// What is under way in `c`, in the order it is rendered: the background,
+/// her cycle, then the foreground (spec 2026-11-24-period-cycle-design.md
+/// §7).
+fn under_way(
+    c: &eros_engine_store::events::CurrentEvents,
+) -> impl Iterator<Item = eros_engine_core::events::PastEvent> {
+    let cycle = c
+        .cycle
+        .as_ref()
+        .map(|e| eros_engine_core::events::PastEvent {
+            kind: e.kind,
+            started_at: e.started_at,
+            ends_at: e.ends_at,
+        });
+    [
+        c.background.as_ref().map(|e| e.past()),
+        cycle,
+        c.foreground.as_ref().map(|e| e.past()),
+    ]
+    .into_iter()
+    .flatten()
+}
+
 /// `[近期事件]` (spec 2026-10-15-life-events-v2-design.md §8.2; 2026-10-16-
-/// life-events-offline-and-scares-design.md §4.2, §5.2): the background, the
-/// foreground, an offline stretch she has not explained, a separation that
-/// ended and has not been marked, a false alarm not yet resolved, then the
-/// date they are just back from, each 「临时接到工作（1 小时前开始，约 3 小时
+/// life-events-offline-and-scares-design.md §4.2, §5.2): the background, her
+/// cycle (spec 2026-11-24-period-cycle-design.md §7), the foreground, an
+/// offline stretch she has not explained, a separation that ended and has not
+/// been marked, a false alarm not yet resolved, then the date they are just
+/// back from, each 「临时接到工作（1 小时前开始，约 3 小时
 /// 后结束）」, 「睡着了（2 小时前结束，期间对方的消息你没有回）」, 「说好暂时
 /// 分开（2 小时前结束，对方等到了约定之后）」, 「月经没来（1 小时前结束，结果
 /// 是虚惊一场）」 or 「和对方约会（1 小时前结束）」; a false alarm under way is
@@ -1263,9 +1289,7 @@ pub(crate) fn events_judge_text(
     scare: Option<&eros_engine_store::events::EventRecord>,
     date_back: Option<&eros_engine_store::activity::ActivityRecord>,
 ) -> Option<String> {
-    let mut items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
-        .into_iter()
-        .flatten()
+    let mut items: Vec<String> = under_way(c)
         .map(|e| {
             if e.kind.is_false_alarm() {
                 return event_label(e.kind).to_string();
@@ -1314,13 +1338,11 @@ pub(crate) fn events_judge_text(
     (!items.is_empty()).then(|| items.join("；"))
 }
 
-/// `正在经历` (§8.2): the background, then the foreground, each
-/// 「临时接到工作（约 3 小时后结束）」; a false alarm under way is its label
-/// alone; `None` when neither.
+/// `正在经历` (§8.2): the background, her cycle (spec 2026-11-24-period-
+/// cycle-design.md §7), then the foreground, each 「临时接到工作（约 3 小时
+/// 后结束）」; a false alarm under way is its label alone; `None` when none.
 pub(crate) fn events_reply_text(c: &eros_engine_store::events::CurrentEvents) -> Option<String> {
-    let items: Vec<String> = [c.background.as_ref(), c.foreground.as_ref()]
-        .into_iter()
-        .flatten()
+    let items: Vec<String> = under_way(c)
         .map(|e| {
             if e.kind.is_false_alarm() {
                 event_label(e.kind).to_string()
@@ -1337,8 +1359,8 @@ pub(crate) fn events_reply_text(c: &eros_engine_store::events::CurrentEvents) ->
 /// and-scares-design.md §6).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EventLines {
-    /// `正在经历`: the background and the foreground under way, rendered by
-    /// `events_reply_text`.
+    /// `正在经历`: the background, her cycle and the foreground under way,
+    /// rendered by `events_reply_text`.
     pub under_way: Option<String>,
     /// `刚才`: an offline stretch this session has not been told about, the
     /// return of a separation she asked for (marked whether or not the user
@@ -5174,15 +5196,25 @@ mod tests {
             chrono::DateTime<chrono::Utc>,
         ),
     ) -> eros_engine_store::events::CurrentEvents {
-        let (foreground, background) = if e.kind.is_background() {
-            (None, Some(e))
-        } else {
-            (Some(e), None)
-        };
-        eros_engine_store::events::CurrentEvents {
-            foreground,
-            background,
-            ..eros_engine_store::events::CurrentEvents::none(at)
+        use eros_engine_core::events::Slot;
+        let mut c = eros_engine_store::events::CurrentEvents::none(at);
+        match e.kind.slot() {
+            Slot::Foreground => c.foreground = Some(e),
+            Slot::Background => c.background = Some(e),
+            Slot::Cycle => c.cycle = Some(cycle_event(e)),
+        }
+        c
+    }
+
+    /// `e` as the cycle slot holds it.
+    fn cycle_event(
+        e: eros_engine_store::events::EventRecord,
+    ) -> eros_engine_store::events::CycleEvent {
+        eros_engine_store::events::CycleEvent {
+            kind: e.kind,
+            started_at: e.started_at,
+            ends_at: e.ends_at,
+            message_id: e.message_id,
         }
     }
 
@@ -5302,8 +5334,8 @@ mod tests {
         let (trip, at) = event_at(EventKind::BusinessTrip, 600, 840);
         let (scare, _) = event_at(EventKind::PeriodScare, 30, 90);
         let c = eros_engine_store::events::CurrentEvents {
-            foreground: Some(scare),
             background: Some(trip),
+            cycle: Some(cycle_event(scare)),
             ..eros_engine_store::events::CurrentEvents::none(at)
         };
         assert_eq!(
@@ -5320,6 +5352,61 @@ mod tests {
         assert_eq!(
             events_judge_text(&c, None, None, None, None).unwrap(),
             "验出怀孕"
+        );
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §7: her cycle reads after the
+    /// background and before the foreground; a late period is its label
+    /// alone.
+    #[test]
+    fn the_cycle_reads_between_background_and_foreground() {
+        use eros_engine_core::events::EventKind::{LongTrip, Period, PeriodScare, Reading};
+        let (m, d) = (chrono::Duration::minutes, chrono::Duration::days);
+        let (trip, at) = event_at(LongTrip, 2 * 24 * 60, 3 * 24 * 60);
+        let (period, _) = event_at(Period, 60, 3 * 24 * 60);
+        let (reading, _) = event_at(Reading, 30, 90);
+        let c = eros_engine_store::events::CurrentEvents {
+            foreground: Some(reading),
+            background: Some(trip),
+            cycle: Some(cycle_event(period)),
+            ..eros_engine_store::events::CurrentEvents::none(at)
+        };
+        assert_eq!(
+            events_judge_text(&c, None, None, None, None).unwrap(),
+            format!(
+                "{}（{}前开始，{}）；{}（{}前开始，{}）；{}（{}前开始，{}）",
+                event_label(LongTrip),
+                span_text(d(2)),
+                ends_text(d(3)),
+                event_label(Period),
+                span_text(m(60)),
+                ends_text(d(3)),
+                event_label(Reading),
+                span_text(m(30)),
+                ends_text(m(90)),
+            )
+        );
+        assert_eq!(
+            events_reply_text(&c).unwrap(),
+            format!(
+                "{}（{}）；{}（{}）；{}（{}）",
+                event_label(LongTrip),
+                ends_text(d(3)),
+                event_label(Period),
+                ends_text(d(3)),
+                event_label(Reading),
+                ends_text(m(90)),
+            )
+        );
+        let late = only(event_at(PeriodScare, 10, 2 * 24 * 60));
+        assert_eq!(event_label(PeriodScare), "月经没来");
+        assert_eq!(
+            events_judge_text(&late, None, None, None, None).as_deref(),
+            Some(event_label(PeriodScare))
+        );
+        assert_eq!(
+            events_reply_text(&late).as_deref(),
+            Some(event_label(PeriodScare))
         );
     }
 
@@ -5571,18 +5658,39 @@ mod tests {
     fn current_state_lists_background_then_foreground() {
         use eros_engine_core::events::EventKind::{OnATrain, ShortTrip};
         assert_eq!(
-            current_state(Some(ShortTrip), Some(OnATrain)).as_deref(),
+            current_state(Some(ShortTrip), None, Some(OnATrain)).as_deref(),
             Some("短途旅游；在坐火车")
         );
         assert_eq!(
-            current_state(Some(ShortTrip), None).as_deref(),
+            current_state(Some(ShortTrip), None, None).as_deref(),
             Some("短途旅游")
         );
         assert_eq!(
-            current_state(None, Some(OnATrain)).as_deref(),
+            current_state(None, None, Some(OnATrain)).as_deref(),
             Some("在坐火车")
         );
-        assert_eq!(current_state(None, None), None);
+        assert_eq!(current_state(None, None, None), None);
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §7.
+    #[test]
+    fn the_picture_state_names_her_period() {
+        use eros_engine_core::events::EventKind::{LongTrip, Period, Reading};
+        assert_eq!(
+            current_state(Some(LongTrip), Some(Period), Some(Reading)).as_deref(),
+            Some(
+                &*[
+                    event_label(LongTrip),
+                    event_label(Period),
+                    event_label(Reading)
+                ]
+                .join("；")
+            )
+        );
+        assert_eq!(
+            current_state(None, Some(Period), None).as_deref(),
+            Some("月经中")
+        );
     }
 
     #[test]
@@ -7059,7 +7167,12 @@ mod tests {
             assert_eq!(event_label(a.together_kind().unwrap()), label, "{a:?}");
         }
         assert_eq!(
-            current_state(Some(EventKind::ShortTrip), Some(EventKind::HikingTogether)).as_deref(),
+            current_state(
+                Some(EventKind::ShortTrip),
+                None,
+                Some(EventKind::HikingTogether)
+            )
+            .as_deref(),
             Some("短途旅游；和对方一起爬山")
         );
     }
@@ -7113,7 +7226,12 @@ mod tests {
             assert_eq!(event_label(a.together_kind().unwrap()), label, "{a:?}");
         }
         assert_eq!(
-            current_state(Some(EventKind::ShortTrip), Some(EventKind::SaunaTogether)).as_deref(),
+            current_state(
+                Some(EventKind::ShortTrip),
+                None,
+                Some(EventKind::SaunaTogether)
+            )
+            .as_deref(),
             Some("短途旅游；和对方一起蒸桑拿")
         );
     }
