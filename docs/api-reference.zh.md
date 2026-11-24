@@ -1221,7 +1221,7 @@ engine 不接收也不保存用户的性别或性取向。
 ```json
 {"status": "accepted",
  "message": {"message_id": "…", "content": "真的吗？那我们以后就是男女朋友了。", "sent_at": "2026-11-24T12:00:00Z", "occasion": "life_choice"},
- "affinity": {"bond_tier": 3, "chem_tier": 4, "bond_label": "close_friend", "chemistry_label": "lover", "relationship_status": "dating", "cold_war": false, "composed_relation": "close_lover", "…": "…"},
+ "affinity": {"bond_tier": 3, "chem_tier": 4, "bond_label": "close_friend", "chemistry_label": "lover", "relationship_status": "dating", "cold_war": false, "composed_relation": "tender_lover", "…": "…"},
  "event": null}
 ```
 
@@ -2334,7 +2334,7 @@ session 403）。
 - `relationship_status` ∈ `none | dating | partner | peer | fwb | situationship | engaged | ex`：这一对说定了是什么关系，
   只由 `confess`、`partner_up`、`propose` 和 `break_up` 挪动（见 [affinity-model.zh.md](affinity-model.zh.md#关系状态)）。BYOC 关系永远是 `none`。
 - `cold_war` —— 是否在冷战（见[冷战](life-events-needs.zh.md#冷战)）。
-- `composed_relation` —— 两个档位合起来的名字的键（`good_friend`、`more_than_friends`……，bond 档 × chemistry 档每格一个），
+- `composed_relation` —— 两个档位合起来的名字的键（`trusted_friend`、`more_than_friends`……，bond 档 × chemistry 档每格一个），
   两条线都在第 1 档时为 `null`。它是真实档位那一格：不套用这一对的相容与否，虽然她的提示词对不相容的一对读 chemistry 第 1 列的名字
   （见[组合关系](affinity-model.zh.md#组合关系)）。
 

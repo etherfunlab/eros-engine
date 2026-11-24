@@ -1583,7 +1583,7 @@ this request.
 ```json
 {"status": "accepted",
  "message": {"message_id": "…", "content": "真的吗？那我们以后就是男女朋友了。", "sent_at": "2026-11-24T12:00:00Z", "occasion": "life_choice"},
- "affinity": {"bond_tier": 3, "chem_tier": 4, "bond_label": "close_friend", "chemistry_label": "lover", "relationship_status": "dating", "cold_war": false, "composed_relation": "close_lover", "…": "…"},
+ "affinity": {"bond_tier": 3, "chem_tier": 4, "bond_label": "close_friend", "chemistry_label": "lover", "relationship_status": "dating", "cold_war": false, "composed_relation": "tender_lover", "…": "…"},
  "event": null}
 ```
 
@@ -2904,7 +2904,7 @@ date's sub-session never has one: its relationship is read at the parent's id.
   Always `none` on a BYOC relationship.
 - `cold_war` — whether a cold war is on
   ([the cold war](life-events-needs.md#the-cold-war)).
-- `composed_relation` — the key of what the two tiers add up to (`good_friend`,
+- `composed_relation` — the key of what the two tiers add up to (`trusted_friend`,
   `more_than_friends`, … , one per bond tier × chemistry tier), or `null` at
   tier 1 on both lines. It is the cell of the real tiers: the pair's
   compatibility is not applied, though her prompt reads an incompatible pair's
