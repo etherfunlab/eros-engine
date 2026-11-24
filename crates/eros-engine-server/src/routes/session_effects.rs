@@ -118,17 +118,21 @@ pub struct EffectsResponse {
     pub needs: Option<NeedsView>,
     /// The persona's foreground event under way now, or `null`.
     pub event: Option<crate::routes::session_events::EventView>,
-    /// The persona's background under way now (a trip, an illness), or
+    /// The persona's background under way now (a trip or an illness), or
     /// `null`.
     pub background_event: Option<crate::routes::session_events::EventView>,
+    /// Her period, or a late-period scare, under way now, or `null`. A
+    /// period that came on her cycle has no `message_id`.
+    pub cycle_event: Option<crate::routes::session_events::EventView>,
     /// The server time this response was computed for: the instant the
     /// carried needs and `changes_at` derive from. A client schedules its
     /// re-read by `changes_at - as_of`, counted from the moment it received
     /// the response, so the device clock does not matter.
     pub as_of: chrono::DateTime<chrono::Utc>,
     /// The earliest time at which this response changes with no new turn and
-    /// no new event: the next drift step of a need, or the end of `event` or
-    /// `background_event`. `null` when nothing changes on its own.
+    /// no new event: the next drift step of a need, the end of `event`,
+    /// `background_event` or `cycle_event`, or the start of her next period.
+    /// `null` when nothing changes on its own.
     pub changes_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The persona's date that is `ongoing`, or `ended` and not yet settled
     /// (spec 2026-11-12-activity-sub-session-design.md §10): its
@@ -138,8 +142,10 @@ pub struct EffectsResponse {
 }
 
 /// The persona's lingering state from accepted gives, her needs and the
-/// incident and the background under way, as a text turn sent now would carry
-/// them, and her date until it is settled.
+/// incident, the background (a trip or an illness) and her period under way,
+/// as a text turn sent now would carry them, and her date until it is
+/// settled. Her period, or a late-period scare, is `cycle_event`, not part of
+/// the background.
 #[utoipa::path(
     get,
     path = "/v2/comp/session/{session_id}/effects",
@@ -208,10 +214,18 @@ async fn get_effects(
         .unsettled_for_instance(instance_id)
         .await?
         .map(|a| crate::routes::dto::ActivityView::from_record(&a, now));
+    // Her next period start: while one is under way it is later than that
+    // period's end, so the minimum needs no special case (spec
+    // 2026-11-24-period-cycle-design.md §10).
+    let next_period = traits
+        .cycle_health()
+        .and_then(|_| eros_engine_core::cycle::next_period_start(&current.cycle_rows, now));
     let changes_at = [
         needs_change,
         current.foreground.as_ref().map(|e| e.ends_at),
         current.background.as_ref().map(|e| e.ends_at),
+        current.cycle.as_ref().map(|e| e.ends_at),
+        next_period,
     ]
     .into_iter()
     .flatten()
@@ -221,6 +235,10 @@ async fn get_effects(
         needs: needs.as_ref().map(NeedsView::from),
         event: view(&current.foreground),
         background_event: view(&current.background),
+        cycle_event: current
+            .cycle
+            .as_ref()
+            .map(crate::routes::session_events::EventView::from_cycle),
         as_of: now,
         changes_at,
         activity,
@@ -302,7 +320,7 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{body}");
         assert_eq!(
             without_as_of(body),
-            json!({"effects": [], "needs": null, "event": null, "background_event": null, "changes_at": null})
+            json!({"effects": [], "needs": null, "event": null, "background_event": null, "cycle_event": null, "changes_at": null})
         );
     }
 
@@ -324,7 +342,7 @@ mod tests {
             json!({"effects": [
                 {"item": "cigarette", "quantity": 1, "level": 3, "phase": "peak", "step": 1, "steps": 1},
                 {"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 3, "phase": "peak", "step": 3, "steps": 3},
-            ], "needs": null, "event": null, "background_event": null, "changes_at": null})
+            ], "needs": null, "event": null, "background_event": null, "cycle_event": null, "changes_at": null})
         );
     }
 
@@ -337,7 +355,7 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(
             without_as_of(body),
-            json!({"effects": [], "needs": null, "event": null, "background_event": null, "changes_at": null})
+            json!({"effects": [], "needs": null, "event": null, "background_event": null, "cycle_event": null, "changes_at": null})
         );
     }
 
@@ -474,6 +492,162 @@ mod tests {
             assert_eq!(body["event"]["kind"], json!("out_shopping"), "{art}");
             assert_eq!(body["event"]["offline"], json!(offline), "{art}");
         }
+    }
+
+    /// Gives the instance's persona a card, so `traits` read what the card says.
+    async fn set_art(pool: &sqlx::PgPool, instance_id: Uuid, art: serde_json::Value) {
+        sqlx::query(
+            "UPDATE engine.persona_genomes SET art_metadata = $2 \
+             WHERE id = (SELECT genome_id FROM engine.persona_instances WHERE id = $1)",
+        )
+        .bind(instance_id)
+        .bind(art)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// An event row spanning `from` to `to`, untold.
+    async fn seed_event(
+        pool: &sqlx::PgPool,
+        instance_id: Uuid,
+        session_id: Uuid,
+        kind: eros_engine_core::events::EventKind,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) {
+        eros_engine_store::events::EventRepo { pool }
+            .insert(
+                &eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: kind.as_str(),
+                    kind,
+                    started_at: from,
+                    ends_at: to,
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The clock the handler reads is its own, so rows are placed relative
+    /// to an instant aligned to the microsecond the column stores.
+    fn micros_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros()).unwrap()
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §10: her period comes beside
+    /// the background, not inside it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_effects_carry_her_period(pool: sqlx::PgPool) {
+        use eros_engine_core::events::EventKind;
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        set_art(
+            &pool,
+            instance_id,
+            json!({"gender": "female", "species": "human"}),
+        )
+        .await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        let now = micros_now();
+        // Her first period began 28 days and an hour ago: the second is
+        // under way and began an hour ago.
+        let days = chrono::Duration::days;
+        let anchor = now - days(28) - chrono::Duration::hours(1);
+        seed_event(
+            &pool,
+            instance_id,
+            session_id,
+            EventKind::Period,
+            anchor,
+            anchor + days(3),
+        )
+        .await;
+        seed_event(
+            &pool,
+            instance_id,
+            session_id,
+            EventKind::LongTrip,
+            now - chrono::Duration::hours(2),
+            now + days(5),
+        )
+        .await;
+        let (s, body) = get(pool, session_id, owner).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(body["background_event"]["kind"], json!("long_trip"));
+        let started = anchor + days(28);
+        assert_eq!(
+            body["cycle_event"],
+            json!({
+                "kind": "period",
+                "category": "body",
+                "offline": false,
+                "started_at": started,
+                "ends_at": started + days(3),
+                "message_id": null,
+            })
+        );
+        assert_eq!(
+            body["changes_at"], body["cycle_event"]["ends_at"],
+            "her period ends before the trip does"
+        );
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §10: with nothing under way,
+    /// the next period start is what changes the response.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_effects_know_when_her_period_starts(pool: sqlx::PgPool) {
+        use eros_engine_core::events::EventKind;
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        set_art(&pool, instance_id, json!({"gender": "female"})).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        let started = micros_now() - chrono::Duration::days(10);
+        seed_event(
+            &pool,
+            instance_id,
+            session_id,
+            EventKind::Period,
+            started,
+            started + chrono::Duration::days(3),
+        )
+        .await;
+        let (s, body) = get(pool, session_id, owner).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(body["cycle_event"], json!(null));
+        assert_eq!(
+            body["changes_at"],
+            json!(started + chrono::Duration::days(28))
+        );
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §4: a persona with no period
+    /// has no cycle to report, whatever rows it holds.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_persona_with_no_period_has_no_cycle_event(pool: sqlx::PgPool) {
+        use eros_engine_core::events::EventKind;
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        set_art(&pool, instance_id, json!({"gender": "male"})).await;
+        let session_id = seed_session(&pool, owner, instance_id).await;
+        let started = micros_now() - chrono::Duration::days(10);
+        seed_event(
+            &pool,
+            instance_id,
+            session_id,
+            EventKind::Period,
+            started,
+            started + chrono::Duration::days(3),
+        )
+        .await;
+        let (s, body) = get(pool, session_id, owner).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(body["cycle_event"], json!(null));
+        assert_eq!(body["changes_at"], json!(null));
     }
 
     /// A date of the instance shows on the session's effects while it runs

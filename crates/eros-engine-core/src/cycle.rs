@@ -104,13 +104,8 @@ pub fn latest_period(rows: &CycleRows, health: Health, at: DateTime<Utc>) -> Opt
 }
 
 /// When her next period starts, counting a scare's delay; `None` without an
-/// anchor. The first period that begins strictly after `at`; a start does not
-/// depend on `health`.
-pub fn next_period_start(
-    rows: &CycleRows,
-    _health: Health,
-    at: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
+/// anchor. The first period that begins strictly after `at`.
+pub fn next_period_start(rows: &CycleRows, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let anchor = rows.period?.started_at;
     let n = cycles_since(anchor, at).max(1);
     let start = start_of(rows, anchor, n);
@@ -175,10 +170,7 @@ mod tests {
             scare: Some(scare(t(1, 27, 10), t(1, 31, 8))),
         };
         assert_eq!(state(&only_scare, Health::Normal, t(1, 28, 0)), None);
-        assert_eq!(
-            next_period_start(&only_scare, Health::Normal, t(1, 28, 0)),
-            None
-        );
+        assert_eq!(next_period_start(&only_scare, t(1, 28, 0)), None);
         assert_eq!(
             latest_period(&only_scare, Health::Normal, t(1, 28, 0)),
             None
@@ -273,16 +265,13 @@ mod tests {
     #[test]
     fn the_next_period_start() {
         assert_eq!(
-            next_period_start(&rows(None), Health::Normal, t(1, 10, 0)),
+            next_period_start(&rows(None), t(1, 10, 0)),
             Some(t(1, 29, 8))
         );
         let late = rows(Some(scare(t(1, 27, 10), t(1, 31, 8))));
+        assert_eq!(next_period_start(&late, t(1, 28, 0)), Some(t(1, 31, 8)));
         assert_eq!(
-            next_period_start(&late, Health::Normal, t(1, 28, 0)),
-            Some(t(1, 31, 8))
-        );
-        assert_eq!(
-            next_period_start(&rows(None), Health::Normal, t(1, 30, 0)),
+            next_period_start(&rows(None), t(1, 30, 0)),
             Some(t(2, 26, 8))
         );
     }

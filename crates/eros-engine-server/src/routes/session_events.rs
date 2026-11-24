@@ -431,6 +431,20 @@ impl EventView {
             message_id: e.message_id,
         }
     }
+
+    /// Her period or a late-period scare under way (spec
+    /// 2026-11-24-period-cycle-design.md §10): never offline, and a period
+    /// her cycle derived has no message.
+    pub(crate) fn from_cycle(e: &eros_engine_store::events::CycleEvent) -> Self {
+        Self {
+            kind: e.kind.into(),
+            category: e.kind.category().into(),
+            offline: false,
+            started_at: e.started_at,
+            ends_at: e.ends_at,
+            message_id: e.message_id,
+        }
+    }
 }
 
 /// The kinds a draw may pick: a list of the allowed kinds, or an object of
@@ -656,8 +670,11 @@ async fn stored(
 /// incident is under way, every allowed kind is cooling down, she has put a
 /// choice to the user and waits for the answer, in any session of the persona,
 /// until it is answered or lapses, or a date of the persona has not been
-/// settled yet). During a background event (a trip or a
-/// body state) only incidents are drawn. The
+/// settled yet). During a background event (a trip or an
+/// illness) only incidents are drawn. A `period` is drawn once per persona
+/// and later comes on its own 28-day cycle; `period_scare` is drawn only in
+/// the three days before a period is due, lasts until one to three days
+/// after it, and does not keep other incidents from happening. The
 /// persona then tells the user in one proactive message, persisted like any
 /// reply and returned with the event. The offline kinds (`away_from_phone`,
 /// `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`,
@@ -1994,7 +2011,9 @@ mod tests {
         let user_id = Uuid::new_v4();
         let (instance_id, session_id) = setup(&pool, user_id).await;
         set_art(&pool, instance_id, json!({"gender": "female"})).await;
-        let started = Utc::now() - chrono::Duration::hours(12);
+        // Fifty hours of it remain: the prompt reads a span of 48 hours or
+        // more in whole days, rounded, so this sits inside 「2 天」.
+        let started = Utc::now() - chrono::Duration::hours(22);
         EventRepo { pool: &pool }
             .insert(
                 &eros_engine_store::events::NewEvent {
