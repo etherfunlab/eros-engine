@@ -2724,7 +2724,7 @@
         "tags": [
           "companion"
         ],
-        "summary": "The persona's lingering state from accepted gives, her needs and the\nincident and the background under way, as a text turn sent now would carry\nthem, and her date until it is settled.",
+        "summary": "The persona's lingering state from accepted gives, her needs and the\nincident, the background (a trip or an illness) and her period under way,\nas a text turn sent now would carry them, and her date until it is\nsettled. Her period, or a late-period scare, is `cycle_event`, not part of\nthe background.",
         "operationId": "get_effects",
         "parameters": [
           {
@@ -2796,7 +2796,7 @@
           "companion"
         ],
         "summary": "Ask for something to happen in the persona's day.",
-        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, every allowed kind is cooling down, she has put a\nchoice to the user and waits for the answer, in any session of the persona,\nuntil it is answered or lapses, or a date of the persona has not been\nsettled yet). During a background event (a trip or a\nbody state) only incidents are drawn. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event. The offline kinds (`away_from_phone`,\n`busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`,\n`having_sex`, and `out_shopping` for a female persona) make her\nunreachable while they last.\n`busy`, `in_battle` and a female persona's `out_shopping` are announced in\na message at intimacy rung 2 and up; below that, and always for\n`away_from_phone`, `asleep`, `having_sex` and the gatherings, the event comes back with\n`message: null`. For any other persona `out_shopping` is not offline and\nis announced at every rung. The same `event_key` returns the same event.\n\nWith `image` in the request and `[tasks.chat_image_prompt_compose]`\nconfigured, a `taking_selfie` message also carries her picture: her words\nare written first, the composer draws from them, and the response's\n`image_request` is the `image-request` route's payload (absent without a\npicture). `outfit` dresses her as on a chat turn, in her words and in the\npicture.",
+        "description": "The engine draws one kind of event, or none (a short or mid-length\nincident is under way, every allowed kind is cooling down, she has put a\nchoice to the user and waits for the answer, in any session of the persona,\nuntil it is answered or lapses, or a date of the persona has not been\nsettled yet). During a background event (a trip or an\nillness) only incidents are drawn. A `period` is drawn once per persona\nand later comes on its own 28-day cycle; `period_scare` is drawn only in\nthe three days before a period is due, lasts until one to three days\nafter it, and does not keep other incidents from happening. The\npersona then tells the user in one proactive message, persisted like any\nreply and returned with the event. The offline kinds (`away_from_phone`,\n`busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`,\n`having_sex`, and `out_shopping` for a female persona) make her\nunreachable while they last.\n`busy`, `in_battle` and a female persona's `out_shopping` are announced in\na message at intimacy rung 2 and up; below that, and always for\n`away_from_phone`, `asleep`, `having_sex` and the gatherings, the event comes back with\n`message: null`. For any other persona `out_shopping` is not offline and\nis announced at every rung. The same `event_key` returns the same event.\n\nWith `image` in the request and `[tasks.chat_image_prompt_compose]`\nconfigured, a `taking_selfie` message also carries her picture: her words\nare written first, the composer draws from them, and the response's\n`image_request` is the `image-request` route's payload (absent without a\npicture). `outfit` dresses her as on a chat turn, in her words and in the\npicture.",
         "operationId": "draw_event",
         "parameters": [
           {
@@ -5536,7 +5536,7 @@
               },
               {
                 "$ref": "#/components/schemas/EventView",
-                "description": "The persona's background under way now (a trip, an illness), or\n`null`."
+                "description": "The persona's background under way now (a trip or an illness), or\n`null`."
               }
             ]
           },
@@ -5546,7 +5546,18 @@
               "null"
             ],
             "format": "date-time",
-            "description": "The earliest time at which this response changes with no new turn and\nno new event: the next drift step of a need, or the end of `event` or\n`background_event`. `null` when nothing changes on its own."
+            "description": "The earliest time at which this response changes with no new turn and\nno new event: the next drift step of a need, the end of `event`,\n`background_event` or `cycle_event`, or the start of her next period.\n`null` when nothing changes on its own."
+          },
+          "cycle_event": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventView",
+                "description": "Her period, or a late-period scare, under way now, or `null`. A\nperiod that came on her cycle has no `message_id`."
+              }
+            ]
           },
           "effects": {
             "type": "array",

@@ -504,6 +504,7 @@ pub(crate) fn run_group_turn(
                     Some(turn.user_message_id),
                     chrono::Utc::now(),
                     None,
+                    crate::prompt::persona_traits(&seat.persona).cycle_health(),
                 )
                 .await
             } else {

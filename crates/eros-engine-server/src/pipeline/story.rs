@@ -244,10 +244,15 @@ fn story_user_payload(
         .iter()
         .map(|e| life_event_value(e, now))
         .collect();
+    // Her period is no background here (spec 2026-11-24-period-cycle-
+    // design.md §7, "Not the world system").
     let current_background = evidence
         .life_events
         .iter()
-        .find(|e| e.event.kind.is_background() && e.event.ends_at > now)
+        .find(|e| {
+            e.event.kind.slot() == eros_engine_core::events::Slot::Background
+                && e.event.ends_at > now
+        })
         .map(|e| life_event_value(e, now))
         .unwrap_or(serde_json::Value::Null);
     let life_choices: Vec<serde_json::Value> = evidence
@@ -773,6 +778,29 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("后结束"));
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §7 ("Not the world system").
+    #[test]
+    fn a_period_is_no_background_to_the_story() {
+        let now = fixed_now();
+        let (h, d) = (chrono::Duration::hours, chrono::Duration::days);
+        let period = || life(EventKind::Period, now - h(5), now + d(2), None);
+        let p = payload_with(&StoryEvidence {
+            life_events: vec![
+                period(),
+                life(EventKind::LongTrip, now - d(2), now + d(3), None),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(data(&p)["current_background"]["label"], "长途旅游");
+        let p = payload_with(&StoryEvidence {
+            life_events: vec![period()],
+            ..Default::default()
+        });
+        let d = data(&p);
+        assert!(d["current_background"].is_null());
+        assert_eq!(d["life_events"][0]["label"], "月经中");
     }
 
     #[test]

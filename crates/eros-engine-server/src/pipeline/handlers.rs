@@ -2754,6 +2754,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let system_with = |intimacy_tension: f64| {
             let mut affinity = ladder_test_affinity(session_id, owner, instance_id);
@@ -4008,6 +4009,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -4135,6 +4137,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -4274,6 +4277,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -4428,6 +4432,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -4540,6 +4545,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -4860,6 +4866,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -5063,6 +5070,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let mut affinity = ladder_test_affinity(session_id, owner, instance_id);
         if let Some(v) = turn.axes {
@@ -5415,6 +5423,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -5730,6 +5739,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let input = DecisionInput {
             event: Event::UserMessage {
@@ -5799,6 +5809,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: Some(response),
+            refusal_free: false,
         };
         let mut persona = ladder_test_persona(instance_id, owner);
         persona.genome.tip_personality = tip_personality.map(str::to_string);

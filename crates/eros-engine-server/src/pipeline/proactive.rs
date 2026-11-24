@@ -101,6 +101,9 @@ pub(crate) enum Occasion {
         lasts: chrono::Duration,
         /// The background under way when it was drawn.
         background: Option<EventKind>,
+        /// Her period was under way when it was drawn (spec
+        /// 2026-11-24-period-cycle-design.md §7).
+        on_period: bool,
         /// The message carries her picture, composed with these (spec
         /// 2026-10-26-event-message-image-design.md §3–§4).
         image: Option<ImageReplyParams>,
@@ -297,6 +300,7 @@ impl Occasion {
                 lasts,
                 background,
                 image,
+                on_period,
                 ..
             } => event_cue(
                 *kind,
@@ -306,6 +310,7 @@ impl Occasion {
                 traits,
                 tip_personality,
                 image.is_some(),
+                *on_period,
             ),
             Self::LifeChoice(cue) => cue.cue(),
             Self::ColdWar => COLD_WAR_CUE.into(),
@@ -365,7 +370,7 @@ fn kind_cue(
         Showering => "（你准备去洗澡了。）".into(),
         Bathing => "（你正在泡澡。）".into(),
         OnTheWay => "（你正在赶路。）".into(),
-        PeriodScare => "（你发现月经推迟了好几天还没来，心里有点慌。）".into(),
+        PeriodScare => "（按日子月经这两天就该来了，身体却一点动静都没有，你心里有点慌。）".into(),
         PregnancyScare => "（你刚验了孕，验出两条杠，整个人都懵了。）".into(),
         GotBumped => "（你刚走在路上，被擦撞了一下。）".into(),
         Quarrel => "（你刚跟人吵了一架。）".into(),
@@ -441,7 +446,8 @@ fn kind_cue(
 }
 
 /// How a foreground event's cue opens during a background (spec
-/// 2026-10-15-life-events-v2-design.md §3.4); `None` for a foreground kind.
+/// 2026-10-15-life-events-v2-design.md §3.4) or, for `Period`, during her
+/// period; `None` for a foreground kind.
 fn background_state(kind: EventKind) -> Option<&'static str> {
     use EventKind::*;
     Some(match kind {
@@ -458,7 +464,9 @@ fn background_state(kind: EventKind) -> Option<&'static str> {
 }
 
 /// The kind's cue, opened with the background's state when one is under
-/// way: 「（你正在外地出差。你刚在路上遇到了一只小动物。）」.
+/// way, then with her period when `on_period` (spec 2026-11-24-period-cycle-
+/// design.md §7): 「（你正在外地出差。你正在经期。你刚在路上遇到了一只小动物。）」.
+#[allow(clippy::too_many_arguments)]
 fn event_cue(
     kind: EventKind,
     lasts: chrono::Duration,
@@ -467,6 +475,7 @@ fn event_cue(
     traits: &PersonaTraits,
     tip_personality: Option<&str>,
     picture: bool,
+    on_period: bool,
 ) -> String {
     if background == Some(EventKind::TravelingTogether) {
         match kind {
@@ -482,13 +491,21 @@ fn event_cue(
         }
     }
     let cue = kind_cue(kind, lasts, rung, traits, tip_personality, picture);
-    match background.and_then(background_state) {
-        Some(state) => format!(
-            "（{state}。{}）",
-            cue.trim_start_matches('（').trim_end_matches('）')
-        ),
-        None => cue,
+    let opening: Vec<&str> = [
+        background.and_then(background_state),
+        background_state(EventKind::Period).filter(|_| on_period),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if opening.is_empty() {
+        return cue;
     }
+    format!(
+        "（{}。{}）",
+        opening.join("。"),
+        cue.trim_start_matches('（').trim_end_matches('）')
+    )
 }
 
 /// One proactive message to generate. `metadata` arrives holding the caller's
@@ -592,9 +609,12 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
         image_ref: ImageRef::Previous,
         aspect_ratio: None,
         action_response: None,
+        refusal_free: false,
     };
     let repo = eros_engine_store::events::EventRepo { pool: &state.pool };
-    let current = repo.current(g.instance_id, None, g.now.now).await?;
+    let current = repo
+        .current(g.instance_id, None, g.now.now, traits.cycle_health())
+        .await?;
     // Only a stretch that took this persona offline left something unsaid.
     let offline = repo
         .unexplained_offline(
@@ -719,8 +739,15 @@ async fn store(
         };
         // The events at the instant the reply prompt read them; the event
         // itself is not stored yet, so the kind it starts counts as live.
-        let current_state =
-            state_for_picture(&state.pool, g.instance_id, None, g.now.now, Some(*kind)).await;
+        let current_state = state_for_picture(
+            &state.pool,
+            g.instance_id,
+            None,
+            g.now.now,
+            Some(*kind),
+            crate::prompt::persona_traits(&g.persona).cycle_health(),
+        )
+        .await;
         let img = build_delegated_image_prompt_for(
             state,
             &g.persona,
@@ -1121,7 +1148,7 @@ mod tests {
             (EventKind::Period, "（你的月经来了。）"),
             (
                 EventKind::PeriodScare,
-                "（你发现月经推迟了好几天还没来，心里有点慌。）",
+                "（按日子月经这两天就该来了，身体却一点动静都没有，你心里有点慌。）",
             ),
             (
                 EventKind::PregnancyScare,
@@ -1196,6 +1223,7 @@ mod tests {
                 &PersonaTraits::default(),
                 None,
                 false,
+                false,
             )
         };
         assert_eq!(
@@ -1219,6 +1247,7 @@ mod tests {
                 1,
                 &PersonaTraits::default(),
                 None,
+                false,
                 false,
             )
         };
@@ -1278,6 +1307,7 @@ mod tests {
                     1,
                     &p,
                     None,
+                    false,
                     false
                 ),
                 together,
@@ -1292,6 +1322,7 @@ mod tests {
                 1,
                 &p,
                 None,
+                false,
                 false
             ),
             "（你正在短途旅行。你正在坐火车。）"
@@ -1301,7 +1332,18 @@ mod tests {
     #[test]
     fn an_incident_during_a_background_opens_with_its_state() {
         let h = Duration::hours(1);
-        let cue = |kind, bg| event_cue(kind, h, bg, 1, &PersonaTraits::default(), None, false);
+        let cue = |kind, bg| {
+            event_cue(
+                kind,
+                h,
+                bg,
+                1,
+                &PersonaTraits::default(),
+                None,
+                false,
+                false,
+            )
+        };
         assert_eq!(
             cue(EventKind::AnimalEncounter, Some(EventKind::BusinessTrip)),
             "（你正在外地出差。你刚在路上遇到了一只小动物。）"
@@ -1397,6 +1439,7 @@ mod tests {
                 &PersonaTraits::default(),
                 None,
                 true,
+                false,
             )
         };
         assert_eq!(
@@ -1419,9 +1462,40 @@ mod tests {
                 1,
                 &PersonaTraits::default(),
                 None,
+                false,
                 false
             ),
-            "（你正在外地出差。你发现月经推迟了好几天还没来，心里有点慌。）"
+            "（你正在外地出差。按日子月经这两天就该来了，身体却一点动静都没有，你心里有点慌。）"
+        );
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §7: the background's state
+    /// first, her period second.
+    #[test]
+    fn the_cue_opens_with_the_background_then_her_period() {
+        let h = Duration::hours(1);
+        let p = PersonaTraits::default();
+        let cue = |kind, bg, on_period| event_cue(kind, h, bg, 1, &p, None, false, on_period);
+        assert_eq!(
+            cue(
+                EventKind::AnimalEncounter,
+                Some(EventKind::BusinessTrip),
+                true
+            ),
+            "（你正在外地出差。你正在经期。你刚在路上遇到了一只小动物。）"
+        );
+        assert_eq!(
+            cue(EventKind::AnimalEncounter, None, true),
+            "（你正在经期。你刚在路上遇到了一只小动物。）"
+        );
+        assert_eq!(
+            cue(EventKind::AnimalEncounter, None, false),
+            kind_cue(EventKind::AnimalEncounter, h, 1, &p, None, false)
+        );
+        // The trip they take together keeps its own cues.
+        assert_eq!(
+            cue(EventKind::GotLost, Some(EventKind::TravelingTogether), true),
+            "（你们一起出来玩，刚迷了路。）"
         );
     }
 

@@ -122,6 +122,34 @@ pub fn world_ruled_out(event: &Event, setting: crate::events::Setting) -> bool {
     )
 }
 
+/// How often she still goes along with sex or water during her period, of
+/// the times it would reach the judge (spec 2026-11-24-period-cycle-design.md
+/// §8).
+pub const PERIOD_ACCEPT: f64 = 1.0 / 3.0;
+
+/// Whether her period refuses this turn's action before the judge (spec
+/// 2026-11-24-period-cycle-design.md §8): a `sex_together`, `bath_together`,
+/// `hot_spring_together`, `sauna_together` or `swim_together` while
+/// `on_period`, with `roll` (uniform in [0, 1)) at or above `PERIOD_ACCEPT`.
+/// Such a refusal drops no line.
+pub fn period_refuses(event: &Event, on_period: bool, roll: f64) -> bool {
+    on_period
+        && roll >= PERIOD_ACCEPT
+        && matches!(
+            event,
+            Event::UserMessage {
+                action: Some(
+                    UserAction::SexTogether
+                        | UserAction::BathTogether
+                        | UserAction::HotSpringTogether
+                        | UserAction::SaunaTogether
+                        | UserAction::SwimTogether
+                ),
+                ..
+            }
+        )
+}
+
 /// Whether this turn's status ask is ruled out before the judge (spec
 /// 2026-11-23-affinity-50-design.md §6.5, §8): on a genome instance, a
 /// `propose` from a status it is not put from (only `dating`, `fwb` and
@@ -188,6 +216,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             image_ref: ImageRef::Face,
             aspect_ratio: None,
             action_response: Some(ActionResponse::Accept),
+            refusal_free: false,
         };
     }
 
@@ -210,6 +239,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             image_ref: ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
     }
 
@@ -228,6 +258,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             image_ref: ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
     }
 
@@ -247,6 +278,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
             image_ref: ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
     }
 
@@ -264,6 +296,7 @@ pub fn decide(input: &DecisionInput) -> ActionPlan {
         image_ref: ImageRef::Face,
         aspect_ratio: None,
         action_response: None,
+        refusal_free: false,
     }
 }
 
@@ -311,6 +344,7 @@ pub fn plan_for(
             image_ref,
             aspect_ratio,
             action_response: settle_action_response(&input.event, action_response),
+            refusal_free: false,
         },
         ActionType::Ghost => ActionPlan {
             action_type: ActionType::Ghost,
@@ -325,6 +359,7 @@ pub fn plan_for(
             image_ref: ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         },
         ActionType::ProductQa => ActionPlan {
             action_type: ActionType::ProductQa,
@@ -342,6 +377,7 @@ pub fn plan_for(
             image_ref: ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         },
         ActionType::Proactive => {
             unreachable!("plan_for is never called with Proactive; it comes only from pde::decide")
@@ -1325,6 +1361,44 @@ mod tests {
                 assert!(!world_ruled_out(&action_msg(a.clone()), s), "{a:?} {s:?}");
             }
         }
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §8: during her period sex and
+    /// the water actions are refused on a roll at or above one in three; no
+    /// other action is rolled, and nothing is outside her period.
+    #[test]
+    fn her_period_refuses_sex_and_water_two_times_in_three() {
+        use UserAction::*;
+        for a in [
+            SexTogether,
+            BathTogether,
+            HotSpringTogether,
+            SaunaTogether,
+            SwimTogether,
+        ] {
+            assert!(!period_refuses(&action_msg(a.clone()), true, 0.33), "{a:?}");
+            assert!(
+                period_refuses(&action_msg(a.clone()), true, 1.0 / 3.0),
+                "{a:?}"
+            );
+            assert!(period_refuses(&action_msg(a.clone()), true, 0.99), "{a:?}");
+            assert!(
+                !period_refuses(&action_msg(a.clone()), false, 0.99),
+                "{a:?}"
+            );
+        }
+        for a in [
+            ShowerTogether,
+            Strip,
+            StreakTogether,
+            Kiss,
+            Lick,
+            FallAsleepTogether,
+            WalkTogether,
+        ] {
+            assert!(!period_refuses(&action_msg(a.clone()), true, 0.99), "{a:?}");
+        }
+        assert!(!period_refuses(&user_msg("hi"), true, 0.99));
     }
 
     /// Spec 2026-11-23-affinity-50-design.md §6.5, §8: a proposal is put

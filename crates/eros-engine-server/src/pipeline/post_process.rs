@@ -1022,13 +1022,15 @@ fn eval_skip_reason(
 /// on every other turn, on a refused tip, which drops nothing (spec
 /// 2026-10-11 §6), and on an action the persona's `setting` rules out (spec
 /// 2026-11-23-hot-spring-fight-challenge-bet-design.md §4; spec
-/// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §6).
+/// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §6),
+/// and on a refusal the plan marks free, one her period's roll ruled (spec
+/// 2026-11-24-period-cycle-design.md §8).
 fn tier_drop_for(
     event: &Event,
     plan: &ActionPlan,
     setting: eros_engine_core::events::Setting,
 ) -> Option<eros_engine_core::affinity::AffinityLine> {
-    if eros_engine_core::pde::world_ruled_out(event, setting) {
+    if plan.refusal_free || eros_engine_core::pde::world_ruled_out(event, setting) {
         return None;
     }
     match (event, plan.action_response) {
@@ -2766,6 +2768,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: r,
+            refusal_free: false,
         };
         let give = UserAction::Give {
             item: GivenItem::Alcohol,
@@ -2834,6 +2837,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: Some(ActionResponse::Refuse),
+            refusal_free: false,
         };
         let fight = event(UserAction::FightTogether);
         assert_eq!(tier_drop_for(&fight, &refused, Setting::Modern), None);
@@ -2892,6 +2896,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: Some(ActionResponse::Refuse),
+            refusal_free: false,
         };
         let cycle = event(UserAction::CycleTogether);
         assert_eq!(tier_drop_for(&cycle, &refused, Setting::Fantasy), None);
@@ -2904,6 +2909,47 @@ mod tests {
             tier_drop_for(&hike, &refused, Setting::Fantasy),
             Some(AffinityLine::Chemistry)
         );
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §8: a refusal her period's
+    /// roll ruled before the judge costs nothing; the judge's own refusal of
+    /// the same action still drops chemistry.
+    #[test]
+    fn a_refusal_her_period_ruled_drops_nothing() {
+        use eros_engine_core::affinity::AffinityLine;
+        use eros_engine_core::types::{ActionResponse, UserAction};
+        let sex = Event::UserMessage {
+            content: String::new(),
+            message_id: Uuid::nil(),
+            prompt_traits: vec![],
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            quote: None,
+            action: Some(UserAction::SexTogether),
+            outfit: None,
+        };
+        let refused = |refusal_free: bool| ActionPlan {
+            action_type: ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: Some(ActionResponse::Refuse),
+            refusal_free,
+        };
+        assert_eq!(
+            tier_drop_for(&sex, &refused(false), Setting::Modern),
+            Some(AffinityLine::Chemistry)
+        );
+        assert_eq!(tier_drop_for(&sex, &refused(true), Setting::Modern), None);
     }
 
     #[test]
@@ -2934,6 +2980,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: Some(ActionResponse::Refuse),
+            refusal_free: false,
         };
         assert_eq!(tier_drop_for(&event, &plan, Setting::Modern), None);
     }
@@ -3913,6 +3960,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
 
         // EMPTY text — this is exactly what a fallback-ghost turn produces when
@@ -4073,6 +4121,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let produced = vec![ProducedMessage {
             message_id: Uuid::new_v4(),
@@ -4209,6 +4258,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let produced = vec![ProducedMessage {
             message_id: Uuid::new_v4(),
@@ -4883,6 +4933,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let produced = vec![ProducedMessage {
             message_id: Uuid::new_v4(),
@@ -5024,6 +5075,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         };
         let produced = vec![ProducedMessage {
             message_id: Uuid::new_v4(),
@@ -5559,6 +5611,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: None,
             action_response: None,
+            refusal_free: false,
         }
     }
 

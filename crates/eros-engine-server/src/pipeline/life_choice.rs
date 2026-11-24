@@ -157,7 +157,7 @@ async fn separated(
     now: DateTime<Utc>,
 ) -> Result<bool, sqlx::Error> {
     Ok(EventRepo { pool }
-        .current(instance_id, at_message, now)
+        .current(instance_id, at_message, now, None)
         .await?
         .foreground
         .is_some_and(|e| e.kind == EventKind::TakingSpace))
@@ -546,11 +546,32 @@ async fn status_ask_waits(
             .await?)
 }
 
+/// Whether her period is under way at `now` (spec
+/// 2026-11-24-period-cycle-design.md §9): the cycle state is `period`, not a
+/// `period_scare`. `false` for a persona with no period, with no read.
+async fn on_period(
+    state: &AppState,
+    instance_id: Uuid,
+    persona: &CompanionPersona,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let Some(health) = crate::prompt::persona_traits(persona).cycle_health() else {
+        return Ok(false);
+    };
+    let cycle = (EventRepo { pool: &state.pool })
+        .current(instance_id, None, now, Some(health))
+        .await?
+        .cycle;
+    Ok(cycle.is_some_and(|c| c.kind == EventKind::Period))
+}
+
 /// The romantic trigger (spec 2026-10-30 §4.3, spec 2026-11-23-affinity-50
 /// §7.2, §7.3), then her ask (§4.4) through [`speak`]: a proposal, or her
 /// sleep ask in the form the status gives it. Only a pair the caller's
 /// recorded scopes mark as romantic qualifies, and the ask is generated under
-/// those scopes.
+/// those scopes. She does not ask `sleep_together` while her period is under
+/// way (spec 2026-11-24-period-cycle-design.md §9); the kind stays unsettled,
+/// so the ask only waits.
 async fn try_romance(
     state: &AppState,
     session_id: Uuid,
@@ -602,6 +623,11 @@ async fn try_romance(
     ) else {
         return Ok(());
     };
+    // Read only once the sex ask is the one chosen: `propose` and
+    // `fall_asleep_together` are asked on her period as on any other day.
+    if kind == LifeChoiceKind::SleepTogether && on_period(state, instance_id, persona, now).await? {
+        return Ok(());
+    }
     if !runway_clear(state, session_id, instance_id, now).await? {
         return Ok(());
     }
@@ -695,8 +721,10 @@ fn bathe_qualifies(chem_tier: u8, hygienic: Option<bool>, endpoints: &[JudgedEnd
 
 /// She asks the user to take a bath with her: a romance-compatible pair that
 /// [`bathe_qualifies`], not within [`BATHE_COOLDOWN_DAYS`] of the last
-/// accept or ignore. Its own trigger, independent of the bed: it runs after
-/// the romantic trigger, whose pending ask closes the runway.
+/// accept or ignore, and not while her period is under way (spec
+/// 2026-11-24-period-cycle-design.md §9). Its own trigger, independent of the
+/// bed: it runs after the romantic trigger, whose pending ask closes the
+/// runway.
 async fn try_bathe(
     state: &AppState,
     session_id: Uuid,
@@ -731,6 +759,7 @@ async fn try_bathe(
     if choices
         .settled_since(session_id, LifeChoiceKind::BatheTogether, cooled)
         .await?
+        || on_period(state, instance_id, persona, now).await?
         || !runway_clear(state, session_id, instance_id, now).await?
     {
         return Ok(());
@@ -792,8 +821,10 @@ async fn try_travel(
     {
         return Ok(());
     }
+    // Her period is no background and holds back no travel ask (spec
+    // 2026-11-24-period-cycle-design.md §9).
     let background = (EventRepo { pool: &state.pool })
-        .current(instance_id, None, now)
+        .current(instance_id, None, now, None)
         .await?
         .background;
     if background.is_some() || !runway_clear(state, session_id, instance_id, now).await? {
@@ -3456,5 +3487,159 @@ mod tests {
             );
             assert_eq!(companion_calls(&mock).await.len(), 1, "{kind:?}");
         }
+    }
+
+    // ---- Her period (spec 2026-11-24-period-cycle-design.md §9) ----
+
+    impl Scene {
+        /// The row her cycle is derived from: a three-day `period` that began
+        /// `ago` ago. At 28 days and an hour the period derived from it began
+        /// an hour ago and is under way; at 10 days it is not.
+        async fn period_row(&self, ago: Duration) {
+            let started_at = Utc::now() - ago;
+            EventRepo { pool: &self.pool }
+                .insert_preempting(&NewEvent {
+                    instance_id: self.instance_id,
+                    session_id: self.session_id,
+                    event_key: "period",
+                    kind: EventKind::Period,
+                    started_at,
+                    ends_at: started_at + Duration::days(3),
+                })
+                .await
+                .unwrap();
+        }
+
+        /// Whether the cycle state now is her period, read as the store gives
+        /// it for this persona.
+        async fn on_her_period(&self) -> bool {
+            EventRepo { pool: &self.pool }
+                .current(
+                    self.instance_id,
+                    None,
+                    Utc::now(),
+                    crate::prompt::persona_traits(&self.persona).cycle_health(),
+                )
+                .await
+                .unwrap()
+                .cycle
+                .is_some_and(|c| c.kind == EventKind::Period)
+        }
+    }
+
+    /// Her period began an hour ago.
+    fn on_her_period_ago() -> Duration {
+        Duration::days(28) + Duration::hours(1)
+    }
+
+    /// Her next period is 18 days away.
+    fn off_her_period_ago() -> Duration {
+        Duration::days(10)
+    }
+
+    /// `sleep_together` is held back while her period is under way and asked
+    /// on the same pair once it is not.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn her_period_holds_back_her_sleep_ask(pool: PgPool) {
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for (ago, on_period) in [(on_her_period_ago(), true), (off_her_period_ago(), false)] {
+            let mut s = scene_with_lines(&pool, 0.5, 0.5).await;
+            // Not hygienic, so no bath is asked; a background, so no trip:
+            // the bed is the one ask in play.
+            s.set_art(json!({"gender": "female", "hygienic": false}))
+                .await;
+            s.record_scopes("full", AffinityScope::chemistry()).await;
+            s.set_status("dating", false).await;
+            s.event_under_way(EventKind::ShortTrip).await;
+            s.period_row(ago).await;
+            assert_eq!(s.on_her_period().await, on_period);
+
+            for _ in 0..3 {
+                s.turn(&state, SEEN).await;
+            }
+            assert_eq!(
+                s.kinds().await,
+                if on_period {
+                    vec![]
+                } else {
+                    vec![pending("sleep_together")]
+                },
+                "period under way: {on_period}"
+            );
+            assert_eq!(
+                companion_calls(&mock).await.len(),
+                usize::from(!on_period),
+                "period under way: {on_period}"
+            );
+        }
+    }
+
+    /// `bathe_together` is held back the same way.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn her_period_holds_back_her_bath_ask(pool: PgPool) {
+        let mock = mock_llm(WARM, Some(BATHE_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for (ago, on_period) in [(on_her_period_ago(), true), (off_her_period_ago(), false)] {
+            let mut s = scene_with_lines(&pool, 0.5, 0.25).await;
+            s.set_art(json!({"gender": "female", "hygienic": true}))
+                .await;
+            s.record_scopes("full", AffinityScope::chemistry()).await;
+            s.set_status("dating", false).await;
+            s.period_row(ago).await;
+            assert_eq!(s.on_her_period().await, on_period);
+
+            for _ in 0..3 {
+                s.turn(&state, SEEN).await;
+            }
+            assert_eq!(
+                s.kinds().await,
+                if on_period {
+                    vec![]
+                } else {
+                    vec![pending("bathe_together")]
+                },
+                "period under way: {on_period}"
+            );
+            assert_eq!(
+                companion_calls(&mock).await.len(),
+                usize::from(!on_period),
+                "period under way: {on_period}"
+            );
+        }
+    }
+
+    /// Her period holds back no other ask: falling asleep side by side and a
+    /// trip are asked as on any other day.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn her_period_holds_back_no_other_ask(pool: PgPool) {
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        // A bare partner at chemistry tier 3: her sleep ask is not for sex.
+        let mut s = scene_with_lines(&pool, 0.55, 0.5).await;
+        s.set_art(json!({"gender": "female", "hygienic": false}))
+            .await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("partner", false).await;
+        s.period_row(on_her_period_ago()).await;
+        assert!(s.on_her_period().await);
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(s.kinds().await, vec![pending("fall_asleep_together")]);
+
+        let mock = mock_llm(WARM, Some(TRAVEL_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        let mut s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.set_art(json!({"gender": "female"})).await;
+        s.record_bond_only().await;
+        s.set_status("partner", false).await;
+        s.period_row(on_her_period_ago()).await;
+        assert!(s.on_her_period().await);
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(s.kinds().await, vec![pending("travel_together")]);
     }
 }

@@ -666,7 +666,7 @@ mod tests {
 
         let later = chrono::Utc::now();
         let current = EventRepo { pool: &pool }
-            .current(instance_id, None, later)
+            .current(instance_id, None, later, None)
             .await
             .unwrap();
         assert!(current.foreground.is_none(), "{:?}", current.foreground);

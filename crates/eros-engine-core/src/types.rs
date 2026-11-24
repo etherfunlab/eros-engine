@@ -576,6 +576,10 @@ pub struct ActionPlan {
     /// The response in effect for this turn's user action: `Some` exactly when
     /// the event carries an action and the plan replies; `None` otherwise.
     pub action_response: Option<ActionResponse>,
+    /// A refusal ruled before the judge that drops no line: one her period's
+    /// roll decided (spec 2026-11-24-period-cycle-design.md §8), which
+    /// cannot be recomputed from the event after the turn.
+    pub refusal_free: bool,
 }
 
 /// Conversation signals computed from chat history.

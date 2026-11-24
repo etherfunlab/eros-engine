@@ -3110,10 +3110,12 @@ fn build_pde_ctx(
     // incompatible pair cannot have, spec 2026-11-08-strip-and-world-setting-
     // design.md §2.1, and so is a together action, spec 2026-11-20-
     // together-actions-state-in-picture-and-genome-routes-design.md §5 and
-    // 2026-11-23-twelve-together-actions-and-propose-design.md §4.1, §5; a
-    // date the gate turns down, spec 2026-11-12-activity-sub-session-
-    // design.md §4.3; a proposal or break-up the status does not allow, spec
-    // 2026-11-23-affinity-50-design.md §8) states the outcome, not the reason.
+    // 2026-11-23-twelve-together-actions-and-propose-design.md §4.1, §5;
+    // sex or water her period's roll refused, spec 2026-11-24-period-cycle-
+    // design.md §8; a date the gate turns down, spec 2026-11-12-activity-sub-
+    // session-design.md §4.3; a proposal or break-up the status does not
+    // allow, spec 2026-11-23-affinity-50-design.md §8) states the outcome,
+    // not the reason.
     let action_line = match &input.event {
         eros_engine_core::types::Event::UserMessage {
             action: Some(a), ..
@@ -4375,37 +4377,41 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-/// The background and foreground kinds a picture reads from the events
+/// The background, cycle and foreground kinds a picture reads from the events
 /// `current` holds, with the kind being started this moment (`starting`, not
-/// stored yet) counted as live: a background kind stands in for the
-/// background, any other for the foreground.
+/// stored yet) counted as live: it stands in for the slot `slot()` gives it
+/// (spec 2026-11-24-period-cycle-design.md §7).
 fn picture_kinds(
     current: &eros_engine_store::events::CurrentEvents,
     starting: Option<eros_engine_core::events::EventKind>,
 ) -> (
     Option<eros_engine_core::events::EventKind>,
     Option<eros_engine_core::events::EventKind>,
+    Option<eros_engine_core::events::EventKind>,
 ) {
+    use eros_engine_core::events::Slot;
     let mut background = current.background.as_ref().map(|e| e.kind);
+    let mut cycle = current.cycle.as_ref().map(|e| e.kind);
     let mut foreground = current.foreground.as_ref().map(|e| e.kind);
-    match starting {
-        Some(kind) if kind.is_background() => background = Some(kind),
-        Some(kind) => foreground = Some(kind),
-        None => {}
+    if let Some(kind) = starting {
+        *match kind.slot() {
+            Slot::Background => &mut background,
+            Slot::Cycle => &mut cycle,
+            Slot::Foreground => &mut foreground,
+        } = Some(kind);
     }
-    (background, foreground)
+    (background, cycle, foreground)
 }
 
 /// What the composer's `[此刻状态]` says of the events `current` holds, with
 /// the kind being started this moment (`starting`, not stored yet) counted as
-/// live: a background kind stands in for the background, any other for the
-/// foreground. Pure.
+/// live in its slot. Pure.
 pub(crate) fn picture_state_of(
     current: &eros_engine_store::events::CurrentEvents,
     starting: Option<eros_engine_core::events::EventKind>,
 ) -> Option<String> {
-    let (background, foreground) = picture_kinds(current, starting);
-    crate::prompt::current_state(background, foreground)
+    let (background, cycle, foreground) = picture_kinds(current, starting);
+    crate::prompt::current_state(background, cycle, foreground)
 }
 
 /// What the composer's `[对方]` says: the user's gender when one is given and
@@ -4417,7 +4423,7 @@ pub(crate) fn partner_gender_of(
     starting: Option<eros_engine_core::events::EventKind>,
     gender: Option<crate::routes::companion_stream::UserGender>,
 ) -> Option<&'static str> {
-    let (background, foreground) = picture_kinds(current, starting);
+    let (background, _, foreground) = picture_kinds(current, starting);
     let shared = [background, foreground]
         .into_iter()
         .flatten()
@@ -4427,25 +4433,23 @@ pub(crate) fn partner_gender_of(
 
 /// What she is doing at a picture's moment, as the composer reads it: the
 /// events under way for `instance_id` at `at_message` (or at `now` without
-/// one), plus `starting`. Fail-open: a failed read is warned and reads as no
-/// events under way (`starting` still counts), never blocks the picture.
+/// one), plus `starting`. `period` is the persona's
+/// `PersonaTraits::cycle_health`. Fail-open: a failed read is warned and reads
+/// as no events under way (`starting` still counts), never blocks the picture.
 pub(crate) async fn state_for_picture(
     pool: &sqlx::PgPool,
     instance_id: Uuid,
     at_message: Option<Uuid>,
     now: chrono::DateTime<chrono::Utc>,
     starting: Option<eros_engine_core::events::EventKind>,
+    period: Option<eros_engine_core::events::Health>,
 ) -> Option<String> {
     let current = (eros_engine_store::events::EventRepo { pool })
-        .current(instance_id, at_message, now)
+        .current(instance_id, at_message, now, period)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(%instance_id, "image-compose: event read failed: {e}");
-            eros_engine_store::events::CurrentEvents {
-                foreground: None,
-                background: None,
-                at: now,
-            }
+            eros_engine_store::events::CurrentEvents::none(now)
         });
     picture_state_of(&current, starting)
 }
@@ -5196,29 +5200,27 @@ pub(crate) fn run_stream_with(
                 tracing::warn!("stream: ignore conversion failed: {e}");
             }
         }
+        let traits = crate::prompt::persona_traits(&input.persona);
         // The events under way at this turn, anchored at its own row so a
         // re-driven turn sees the same ones (spec 2026-10-15-life-events-v2-
-        // design.md §6.4). Independent of the judge.
+        // design.md §6.4), with her cycle (spec 2026-11-24-period-cycle-
+        // design.md §7). Independent of the judge.
         let current = eros_engine_store::events::EventRepo { pool: &state.pool }
             .current(
                 user_msg.instance_id,
                 Some(user_msg.user_message_id),
                 chrono::Utc::now(),
+                traits.cycle_health(),
             )
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("stream: event read failed: {e}");
-                eros_engine_store::events::CurrentEvents {
-                    foreground: None,
-                    background: None,
-                    at: chrono::Utc::now(),
-                }
+                eros_engine_store::events::CurrentEvents::none(chrono::Utc::now())
             });
         // An action turn and a client-forced image turn are always answered,
         // never met with silence.
         let action_turn = user_msg.action.is_some();
         let force_image = user_msg.image.as_ref().is_some_and(|i| i.force);
-        let traits = crate::prompt::persona_traits(&input.persona);
         let offline_now = current
             .foreground
             .as_ref()
@@ -5404,13 +5406,24 @@ pub(crate) fn run_stream_with(
         // 2026-11-20-together-actions-state-in-picture-and-genome-routes-
         // design.md §5, 2026-11-23-twelve-together-actions-and-propose-
         // design.md §4.1).
-        let traits = crate::prompt::persona_traits(&input.persona);
         let together_refused = pde::together_ruled_out(&input.event, traits.machine);
         // A together action her world does not have, a fight in a modern
         // one or a cycle in a fantasy one (spec 2026-11-23-hot-spring-fight-
         // challenge-bet-design.md §4, 2026-11-24-focused-tone-four-together-
         // actions-and-user-gender-design.md §6): refused, and free.
         let world_refused = pde::world_ruled_out(&input.event, traits.setting);
+        // During her period sex and the water actions are rolled (spec
+        // 2026-11-24-period-cycle-design.md §8): refused, and free. The rule-
+        // outs above come first and keep their own outcomes. A late period
+        // is not her period.
+        let on_period = current
+            .cycle
+            .as_ref()
+            .is_some_and(|c| c.kind == eros_engine_core::events::EventKind::Period);
+        let period_refused = !strip_refused
+            && !together_refused
+            && !world_refused
+            && pde::period_refuses(&input.event, on_period, rand::thread_rng().gen());
         // A date she cannot go on (spec 2026-11-12-activity-sub-session-
         // design.md §4.3): she is offline, or a `mid` one is asked below bond
         // tier 2. On the decayed affinity this turn reads. Another date of
@@ -5452,6 +5465,7 @@ pub(crate) fn run_stream_with(
             || strip_refused
             || together_refused
             || world_refused
+            || period_refused
             || date_refused
             || status_refused;
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
@@ -5607,6 +5621,11 @@ pub(crate) fn run_stream_with(
                 plan.action_response,
             );
         }
+        // A refusal her period's roll ruled drops no line (spec 2026-11-24-
+        // period-cycle-design.md §8). The roll cannot be recomputed later, so
+        // the plan carries it to post-process: after every `plan_for`, which
+        // builds a plan without it.
+        plan.refusal_free = period_refused;
         // An accepted strip undresses her this turn (spec 2026-11-08-strip-and-
         // world-setting-design.md §2.2), over the judge and a named outfit:
         // after every `plan_for`, which would put a named outfit back.
@@ -7624,6 +7643,7 @@ mod tests {
             image_ref: eros_engine_core::types::ImageRef::Face,
             aspect_ratio: aspect.map(str::to_string),
             action_response: None,
+            refusal_free: false,
         }
     }
 
@@ -11672,6 +11692,43 @@ data: [DONE]\n\n";
         image: bool,
         art: Option<serde_json::Value>,
     ) -> (Vec<ProtocolFrame>, String, Uuid) {
+        let (frames, mock, umid) = run_together_turn_mock(
+            pool,
+            action,
+            response,
+            "reply_text",
+            compatible,
+            events,
+            image,
+            art,
+        )
+        .await;
+        let composer = mock
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("\"model\":\"composer\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (frames, composer, umid)
+    }
+
+    /// [`run_together_turn_in`] returning the mock, for request inspection,
+    /// in place of the composer bodies, with the judge answering the action
+    /// `judge_action`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_together_turn_mock(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        response: Option<&str>,
+        judge_action: &str,
+        compatible: bool,
+        events: &[EventSeed],
+        image: bool,
+        art: Option<serde_json::Value>,
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -11685,7 +11742,7 @@ data: [DONE]\n\n";
             .await;
         if let Some(response) = response {
             let verdict = serde_json::json!({
-                "action": "reply_text", "inner_state": "", "action_response": response
+                "action": judge_action, "inner_state": "", "action_response": response
             });
             let judge_body = serde_json::json!({
                 "id": "gj", "model": "pde/judge",
@@ -11807,16 +11864,7 @@ data: [DONE]\n\n";
         )
         .collect()
         .await;
-        let composer = mock
-            .received_requests()
-            .await
-            .expect("recorded requests")
-            .iter()
-            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
-            .filter(|b| b.contains("\"model\":\"composer\""))
-            .collect::<Vec<_>>()
-            .join("\n");
-        (frames, composer, umid)
+        (frames, mock, umid)
     }
 
     /// `(event_key, session_id, started_at, ends_at)` of every event of `kind`.
@@ -12023,6 +12071,109 @@ data: [DONE]\n\n";
         let placed = events_of_kind(&pool, "cycling_together").await;
         assert_eq!(placed.len(), 1, "{placed:?}");
         assert_eq!(placed[0].0, format!("action:{umid}:cycling_together"));
+    }
+
+    /// One `sex_together` turn of a female human with `events` seeded, on
+    /// romance-compatible scopes, the judge answering `judge` (`None`: no
+    /// judge, so the rule engine accepts). With `picture` pictures are
+    /// available and the judge proposes one (`reply_text_image`). Returns
+    /// whether the turn was refused, once it has checked that the judge was
+    /// told 「这次你不会答应」 exactly then, that an accept placed the event and
+    /// a refusal did not, and that neither dropped a line.
+    async fn period_sex_turn(
+        pool: &PgPool,
+        events: &[EventSeed],
+        judge: Option<&str>,
+        picture: bool,
+    ) -> bool {
+        let (frames, mock, umid) = run_together_turn_mock(
+            pool,
+            eros_engine_core::types::UserAction::SexTogether,
+            judge,
+            if picture {
+                "reply_text_image"
+            } else {
+                "reply_text"
+            },
+            true,
+            events,
+            picture,
+            Some(serde_json::json!({"gender": "female"})),
+        )
+        .await;
+        let refused = action_response_of(&frames) == "refuse";
+        if judge.is_some() {
+            let reqs = mock.received_requests().await.unwrap();
+            assert_eq!(
+                judge_request(&reqs).contains("这次你不会答应"),
+                refused,
+                "the judge is told exactly when the turn refuses"
+            );
+        }
+        let key = format!("action:{umid}:having_sex_together");
+        let placed = events_of_kind(pool, "having_sex_together")
+            .await
+            .into_iter()
+            .filter(|(k, ..)| *k == key)
+            .count();
+        assert_eq!(placed, usize::from(!refused), "refused={refused}");
+        let (context, _) = turn_affinity_row(pool, umid).await;
+        assert!(
+            context.get("tier_drop").is_none(),
+            "refused={refused}: {context}"
+        );
+        refused
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §8: during her period a
+    /// `sex_together` is rolled before the judge, and with no judge too. The
+    /// judge accepts, so a refusal is the roll's; the roll is random, so the
+    /// turns run until both outcomes have been seen. Her period started 28
+    /// days and an hour ago: the next one began an hour before the turn.
+    /// With no `period` row nothing is rolled, nor during a late period
+    /// (§6): her period started 27 days ago, so the next is due in a day,
+    /// and the scare began a day ago and ends two days after the due moment.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn her_period_turns_sex_down_before_the_judge(pool: PgPool) {
+        let day = 24 * 60;
+        let period = [ev("period", 28 * day + 60, -(25 * day + 60))];
+        for judge in [Some("accept"), None] {
+            let mut seen = [false; 2];
+            for _ in 0..40 {
+                seen[usize::from(period_sex_turn(&pool, &period, judge, false).await)] = true;
+                if seen == [true; 2] {
+                    break;
+                }
+            }
+            assert_eq!(seen, [true; 2], "{judge:?}: [accepted, refused]");
+        }
+        let late = [
+            ev("period", 27 * day, -24 * day),
+            ev("period_scare", day, 3 * day),
+        ];
+        for events in [&[][..], &late[..]] {
+            for _ in 0..8 {
+                assert!(!period_sex_turn(&pool, events, Some("accept"), false).await);
+            }
+        }
+    }
+
+    /// A refusal her period's roll ruled drops nothing when the judge
+    /// proposed a picture either: `picture_action` then rebuilds the refused
+    /// plan as text only through `plan_for` (spec 2026-11-24-period-cycle-
+    /// design.md §8). The turns run until the roll refuses.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn her_period_refusal_drops_nothing_when_the_judge_proposes_a_picture(pool: PgPool) {
+        let day = 24 * 60;
+        let period = [ev("period", 28 * day + 60, -(25 * day + 60))];
+        let mut refused = false;
+        for _ in 0..40 {
+            if period_sex_turn(&pool, &period, Some("accept"), true).await {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "no turn of forty was refused");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -23760,7 +23911,7 @@ data: [DONE]\n\n"
             eros_engine_store::events::CurrentEvents {
                 foreground: foreground.map(live_event),
                 background: background.map(live_event),
-                at: chrono::DateTime::UNIX_EPOCH,
+                ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
             }
         };
         assert_eq!(
@@ -23914,13 +24065,9 @@ data: [DONE]\n\n"
         let under_way = eros_engine_store::events::CurrentEvents {
             foreground: Some(live_event(OnATrain)),
             background: Some(live_event(ShortTrip)),
-            at: chrono::DateTime::UNIX_EPOCH,
+            ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
         };
-        let nothing = eros_engine_store::events::CurrentEvents {
-            foreground: None,
-            background: None,
-            at: chrono::DateTime::UNIX_EPOCH,
-        };
+        let nothing = eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH);
         assert_eq!(
             picture_state_of(&under_way, None).as_deref(),
             Some("短途旅游；在坐火车")
@@ -23944,7 +24091,7 @@ data: [DONE]\n\n"
         let incident_only = eros_engine_store::events::CurrentEvents {
             foreground: Some(live_event(OnATrain)),
             background: None,
-            at: chrono::DateTime::UNIX_EPOCH,
+            ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
         };
         assert_eq!(
             picture_state_of(&incident_only, Some(LongTrip)).as_deref(),
@@ -23957,11 +24104,51 @@ data: [DONE]\n\n"
         let background_only = eros_engine_store::events::CurrentEvents {
             foreground: None,
             background: Some(live_event(ShortTrip)),
-            at: chrono::DateTime::UNIX_EPOCH,
+            ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
         };
         assert_eq!(
             picture_state_of(&background_only, Some(TakingSelfie)).as_deref(),
             Some("短途旅游；刚拍了张自拍")
+        );
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §7: her cycle sits between the
+    /// background and the foreground, and a cycle kind being started takes
+    /// the cycle's place.
+    #[test]
+    fn the_picture_state_carries_her_cycle() {
+        use eros_engine_core::events::EventKind::*;
+        let epoch = chrono::DateTime::UNIX_EPOCH;
+        let on_period = eros_engine_store::events::CurrentEvents {
+            foreground: Some(live_event(OnATrain)),
+            background: Some(live_event(ShortTrip)),
+            cycle: Some(eros_engine_store::events::CycleEvent {
+                kind: Period,
+                started_at: epoch,
+                ends_at: epoch,
+                message_id: None,
+            }),
+            ..eros_engine_store::events::CurrentEvents::none(epoch)
+        };
+        assert_eq!(
+            picture_state_of(&on_period, None).as_deref(),
+            Some("短途旅游；月经中；在坐火车")
+        );
+        assert_eq!(
+            picture_state_of(&on_period, Some(TakingSelfie)).as_deref(),
+            Some("短途旅游；月经中；刚拍了张自拍")
+        );
+        let background_only = eros_engine_store::events::CurrentEvents {
+            background: Some(live_event(ShortTrip)),
+            ..eros_engine_store::events::CurrentEvents::none(epoch)
+        };
+        assert_eq!(
+            picture_state_of(&background_only, Some(Period)).as_deref(),
+            Some("短途旅游；月经中")
+        );
+        assert_eq!(
+            picture_state_of(&on_period, Some(PeriodScare)).as_deref(),
+            Some("短途旅游；月经没来；在坐火车")
         );
     }
 
@@ -23988,7 +24175,7 @@ data: [DONE]\n\n"
         let on_a_date = eros_engine_store::events::CurrentEvents {
             foreground: Some(live_event(EventKind::OnADate)),
             background: None,
-            at: chrono::DateTime::UNIX_EPOCH,
+            ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
         };
         assert_eq!(
             picture_state_of(
@@ -25252,12 +25439,14 @@ data: [DONE]\n\n"
             turn_mins_ago,
             image,
             true,
+            None,
         )
         .await
     }
 
     /// [`run_event_turn_with`] under a model config whose ghosting switch
-    /// (`[tasks.pde_decision].ghosting`) is `ghosting`.
+    /// (`[tasks.pde_decision].ghosting`) is `ghosting`, and, when given, with
+    /// the genome's `art_metadata`.
     #[allow(clippy::too_many_arguments)]
     async fn run_event_turn_in(
         pool: &PgPool,
@@ -25268,6 +25457,7 @@ data: [DONE]\n\n"
         turn_mins_ago: i32,
         image: Option<crate::routes::companion_stream::ImageReplyParams>,
         ghosting: bool,
+        art: Option<serde_json::Value>,
     ) -> NeedsTurn {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
@@ -25301,7 +25491,15 @@ data: [DONE]\n\n"
             .await;
 
         let user_id = Uuid::new_v4();
-        let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let (genome_id, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        if let Some(art) = art {
+            sqlx::query("UPDATE engine.persona_genomes SET art_metadata = $2 WHERE id = $1")
+                .bind(genome_id)
+                .bind(art)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
         let mut state = crate::routes::companion::test_state(pool.clone());
         let toml = if verdict.is_some() {
             format!(
@@ -25796,6 +25994,7 @@ data: [DONE]\n\n"
             0,
             None,
             false,
+            None,
         )
         .await;
         let reqs = t.mock.received_requests().await.unwrap();
@@ -25900,15 +26099,27 @@ data: [DONE]\n\n"
         assert!(!chat_request_body(&reqs).contains("- 刚才："));
     }
 
+    /// A scare under way is her cycle state: a female human whose period is
+    /// due inside the scare's window (spec 2026-11-24-period-cycle-design.md
+    /// §6, §7).
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn while_the_scare_lasts_nothing_says_it_is_false(pool: PgPool) {
-        let t = run_event_turn(
+        let day = 24 * 60;
+        let t = run_event_turn_in(
             &pool,
             &[],
-            &[ev_here("period_scare", 10, 50)],
+            // Her period started 27 days ago, so the next is due in a day;
+            // the scare ends a day after that.
+            &[
+                ev("period", 27 * day, -24 * day),
+                ev_here("period_scare", 10, 2 * day),
+            ],
             &[],
             Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
             0,
+            None,
+            true,
+            Some(serde_json::json!({"gender": "female"})),
         )
         .await;
         let reqs = t.mock.received_requests().await.unwrap();
@@ -25919,6 +26130,43 @@ data: [DONE]\n\n"
             assert!(!body.contains("虚惊"));
             assert!(!body.contains("后结束"));
             assert!(!body.contains("前开始"));
+        }
+    }
+
+    /// A period the cycle derives, with no row of its own, shows right after
+    /// a trip under way, in the judge's `[近期事件]` and the reply's
+    /// `正在经历` (spec 2026-11-24-period-cycle-design.md §7). Her period
+    /// started 28 days and an hour ago: the next one began an hour before
+    /// the turn.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_derived_period_shows_after_a_trip(pool: PgPool) {
+        let day = 24 * 60;
+        let t = run_event_turn_in(
+            &pool,
+            &[],
+            &[
+                ev("period", 28 * day + 60, -(25 * day + 60)),
+                ev("long_trip", 30 * 60, 70 * 60),
+            ],
+            &[],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+            None,
+            true,
+            Some(serde_json::json!({"gender": "female"})),
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        let judge = judge_request(&reqs);
+        let chat = chat_request_body(&reqs);
+        for (body, opening) in [
+            (&judge, "[近期事件] 长途旅游（"),
+            (&chat, "- 正在经历：长途旅游（"),
+        ] {
+            let from = body.find(opening).unwrap_or_else(|| panic!("{body}"));
+            let line = &body[from..];
+            let line = &line[..line.find("\\n").unwrap_or(line.len())];
+            assert!(line.contains("）；月经中（"), "{line}");
         }
     }
 
