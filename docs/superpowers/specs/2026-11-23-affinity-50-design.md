@@ -250,6 +250,12 @@ cold-war check therefore read the instance kind first.
 - Runway, session and delivery rules are unchanged: one pending ask per
   instance, 1:1 text session of a genome instance, 24-hour window, the
   `life_choice` field on the delta, typed replies convert to `ignored`.
+- **Scopes of her words** *(owner's ruling)*. Every ask of hers is generated
+  under the scopes the pair's replies recorded, the ones her ordinary replies
+  read; a pair with none recorded reads as romance-compatible. An
+  incompatible pair's ask may therefore carry a romantic composed name when
+  nothing is recorded: left open on purpose, to be tightened if it proves a
+  problem. The cold-war message keeps the engine's default scopes.
 
 ### 7.2 Her asks
 

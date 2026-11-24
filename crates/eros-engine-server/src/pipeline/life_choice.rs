@@ -24,7 +24,7 @@ use eros_engine_core::relationship::{
     cold_war_ends, cold_war_starts, leading_line, sleep_ask_is_sex, wants_break_up,
     RelationshipStatus, StatusAsk, COLD_WAR_WINDOW,
 };
-use eros_engine_core::scope::romance_compatible;
+use eros_engine_core::scope::{romance_compatible, AffinityScope, MemoryScope};
 use eros_engine_store::activity::ActivityRepo;
 use eros_engine_store::affinity::{AffinityRepo, JudgedEndpoints};
 use eros_engine_store::chat::ChatRepo;
@@ -549,8 +549,8 @@ async fn status_ask_waits(
 /// The romantic trigger (spec 2026-10-30 §4.3, spec 2026-11-23-affinity-50
 /// §7.2, §7.3), then her ask (§4.4) through [`speak`]: a proposal, or her
 /// sleep ask in the form the status gives it. Only a pair the caller's
-/// recorded scopes mark as romantic qualifies; the ask itself is generated
-/// with the engine's default scopes.
+/// recorded scopes mark as romantic qualifies, and the ask is generated under
+/// those scopes.
 async fn try_romance(
     state: &AppState,
     session_id: Uuid,
@@ -821,9 +821,10 @@ async fn try_travel(
 }
 
 /// Her words on `occasion` through the proactive path (spec 2026-10-30 §4.4,
-/// spec 2026-11-23-affinity-50 §7.4), generated with the engine's default
-/// scopes: an ask is written with its choice row beside it, the cold-war
-/// message on its own. `true` when it was written. A reply that is blank,
+/// spec 2026-11-23-affinity-50 §7.4): an ask is written with its choice row
+/// beside it, under the scopes the pair's replies recorded (a pair with none
+/// reads as romance-compatible); the cold-war message is written on its own,
+/// under the engine's default scopes. `true` when it was written. A reply that is blank,
 /// strips to nothing or fails writes nothing: an ask is made again on a later
 /// qualifying turn; the cold-war message is not retried, its flag already
 /// committed.
@@ -858,6 +859,16 @@ async fn speak(
     let locale = UserLocale::resolve(timezone, country, region);
     let tier = raw("tier").map(String::from);
     let recall_query = latest.as_ref().map(recall_query_text).unwrap_or_default();
+    // Her ask is written under the scopes the pair's replies recorded; a pair
+    // with none recorded reads as romance-compatible. The cold-war message
+    // keeps the engine's defaults.
+    let (memory_scope, affinity_scope) = match occasion {
+        Occasion::LifeChoice(_) => (ChatRepo { pool: &state.pool })
+            .latest_scopes(session_id)
+            .await?
+            .unwrap_or((MemoryScope::default(), AffinityScope::full())),
+        _ => Default::default(),
+    };
 
     let spoken = greet(
         state,
@@ -872,8 +883,8 @@ async fn speak(
             since: now,
             tier,
             prompt_traits: Vec::new(),
-            memory_scope: Default::default(),
-            affinity_scope: Default::default(),
+            memory_scope,
+            affinity_scope,
             audit: None,
             metadata,
             message_id: None,
@@ -2936,6 +2947,88 @@ mod tests {
         let rows = s.ask_rows().await;
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].1, TRAVEL_TEXT);
+    }
+
+    /// Everything the one generation was sent, as one string.
+    async fn only_prompt(mock: &MockServer) -> String {
+        let calls = companion_calls(mock).await;
+        assert_eq!(calls.len(), 1, "one generation");
+        calls[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Her ask is written under the scopes the pair's replies recorded, so a
+    /// compatible pair at (3, 3) reads its own composed name.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn her_ask_reads_the_pairs_recorded_scopes(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.5, 0.5).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(s.kinds().await, vec![pending("sleep_together")]);
+        let prompt = only_prompt(&mock).await;
+        assert!(prompt.contains("论感情，你们现在是恋人未满"), "{prompt}");
+        // The recorded scope itself, not a wider one: it has no warmth axis,
+        // so the warm pair's pet-name line stays out.
+        assert!(!prompt.contains("可以用一些亲昵的称呼"), "{prompt}");
+    }
+
+    /// Recorded scopes without a chemistry axis keep the chemistry-1 name in
+    /// her ask; a pair with no scopes recorded reads as compatible.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_trip_ask_follows_recorded_scopes_and_defaults_to_compatible(pool: PgPool) {
+        let bond_only = scene_with_lines(&pool, 0.5, 0.5).await;
+        bond_only.record_bond_only().await;
+        bond_only.set_status("partner", false).await;
+        let mock = mock_llm(WARM, Some(TRAVEL_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for _ in 0..3 {
+            bond_only.turn(&state, SEEN).await;
+        }
+        assert_eq!(bond_only.kinds().await, vec![pending("travel_together")]);
+        let prompt = only_prompt(&mock).await;
+        assert!(prompt.contains("论感情，你们现在是好朋友"), "{prompt}");
+
+        let unrecorded = scene_with_lines(&pool, 0.5, 0.5).await;
+        unrecorded.set_status("partner", false).await;
+        let mock = mock_llm(WARM, Some(TRAVEL_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        for _ in 0..3 {
+            unrecorded.turn(&state, SEEN).await;
+        }
+        assert_eq!(unrecorded.kinds().await, vec![pending("travel_together")]);
+        let prompt = only_prompt(&mock).await;
+        assert!(prompt.contains("论感情，你们现在是恋人未满"), "{prompt}");
+        // Every axis is in scope, warmth included.
+        assert!(prompt.contains("可以用一些亲昵的称呼"), "{prompt}");
+    }
+
+    /// The cold-war message keeps the engine's default scopes, whatever the
+    /// pair recorded.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_cold_war_message_keeps_the_default_scopes(pool: PgPool) {
+        let s = scene_with_lines(&pool, 0.45, 0.45).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        let mock = mock_llm(LOW_PATIENCE, Some(COLD_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert!(s.cold_war().await);
+        let prompt = only_prompt(&mock).await;
+        assert!(prompt.contains("你是用户的好朋友"), "{prompt}");
+        assert!(!prompt.contains("恋人未满"), "{prompt}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
