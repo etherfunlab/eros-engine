@@ -5608,7 +5608,7 @@ pub(crate) fn run_stream_with(
             .action
             .as_ref()
             .is_some_and(|a| a.speaks_emotionally());
-        let tone: Option<eros_engine_core::tone::Tone> = if tone_on && listed_action {
+        let drawn: Option<eros_engine_core::tone::Tone> = if tone_on && listed_action {
             Some(eros_engine_core::tone::Tone::Emotional)
         } else {
             (tone_on && !action_turn).then(|| {
@@ -5621,14 +5621,42 @@ pub(crate) fn run_stream_with(
                 eros_engine_core::tone::draw(p, rand::thread_rng().gen())
             })
         };
+        // The `focused` draw (spec 2026-11-24-focused-tone-four-together-
+        // actions-and-user-gender-design.md §5.3): the emotional draw comes
+        // first and a turn it makes `emotional` stays so; any other text turn
+        // without an action rolls once when the events under way, `employed`
+        // and `tones.focused` give it a chance. A turn with a user action
+        // rolls no `focused` dice: a listed action is `emotional` above or
+        // draws nothing.
+        let focused_p = (plan.action_type.bears_text() && !action_turn)
+            .then(|| {
+                eros_engine_core::tone::focused_probability(
+                    state.model_config.tone_focused_probability(),
+                    current.background.as_ref().map(|e| e.kind),
+                    current.foreground.as_ref().map(|e| e.kind),
+                    traits.employed,
+                )
+            })
+            .flatten();
+        let tone = match (drawn, focused_p) {
+            (Some(eros_engine_core::tone::Tone::Emotional), _) => drawn,
+            (_, Some(p)) => Some(eros_engine_core::tone::draw_focused(
+                p,
+                rand::thread_rng().gen(),
+            )),
+            (drawn, None) => drawn,
+        };
         let emotional = tone == Some(eros_engine_core::tone::Tone::Emotional);
+        let focused = tone == Some(eros_engine_core::tone::Tone::Focused);
         // An action turn rolls no dice: the action already fixes what the turn
         // is about (spec 2026-10-05 §5.2). Neither does an emotional turn: its
-        // prompt carries no `[this_turn]`.
+        // prompt carries no `[this_turn]`. A focused turn's `[this_turn]`
+        // holds its one line instead.
         let roll = plan.reply_mode.is_none()
             && plan.action_type.bears_text()
             && !action_turn
-            && !emotional;
+            && !emotional
+            && !focused;
         if roll {
             plan.nudges = crate::prompt::roll_nudges(
                 Some(&input.affinity),
@@ -6554,6 +6582,14 @@ pub(crate) fn run_stream_with(
                 );
                 let req_res = if emotional {
                     crate::pipeline::handlers::build_emotional_reply_request(
+                        &state, &input, &plan,
+                        user_msg.session_id, user_msg.user_id, user_msg.instance_id,
+                        user_msg.user_message_id, &now_ctx,
+                        body_state.as_deref(), needs_text.as_deref(),
+                        Some(&event_lines),
+                    ).await
+                } else if focused {
+                    crate::pipeline::handlers::build_focused_reply_request(
                         &state, &input, &plan,
                         user_msg.session_id, user_msg.user_id, user_msg.instance_id,
                         user_msg.user_message_id, &now_ctx,
@@ -26630,6 +26666,17 @@ data: [DONE]\n\n"
 
     // ─── The tone draw (spec 2026-11-12-chat-tone-emotional-design.md) ───
 
+    /// What the persona is doing at the turn and what her card says: the
+    /// events under way (a `foreground` and a `background` kind, each started
+    /// before now and ending after it) and the `art_metadata` keys.
+    #[derive(Default)]
+    struct ToneScene {
+        foreground: Option<eros_engine_core::events::EventKind>,
+        background: Option<eros_engine_core::events::EventKind>,
+        employed: Option<&'static str>,
+        setting: Option<&'static str>,
+    }
+
     /// One 1:1 turn after an earlier exchange (`EARLIER-USER` /
     /// `EARLIER-REPLY`), with `tones` appended to `[tasks.chat_companion]`.
     /// `verdict = None` runs without the judge. Returns the mock server and
@@ -26640,6 +26687,18 @@ data: [DONE]\n\n"
         verdict: Option<serde_json::Value>,
         action: Option<eros_engine_core::types::UserAction>,
         filtered: bool,
+    ) -> (wiremock::MockServer, Uuid) {
+        run_tone_turn_at(pool, tones, verdict, action, filtered, ToneScene::default()).await
+    }
+
+    /// [`run_tone_turn`] in `scene`.
+    async fn run_tone_turn_at(
+        pool: &PgPool,
+        tones: &str,
+        verdict: Option<serde_json::Value>,
+        action: Option<eros_engine_core::types::UserAction>,
+        filtered: bool,
+        scene: ToneScene,
     ) -> (wiremock::MockServer, Uuid) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
@@ -26693,7 +26752,29 @@ data: [DONE]\n\n"
             .await;
 
         let user_id = Uuid::new_v4();
-        let (_g, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let (genome_id, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let mut art = serde_json::Map::new();
+        if let Some(employed) = scene.employed {
+            art.insert("employed".into(), employed.into());
+        }
+        if let Some(setting) = scene.setting {
+            art.insert("setting".into(), setting.into());
+        }
+        if !art.is_empty() {
+            sqlx::query("UPDATE engine.persona_genomes SET art_metadata = $2 WHERE id = $1")
+                .bind(genome_id)
+                .bind(serde_json::Value::Object(art))
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        let events: Vec<EventSeed> = [(scene.foreground, 30, 120), (scene.background, 600, 840)]
+            .into_iter()
+            .filter_map(|(kind, started, ends)| kind.map(|k| ev(k.as_str(), started, ends)))
+            .collect();
+        if !events.is_empty() {
+            seed_events(pool, user_id, instance_id, session_id, &events).await;
+        }
         let mut toml = format!("[tasks.chat_companion]\nmodel=\"deepseek/x\"\n{tones}\n");
         if filtered {
             toml.push_str(
@@ -26996,6 +27077,246 @@ data: [DONE]\n\n"
         )
         .await;
         assert!(tone_chat_messages(&mock).await.len() > 2);
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "{meta}");
+    }
+
+    // ─── The focused tone (spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §5) ───
+
+    const FOCUSED_WORK_LINE: &str = "你手上有工作，心思在工作上：回得简短利落，先顾手上的事";
+
+    /// A plain text-reply verdict with no `reply_mode`.
+    fn plain_verdict() -> serde_json::Value {
+        serde_json::json!({"action": "reply_text", "inner_state": "有点开心", "reply_mode": null})
+    }
+
+    fn at_temp_work() -> ToneScene {
+        ToneScene {
+            foreground: Some(eros_engine_core::events::EventKind::TempWork),
+            ..ToneScene::default()
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_at_work_is_focused_and_records_it(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { focused = 1.0 }",
+            Some(plain_verdict()),
+            None,
+            false,
+            at_temp_work(),
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert!(
+            messages.len() > 2,
+            "a focused request keeps history: {messages:?}"
+        );
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains(FOCUSED_WORK_LINE), "{system}");
+        assert!(system.contains("[this_turn]"), "{system}");
+        assert!(
+            system.contains("[reply_length]\n最多 1 句，不超过 40 字"),
+            "{system}"
+        );
+        assert!(!system.contains("[feelings]"), "{system}");
+        assert!(!system.contains("[emotional_context]"), "{system}");
+        let payload = tone_decision_payload(&pool, session_id).await;
+        assert!(
+            payload["nudges"].is_null(),
+            "no dice on a focused turn: {payload}"
+        );
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "focused"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_idle_business_trip_is_at_work_and_a_busy_one_is_not(pool: PgPool) {
+        use eros_engine_core::events::EventKind::{BusinessTrip, Drinking};
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { focused = 1.0 }",
+            None,
+            None,
+            false,
+            ToneScene {
+                background: Some(BusinessTrip),
+                ..ToneScene::default()
+            },
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(FOCUSED_WORK_LINE));
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "focused"
+        );
+
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { focused = 1.0 }",
+            None,
+            None,
+            false,
+            ToneScene {
+                background: Some(BusinessTrip),
+                foreground: Some(Drinking),
+                ..ToneScene::default()
+            },
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert!(!messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(FOCUSED_WORK_LINE));
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "{meta}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn emotional_wins_over_focused(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { emotional = 1.0, focused = 1.0 }",
+            None,
+            None,
+            false,
+            at_temp_work(),
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(!messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(FOCUSED_WORK_LINE));
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "emotional"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_lost_emotional_draw_at_work_is_focused(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { emotional = 1e-12, focused = 1.0 }",
+            None,
+            None,
+            false,
+            at_temp_work(),
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(FOCUSED_WORK_LINE));
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "focused"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn off_work_without_the_career_key_nothing_is_drawn(pool: PgPool) {
+        let (mock, session_id) =
+            run_tone_turn(&pool, "tones = { focused = 1.0 }", None, None, false).await;
+        let messages = tone_chat_messages(&mock).await;
+        assert!(messages.len() > 2, "{messages:?}");
+        assert!(!messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(FOCUSED_WORK_LINE));
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "{meta}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_lost_emotional_draw_off_work_records_default(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn(
+            &pool,
+            "tones = { emotional = 1e-12, focused = 1.0 }",
+            None,
+            None,
+            false,
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert!(messages.len() > 2, "{messages:?}");
+        assert!(!messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(FOCUSED_WORK_LINE));
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "default"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_listed_action_with_focused_alone_draws_nothing(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { focused = 1.0 }",
+            Some(serde_json::json!({
+                "action": "reply_text", "inner_state": "", "action_response": "refuse"
+            })),
+            Some(eros_engine_core::types::UserAction::Strip),
+            false,
+            at_temp_work(),
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert!(!messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(FOCUSED_WORK_LINE));
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "{meta}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_plain_action_at_work_draws_nothing(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { focused = 1.0 }",
+            Some(serde_json::json!({
+                "action": "reply_text", "inner_state": "", "action_response": "accept"
+            })),
+            Some(eros_engine_core::types::UserAction::JogTogether),
+            false,
+            at_temp_work(),
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert!(!messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains(FOCUSED_WORK_LINE));
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "{meta}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn without_focused_a_turn_at_work_is_the_default_turn(pool: PgPool) {
+        let (mock, session_id) =
+            run_tone_turn_at(&pool, "", None, None, false, at_temp_work()).await;
+        let messages = tone_chat_messages(&mock).await;
+        assert!(messages.len() > 2, "{messages:?}");
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(!system.contains(FOCUSED_WORK_LINE), "{system}");
+        assert!(
+            system.contains("- 正在经历：临时接到工作（约 2 小时后结束）"),
+            "[now] still carries the incident: {system}"
+        );
         let meta = tone_reply_metadata(&pool, session_id).await;
         assert!(meta.get("tone").is_none(), "{meta}");
     }

@@ -1014,13 +1014,54 @@ pub(crate) async fn build_reply_request(
         needs,
         event,
         None,
+        false,
+    )
+    .await
+}
+
+/// The reply request of a `focused` turn (spec
+/// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
+/// §5.4): the default request with the focused system prompt. History, the
+/// profile, memories and `[reactions]` are the default's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_focused_reply_request(
+    state: &AppState,
+    input: &DecisionInput,
+    plan: &ActionPlan,
+    session_id: Uuid,
+    user_id: Uuid,
+    instance_id: Uuid,
+    user_message_id: Uuid,
+    now: &crate::prompt::NowContext,
+    body_state: Option<&str>,
+    needs: Option<&str>,
+    event: Option<&crate::prompt::EventLines>,
+) -> Result<(ChatRequest, Vec<String>), AppError> {
+    build_reply_request_with(
+        state,
+        input,
+        plan,
+        session_id,
+        user_id,
+        instance_id,
+        user_message_id,
+        now,
+        true,
+        body_state,
+        needs,
+        event,
+        None,
+        true,
     )
     .await
 }
 
 /// [`build_reply_request`] for one group speaker: `group` swaps the 1:1
 /// history for the group transcript seen from that speaker and appends its
-/// `[群聊]` block to the system prompt. `None` is the 1:1 request.
+/// `[群聊]` block to the system prompt. `None` is the 1:1 request. `focused`
+/// writes the system prompt of the `focused` tone (spec
+/// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
+/// §5.4) and reads no `[emotional_context]`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_reply_request_with(
     state: &AppState,
@@ -1047,6 +1088,7 @@ pub(crate) async fn build_reply_request_with(
     // 2026-10-15-life-events-v2-design.md §8.2).
     event: Option<&crate::prompt::EventLines>,
     group: Option<&crate::pipeline::group::GroupSpeakerView>,
+    focused: bool,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let chat_repo = ChatRepo { pool: &state.pool };
     // A quote points at one line; it never narrows the window. Every turn gets
@@ -1205,18 +1247,23 @@ pub(crate) async fn build_reply_request_with(
         );
     }
 
-    // Most recent affinity reason for [emotional_context] (single row, not a trajectory).
-    let emotional_context = AffinityRepo { pool: &state.pool }
-        .recent_emotional_reasons(relationship, user_message_id, 1)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                session_id = %relationship,
-                "recent_emotional_reasons fetch failed; [emotional_context] omitted"
-            );
-            Vec::new()
-        });
+    // Most recent affinity reason for [emotional_context] (single row, not a
+    // trajectory). A `focused` prompt has no such block, so it reads none.
+    let emotional_context = if focused {
+        Vec::new()
+    } else {
+        AffinityRepo { pool: &state.pool }
+            .recent_emotional_reasons(relationship, user_message_id, 1)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %relationship,
+                    "recent_emotional_reasons fetch failed; [emotional_context] omitted"
+                );
+                Vec::new()
+            })
+    };
 
     // #113: dedup recalled memories (mainly the cross-layer 用户：{u} / {u}
     // overlap) before they enter the prompt. Pure; no new DB calls.
@@ -1287,29 +1334,53 @@ pub(crate) async fn build_reply_request_with(
         character_state.as_ref()
     };
 
-    let mut system_prompt = build_prompt(
-        &input.persona,
-        &profile_groups,
-        &relationship_facts,
-        Some(&input.affinity),
-        &plan.context_hints,
-        plan.reply_mode,
-        plan.clothing.as_deref(),
-        &kept_traits,
-        affinity_scope,
-        &emotional_context,
-        world.as_ref(),
-        stories.as_ref(),
-        quote,
-        character_state_for_prompt,
-        plan.nudges,
-        now,
-        body_state,
-        needs,
-        event,
-        shared_memories.as_deref(),
-        &anniversaries,
-    );
+    let mut system_prompt = if focused {
+        crate::prompt::build_focused_prompt(
+            &input.persona,
+            &profile_groups,
+            &relationship_facts,
+            Some(&input.affinity),
+            &plan.context_hints,
+            plan.reply_mode,
+            plan.clothing.as_deref(),
+            &kept_traits,
+            affinity_scope,
+            world.as_ref(),
+            stories.as_ref(),
+            quote,
+            character_state_for_prompt,
+            now,
+            body_state,
+            needs,
+            event,
+            shared_memories.as_deref(),
+            &anniversaries,
+        )
+    } else {
+        build_prompt(
+            &input.persona,
+            &profile_groups,
+            &relationship_facts,
+            Some(&input.affinity),
+            &plan.context_hints,
+            plan.reply_mode,
+            plan.clothing.as_deref(),
+            &kept_traits,
+            affinity_scope,
+            &emotional_context,
+            world.as_ref(),
+            stories.as_ref(),
+            quote,
+            character_state_for_prompt,
+            plan.nudges,
+            now,
+            body_state,
+            needs,
+            event,
+            shared_memories.as_deref(),
+            &anniversaries,
+        )
+    };
 
     if render_reactions {
         // Reactions the user set since their previous message. Non-fatal: a
@@ -4247,6 +4318,7 @@ mod tests {
             None,
             None,
             Some(&view),
+            false,
         )
         .await
         .expect("build_reply_request_with succeeds");
@@ -5051,6 +5123,7 @@ mod tests {
             None,
             None,
             view.as_ref(),
+            false,
         )
         .await
         .expect("build_reply_request_with succeeds");

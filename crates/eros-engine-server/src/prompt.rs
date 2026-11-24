@@ -2393,7 +2393,6 @@ pub fn build_emotional_prompt(
 /// `[reply_length]` at the lowest tier, and `[this_turn]` holding the work
 /// line alone. Every parameter is documented on `render_prompt`.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub fn build_focused_prompt(
     persona: &CompanionPersona,
     profile_groups: &[(String, Vec<String>)],
@@ -8426,10 +8425,11 @@ mod tests {
         }
     }
 
-    /// Everything but the dropped blocks, the lowest tier and the work line
-    /// renders as the default prompt does.
+    /// Three edits turn the default prompt into the focused one: `[feelings]`
+    /// is dropped, `[reply_length]` is the lowest tier, and `[this_turn]`
+    /// holds the work line. Everything else renders as the default does.
     #[test]
-    fn a_focused_prompt_differs_from_the_default_only_in_its_four_blocks() {
+    fn a_focused_prompt_differs_from_the_default_only_in_the_feelings_the_tier_and_this_turn() {
         let a = focused_warm_affinity();
         let d = default_prompt_of(&a, None, &[], TurnNudges::default());
         let feelings = format!(
