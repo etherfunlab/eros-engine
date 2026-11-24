@@ -77,12 +77,13 @@ value of the wrong shape reads as absent.
 | `is_virgin` | boolean | Read by life events. |
 | `sex_addict` | boolean | Read by life events: only `true` draws `having_sex` and `masturbating`. |
 | `hygienic` | boolean | Whether she loves being clean. Read by life events, and by when she asks the user to take a bath together. |
-| `employed` | string | `free`, `part_time` or `full_time`: how much of her day is work. Absent or any other value reads as `part_time`. Read by life events. |
+| `employed` | string | `free`, `part_time` or `full_time`: how much of her day is work. Absent or any other value reads as `part_time`. Read by life events, and by the chat tone draw: `full_time` is career-minded, so with `tones.focused` above 0, a turn that may draw a tone, off work and with no incident under way, is `focused` 1 time in 8 ([at work](life-events-needs.md#at-work)). |
 | `outdoorsy` | string | `outdoor`, `neutral` or `indoor`: whether she leans outdoors or stays in. Absent or any other value reads as `neutral`. Read by life events. |
-| `setting` | string | `modern` or `fantasy`: the world she lives in, which decides the life events that fit her. Absent or any other value reads as `modern`. Read by life events, and by the user's `fight_together`, which only a `fantasy` persona accepts. |
+| `setting` | string | `modern` or `fantasy`: the world she lives in, which decides the life events that fit her. Absent or any other value reads as `modern`. Read by life events, and by the user's `fight_together`, which only a `fantasy` persona accepts, and `cycle_together`, which only a `modern` one accepts. |
 
-The last ten are accepted on a BYOC instance, where only `setting` has an
-effect, on the user's `fight_together`: BYOC does not serve life events yet.
+The last ten are accepted on a BYOC instance, where only two have an effect:
+`setting`, on the user's `fight_together` and `cycle_together`, and `employed`,
+on the `focused` tone off work. BYOC does not serve life events yet.
 
 ## Versions
 

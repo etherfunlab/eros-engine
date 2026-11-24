@@ -101,7 +101,7 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `tasks.<name>.allow_traits` | `Array<String>` | 否 | 此任务的 prompt-trait allow-list（三态：缺失 = 不设门控；`[]` = 丢弃所有 trait；`["a","b"]` = 白名单）。找不到匹配的 tier 块时使用。 |
 | `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback`、`allow_traits` 和/或 `retry_depth`。不覆盖 `temperature`、`max_tokens`、`top_p`、`frequency_penalty`、`presence_penalty` 或 `repetition_penalty`——这六个都只在任务级生效。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | 否 | 用户输入改写 filter 的全局 trigger。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。`false`/缺失 = 关闭，`true` = 每轮执行，`0.8` = 约 80% 的轮次执行（超出 `[0.0, 1.0]` 的数字会被拒绝）。参见“`input_filter`”。 |
-| `tasks.chat_companion.tones` | table | 否 | 聊天语气：`{ emotional = <f64> }`，`[0.0, 1.0]` 内的基础概率。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。缺失或 `0` = 关闭；超出范围的值、或 `emotional` 以外的语气名会拒绝启动。参见“`tones`”。 |
+| `tasks.chat_companion.tones` | table | 否 | 聊天语气：`{ emotional = <f64>, focused = <f64> }`，各为 `[0.0, 1.0]` 内的概率。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。哪个键缺失或为 `0`，哪种语气就关闭；超出范围的值、或 `emotional` 和 `focused` 以外的语气名会拒绝启动。参见“`tones`”。 |
 | `tasks.<name>.description` | `String` | 否 | 文档字段，代码忽略。 |
 
 **`defaults.ignore_providers` 和 `defaults.provider_sort` 已移除。** 残留
@@ -521,12 +521,13 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 ### `tones` — 聊天语气（仅限 chat 任务）
 
 `[tasks.chat_companion]` 上的 `tones` 打开 engine 的聊天语气。它只在任务级设置，没有 per-tier
-覆盖。缺失（默认）或 `emotional = 0` 即关闭，这时每个 prompt、请求和落库的行都和没有这个键时一样。
-超出 `[0.0, 1.0]` 的值、或 `emotional` 以外的语气名，会拒绝启动。
+覆盖。它有两个键，`emotional` 和 `focused`；每个键缺失或为 `0` 即关闭，两个键各管各的，不依赖对方。
+两个都关（默认）时，每个 prompt、请求和落库的行都和没有这张表时一样。
+超出 `[0.0, 1.0]` 的值、或 `emotional` 和 `focused` 以外的语气名，会拒绝启动。
 
 ```toml
 [tasks.chat_companion]
-tones = { emotional = 0.05 }
+tones = { emotional = 0.05, focused = 1.0 }
 ```
 
 判官决定回复和用户这句话的关系（`reply_mode`），从不决定语气。语气由 engine 在这一轮定稿的计划上决定，
@@ -541,9 +542,19 @@ tones = { emotional = 0.05 }
   | `compatible` | 这一轮的 `affinity_scope` 含暧昧感轴时 ×2 |
 
   `emotional = 0.05` 时，性向相容、又有一项需求成立，是 0.30；角色再是 `moody`，就是 0.90。
+- **不带用户动作、也没有掷出 `emotional` 的 1:1 文字回合**，按她此刻在做什么，以下面的概率用 `focused`：
+
+  | 这一轮 | 概率 |
+  |---|---|
+  | 她在上班：进行中的插曲是 `temp_work`，或者背景是 `business_trip` 而没有插曲在进行 | `focused` |
+  | 不在上班，角色的 `art_metadata.employed` 为 `"full_time"`，没有插曲在进行，背景不限 | 1/8，`focused` 大于 0 时不管取多少 |
+  | 其他 | 不掷 |
+
+  `focused = 1.0` 让上班时的这类回合全都用 `focused`；这个键只负责打开那个 1/8，不缩放它。见
+  [life-events-needs.zh.md](life-events-needs.zh.md#上班时)。
 - **带十三种用户动作之一的 1:1 回合**（`french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、
-  `shower_together`、`bath_together`、`sex_together`、`streak_together`、`propose`、`break_up`、`threaten`、`tip`）一律用 `emotional`，接受、拒绝都一样。其余带动作的回合从不用 `emotional`。
-- **生活事件开始时发的那条消息**，有十六种事件用 `emotional`（[life-events-needs.zh.md](life-events-needs.zh.md#她怎么讲出来)）。
+  `shower_together`、`bath_together`、`sex_together`、`streak_together`、`propose`、`break_up`、`threaten`、`tip`）在 `emotional` 大于 0 时一律用 `emotional`，接受、拒绝都一样。其余带动作的回合从不用 `emotional`，带动作的回合也从不用 `focused`。
+- **生活事件开始时发的那条消息**，在 `emotional` 大于 0 时有十六种事件用 `emotional`（[life-events-needs.zh.md](life-events-needs.zh.md#她怎么讲出来)）。
 
 群聊回合、`/open` 和其他主动消息、编辑与改图回合、语音通话从不带语气。
 
@@ -559,11 +570,21 @@ tones = { emotional = 0.05 }
   `[world_memories]` 和 `[world_stories]` 只出 digest：这一轮不调 embedding。
 - `[shared_memories]` 只放这段关系最近的三个 episode；这一轮的 `memory_scope` 关掉关系层时一个都没有。
 
+**`focused` 回复**像手上有工作的人那样写：请求和 system prompt 都是默认的那一套，区别只有这些：
+
+- system prompt 去掉 `[feelings]` 和 `[emotional_context]`。`[reply_length]` 固定在最低一档
+  （最多 1 句，不超过 40 字），不管亲密度和模式。
+- 不掷每轮的 nudge。`[this_turn]` 只放一行，上班时和不上班时一样，不管 `reply_mode` 是什么：
+  `- 你手上有工作，心思在工作上：回得简短利落，先顾手上的事`。
+- 其余都和默认一样：聊天历史、`[user_profile]`、`[shared_memories]`、`[world_memories]`、`[world_stories]`、
+  `[character_state]`、`[relationship]`、`[mood]`、`[inner_state]`、`[quote]`、`[now]`、各条铁律、按 `reply_mode`
+  写出的铁律 ①、`[output]` 和 `[reactions]`。
+
 post-process（记忆、insights、亲密度）照常跑；模型、采样、输出 filter 和各帧都和 chat 任务一样。
 
-**记录。** 抽过签的回合，它的每一行 assistant 消息都带 `metadata.tone`，值为 `"emotional"` 或
-`"default"`。名单内动作回合的行、名单内事件消息的行也带 `"emotional"`；用户行的 `metadata.action`
-和消息的 `metadata.proactive` 能把它们和抽签的回合区分开。语气没碰到的回合没有 `tone` 这个键。
+**记录。** 两次抽签至少掷过一次的回合，它的每一行 assistant 消息都带 `metadata.tone`：最终的语气，
+`"emotional"`、`"focused"` 或 `"default"`。`emotional` 大于 0 时，名单内动作回合的行、名单内事件消息的行也带 `"emotional"`；用户行的 `metadata.action`
+和消息的 `metadata.proactive` 能把它们和抽签的回合区分开。只开 `focused` 时，名单内动作回合不抽签，它的行不带 `tone`。语气没碰到的回合没有 `tone` 这个键。
 语气不存别处：判官的决策行上没有，任何帧里也没有。
 
 ## 任务名
@@ -649,7 +670,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
   - `inner_state`：融入 reply prompt 的简短情绪/语气描述
   - `reply_mode`（选填）：这一轮回复与用户消息的关系——`"listen"` / `"follow"` / `"ask"` / `"judge"`，拿不准就 `null`（由引擎的每轮骰子接管）。会切换 reply prompt 铁律 ① 的文案；`listen` 同时把回复长度上限降一档
   - `clothing`（选填）：角色此刻的穿着，一句话。上下文里有 `[你的衣柜]` 时判官应从中挑选；有 `[指定穿着]` 时 engine 采用指定的穿着并忽略本字段。注入 reply prompt 的 `[character_state]` 区块内的一行，也进画图 composer 的 `[此刻穿着]` 槽；缺省则不注入
-  - `action_response`（选填）：本轮带用户动作时（上下文里会有 `[用户动作]` 一行）填 `"accept"` 或 `"refuse"`；其他回合或拿不准时填 `null`。`null`、判官调用失败、规则 PDE 一律按接受处理；例外是在判官之前就判为拒绝的动作（见下），不管判官怎么答，回应都是 `refuse`。拒绝会让该动作对应的亲密度线降一档，`tip`、社交动作、`date`、`propose`、`break_up` 和角色的世界排除掉的 `fight_together` 除外（见 [affinity-model.zh.md](affinity-model.zh.md)）。`bluff`、`threaten`、`trick` 的回答表示她有没有中招，`challenge`、`bet` 的回答表示她接不接，`break_up` 的回答表示她同不同意分手，`[用户动作]` 一行会写明两种回答各自的意思，例如 `[用户动作] 对方威胁你（accept：你被吓到了；refuse：你没吃这一套）`、`[用户动作] 对方向你发起挑战（accept：你应战了；refuse：你没应战）` 或 `[用户动作] 对方向你提出分手（accept：你同意分手；refuse：你不同意分手）`。被接受的 `propose` 或 `break_up` 会挪动关系状态（见 [affinity-model.zh.md](affinity-model.zh.md#迁移)）。动作回合里 `ghost` 和 `product_qa` 会改判为 `reply_text`，也不掷每轮骰子
+  - `action_response`（选填）：本轮带用户动作时（上下文里会有 `[用户动作]` 一行）填 `"accept"` 或 `"refuse"`；其他回合或拿不准时填 `null`。`null`、判官调用失败、规则 PDE 一律按接受处理；例外是在判官之前就判为拒绝的动作（见下），不管判官怎么答，回应都是 `refuse`。拒绝会让该动作对应的亲密度线降一档，`tip`、社交动作、`date`、`propose`、`break_up` 和角色的世界排除掉的一起做的动作除外（见 [affinity-model.zh.md](affinity-model.zh.md)）。`bluff`、`threaten`、`trick` 的回答表示她有没有中招，`challenge`、`bet` 的回答表示她接不接，`break_up` 的回答表示她同不同意分手，`[用户动作]` 一行会写明两种回答各自的意思，例如 `[用户动作] 对方威胁你（accept：你被吓到了；refuse：你没吃这一套）`、`[用户动作] 对方向你发起挑战（accept：你应战了；refuse：你没应战）` 或 `[用户动作] 对方向你提出分手（accept：你同意分手；refuse：你不同意分手）`。被接受的 `propose` 或 `break_up` 会挪动关系状态（见 [affinity-model.zh.md](affinity-model.zh.md#迁移)）。动作回合里 `ghost` 和 `product_qa` 会改判为 `reply_text`，也不掷每轮骰子
   - `needs`（选填）：角色此刻的四项基本需要 `{social, emotional, outing, indulgence}`，各为 `"low"` | `"mid"` | `"high"`（`high` = 很想找人说话 / 很需要被在乎 / 很想出门 / 对成瘾物的渴求，来根烟、喝一杯、来口大麻、喝杯咖啡或吃顿好的；`low` 的 `outing` 是只想待在屋里），写 `null` 表示沿用上次的判定（被接受的 give 仍会挪动它涉及的那几项需求，见下）。严格的 `response_format` 下，非空对象四个键齐全。有 `social` 和 `emotional`、但缺 `outing` 或 `indulgence` 的对象，缺的那一项沿用判官看到的水平（第一次评定之前为 `mid`）；缺 `social` 或 `emotional`，整个对象解析不了。engine 不评的键，比如旧版判官 prompt 还会给的 `hunger`、`stamina`，一律忽略。判官只评角色自己，不评两人的关系。判定存在本轮的用户消息上。本轮有被接受的 give（或算作给 1 份的 `smoke_together`、`smoke_weed_together`、`drink_together`）时，由引擎写入存下的水平，判官弃权时也照写：give 挪动的那几项取自基线（判官看到的那组水平）再挪一档，其余各项取判官的评定，判官弃权时取基线（见 [life-events-needs.zh.md](life-events-needs.zh.md#give-会改动需求)）。两次判定之间由引擎按时间推算：社交欲每 12 小时升一档，外出每 8 小时向 `mid` 靠一档，情感需求每 12 小时向 `mid` 靠一档。`indulgence` 在 `art_metadata.smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` 都不为 `true` 的角色身上每 8 小时向 `mid` 靠一档，否则按为 `true` 的有一项、两项、三项及以上，分别每 12、8、4 小时向 `high` 升一档（见 [life-events-needs.zh.md](life-events-needs.zh.md#两次评定之间的漂移)）。不在 `mid` 的档位会作为 `[character_state]` 里的一行进入回复；`indulgence` 只在 `high` 时出现，点名一样值为 `true` 的习惯（很想抽根烟 / 很想喝一杯 / 很想抽口大麻 / 很想喝杯咖啡 / 很想吃顿好的），一样都没有时是很想放纵一下。无法解析的值会被忽略，不会让整个裁决失败。
   - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
@@ -670,7 +691,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 
 只要还有被接受的 give 在起作用（被接受的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 算作给了 1 份 `cigarette`、`herb` 或 `alcohol`），引擎还会在 `[用户动作]` 之前加一行 `[身体状态]`，写明角色身上带着的余效（例如 `[身体状态] 3 杯「威士忌」，微醺，还在往上走`；见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)）；没有时这一行不出现。
 
-**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）为 `false` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。键为 `true` 或不写时从不掷。`smoke_together`、`smoke_weed_together` 或 `drink_together` 按一次给 1 份 `cigarette`、`herb` 或 `alcohol` 的 give 来掷，拒绝时这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你一起去抽根烟，这次你不会答应`。这一轮 `affinity_scope` 性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。同一条件下的 `shower_together`、`bath_together`、`sex_together` 和 `streak_together`，以及机器角色（`art_metadata.species` 为 `"robot"` 或 `"android"`）收到的 `toilet_together`，也一样，这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你一起淋浴，这次你不会答应`。`art_metadata.setting` 不是 `"fantasy"` 的角色收到的 `fight_together` 也一样，末尾相同（`[用户动作] 对方想和你一起去战斗，这次你不会答应`），这样的拒绝哪条线都不降。genome 实例上状态不是 `dating`、`fwb` 或 `situationship` 时的 `propose`（BYOC 实例上的 `propose` 照常交给判官），状态不可分手时的 `break_up`，以及 BYOC 实例上的任何 `break_up`（见 [affinity-model.zh.md](affinity-model.zh.md#迁移)）也一样：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方向你求婚，这次你不会答应`，这样的拒绝哪条线都不降，也不挪动状态。[门槛](activities.zh.md#门槛)不通过的 `date`（bond 不到第 2 档的 `mid` 约会，或她离线、正在另一场约会里时的任何约会）同样如此：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
+**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）为 `false` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。键为 `true` 或不写时从不掷。`smoke_together`、`smoke_weed_together` 或 `drink_together` 按一次给 1 份 `cigarette`、`herb` 或 `alcohol` 的 give 来掷，拒绝时这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你一起去抽根烟，这次你不会答应`。这一轮 `affinity_scope` 性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。同一条件下的 `shower_together`、`bath_together`、`sex_together` 和 `streak_together`，以及机器角色（`art_metadata.species` 为 `"robot"` 或 `"android"`）收到的 `toilet_together`，也一样，这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你一起淋浴，这次你不会答应`。写入的事件不属于角色那个世界的一起做的动作也一样：`art_metadata.setting` 不是 `"fantasy"` 的角色收到的 `fight_together`，以及是 `"fantasy"` 的角色收到的 `cycle_together`，末尾相同（`[用户动作] 对方想和你一起去战斗，这次你不会答应`、`[用户动作] 对方想和你一起骑单车，这次你不会答应`），这样的拒绝哪条线都不降。genome 实例上状态不是 `dating`、`fwb` 或 `situationship` 时的 `propose`（BYOC 实例上的 `propose` 照常交给判官），状态不可分手时的 `break_up`，以及 BYOC 实例上的任何 `break_up`（见 [affinity-model.zh.md](affinity-model.zh.md#迁移)）也一样：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方向你求婚，这次你不会答应`，这样的拒绝哪条线都不降，也不挪动状态。[门槛](activities.zh.md#门槛)不通过的 `date`（bond 不到第 2 档的 `mid` 约会，或她离线、正在另一场约会里时的任何约会）同样如此：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
 
 **需求上下文行。** 每个有判官的回合，上下文里都有一行 `[需求]`，位于 `[身体状态]` 之前：`[需求] 社交欲=低 情感需求=高 外出=中`，即上一次判定推算到本回合的结果；第一次判定之前为 `[需求] 尚未判定`。`外出` 每次都在；只有 `indulgence` 为 `high` 时才在末尾加上 ` 享受=高`（`[需求] 社交欲=低 情感需求=高 外出=中 享受=高`），没有它就读作“不高”，参考 prompt 里也这样告诉判官。严格模式下的判官每个回合仍然要评 `indulgence`，却看不出它原来是 `low` 还是 `mid`，所以连续聊天时它每一轮都在重新猜这一项，按习惯数目的漂移只在两次评定之间起作用。
 
@@ -751,7 +772,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 
 ### `[tasks.chat_image_prompt_compose]` — 出图 prompt 合成器（图片轮次必需）
 
-PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_state`，以及（图片动作时）参考图/宽高比这类输入。真正产出图片 prompt 完全是这个任务的工作：图片动作一旦决定，引擎会在**决定之后、生成之前**跑一次合成器，把人格外观、此刻穿着、身体状态、有事件进行时她此刻在做什么、最近场景、对方最新消息、所选 style、目标宽高比交给它。合成器**从这份上下文生成** prompt——它不再扩写种子，因为种子已经不存在了。
+PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_state`，以及（图片动作时）参考图/宽高比这类输入。真正产出图片 prompt 完全是这个任务的工作：图片动作一旦决定，引擎会在**决定之后、生成之前**跑一次合成器，把人格外观、此刻穿着、身体状态、有事件进行时她此刻在做什么、她和对方一起做时对方的性别、最近场景、对方最新消息、所选 style、目标宽高比交给它。合成器**从这份上下文生成** prompt——它不再扩写种子，因为种子已经不存在了。
 
 **这个任务现在是图片轮次的必需项。** 不配置 `[tasks.chat_image_prompt_compose]`，引擎就没有任何办法产出图片 prompt：它会向判断器报告 `本轮可发图=否`（图片能力为假），并把任何 `reply_image` / `reply_text_image` 提案降级为 `reply_text`。要让图片轮次可用，必须配置这个块。
 
@@ -781,6 +802,8 @@ PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_s
 
 `[此刻状态]` 是有事件进行时她此刻在做什么：先是背景、再是进行中的插曲的标签（每种事件一个固定的中文名），用 `；` 连接，如 `短途旅游；在坐火车`。它排在 `[身体状态]` 之后、`[最近场景]` 之前，出现在聊天流水线画的每一张图里：聊天回合的图（判官选的、强制的，或被接受的 `photo`、`strip`、`ask_dancing`、一起做的动作所出的图）、事件消息自己的图，以及群聊回合的图（写发言人自己的状态）。正在开始的事件即使还没落库也算进行中，所以事件消息的图，以及被接受的一起做的动作的图，画的就是它们开始的那个事件。约会中被接受的一起做的动作不开始事件，它的种类只作为那一张图里她的状态。没有进行中的事件时载荷里没有这一段。独立的 compose 端点和改图端点不发这一段。引擎不改写 `[此刻穿着]`：内置提示词点出这一段，要求图里必须画出它，并说明状态与她的穿着冲突时以状态为准。自定义的 `filter_prompt` 应补一句相应的话；不补的话，模型仍会读到这一段，却没人告诉它怎么用。审计行的 `inputs` 以 `current_state` 记录它（[LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)）。
 
+`[对方]` 是用户的性别，`男性` 或 `女性`，紧跟在 `[此刻状态]` 之后。聊天请求带了 `user_gender`（`"male"` 或 `"female"`，见[发送路由](api-reference.zh.md#post-compchatsession_idmessagestream)），且 `[此刻状态]` 写到的种类里有一种是她和用户一起做的：`traveling_together`、`on_a_date`，或任何 `…_together` 种类（这一轮被接受的一起做的动作写入的那种也算），才有这一段；否则载荷里没有它。它说的是用户是什么性别，不是说用户在画面里：用户出不出现，仍由合成器读 `[此刻状态]`、场景和最新消息来定，所以一起旅行时她拍的自拍，照样可以只有她一个人。两条聊天发送路由之外画的图（事件消息的图、群聊回合的图）不带这一段，独立的 compose 端点和改图端点也不带。内置提示词点出这一段：有这一段、而对方出现在画面里时，按这个性别画对方。自定义的 `filter_prompt` 应补一句这样的话；不补的话，模型仍会看到这一段。审计行的 `inputs` 以 `partner_gender` 记录它，没有这一段时为空字符串。
+
 ```toml
 [tasks.chat_image_prompt_compose]
 model        = "x-ai/grok-4"                       # 任意文本模型；选一个能覆盖你内容范围的
@@ -805,7 +828,7 @@ max_tokens   = 700
 | `repetition_penalty` | `f32` | 缺失 | 重复惩罚，`(0.0, 2.0]`（`1.0` 为恒等值）。未设置时省略。 |
 | `filter_prompt` | `String` \| `Array<String>` \| `Table<String, String>` | **内置默认** | **可选**（不同于其他任务）。空白/缺失 ⇒ 引擎内置的 `DEFAULT_COMPOSE_PROMPT`。数组/表两种形态见下方"变体"。 |
 
-**内置默认提示词。** 不同于其他每个任务（提示词必须来自配置），合成器自带一个通用、**不含产品身份**的内置默认。它**从上下文生成** prompt 和 caption——人格外观、此刻穿着、身体状态、此刻状态、最近场景、对方最新消息、style、宽高比——**不**软化、不降级、不审查、不拒绝，也不自带内容审核层——审核交给画图模型供应商和下游部署，不在这一步。非空 `filter_prompt` 覆盖它（且必须遵守上面的 JSON 契约）；空白/缺失则回退到它。
+**内置默认提示词。** 不同于其他每个任务（提示词必须来自配置），合成器自带一个通用、**不含产品身份**的内置默认。它**从上下文生成** prompt 和 caption——人格外观、此刻穿着、身体状态、此刻状态、对方的性别、最近场景、对方最新消息、style、宽高比——**不**软化、不降级、不审查、不拒绝，也不自带内容审核层——审核交给画图模型供应商和下游部署，不在这一步。非空 `filter_prompt` 覆盖它（且必须遵守上面的 JSON 契约）；空白/缺失则回退到它。
 
 **变体（variants）。** 这个任务的 `filter_prompt` 接受纯字符串以外的形态（`[tasks.chat_image_edit_compose]` 的也接受，见下文）。前端在每个 chat 轮次通过发消息请求体上的 `image.prompt_variant` 挑一个。三种形态：
 

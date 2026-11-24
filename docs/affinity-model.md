@@ -279,8 +279,8 @@ roll can refuse whatever the judge says
   refused whatever the judge says, and drops Chemistry like any refused
   physical action. So is a `shower_together`, `bath_together`, `sex_together` or
   `streak_together` from such a pair, and a `toilet_together` to a machine persona. A
-  `fight_together` to a persona whose `setting` is not `fantasy` is refused the same way and drops
-  no line. The other together actions have no such rule. A `smoke_together`, `smoke_weed_together` or
+  `fight_together` to a persona whose `setting` is not `fantasy`, and a `cycle_together` to one
+  whose `setting` is, are refused the same way and drop no line. The other together actions have no such rule. A `smoke_together`, `smoke_weed_together` or
   `drink_together` the roll refuses drops Chemistry too, not Bond.
 - **Proposal and break-up:** a refused `propose` or `break_up` drops no line; the turn is
   graded like any other. Before the judge, a `propose` from a status other than `dating`,

@@ -240,11 +240,11 @@ cooldowns and ranges are in `rule`, and the category values in `category_rule`, 
 
 A duration written as a range is drawn uniformly in whole hours when the event starts.
 
-Twenty-one more kinds are never drawn: `taking_space` (说好暂时分开), `fell_out`
+Twenty-five more kinds are never drawn: `taking_space` (说好暂时分开), `fell_out`
 (为分开的事闹得不愉快), `traveling_together` (和对方一起旅行), `bathing_together`
 (和对方一起洗澡), `on_a_date` (和对方约会), `showering_together` (和对方一起淋浴),
-`sauna_together` (和对方一起蒸桑拿) and the fourteen kinds of the other together actions, from
-`using_toilet_together` to `fighting_together`
+`sauna_together` (和对方一起蒸桑拿) and the eighteen kinds of the other together actions, from
+`using_toilet_together` to `hiking_together`
 ([together actions](#showering-bathing-and-the-sauna-together)). The first two belong to the
 retired ask for space: the engine no longer writes them, and they remain only in stored data
 ([where the choice is stored](#where-the-choice-is-stored)). They are
@@ -255,14 +255,14 @@ user accepts her suggestion ([going away together](#going-away-together)),
 accepts her ask for a bath, one or the other at even odds ([a bath together](#a-bath-together)),
 or when she accepts the user's `shower_together` or `bath_together`, `sauna_together` a 1-hour
 `short` incident it writes when she accepts the user's `sauna_together`
-([together actions](#showering-bathing-and-the-sauna-together)), the fourteen others the incidents
+([together actions](#showering-bathing-and-the-sauna-together)), the eighteen others the incidents
 it writes when she accepts the user's other together actions, all `short` but the `mid`
-`asleep_together` and `fighting_together` (`having_sex_together` and `asleep_together` are also
-written when the user accepts her `sleep_together` or `fall_asleep_together`,
+`asleep_together`, `fighting_together` and `hiking_together` (`having_sex_together` and
+`asleep_together` are also written when the user accepts her `sleep_together` or `fall_asleep_together`,
 [the romantic choices](#the-romantic-choices)), and `on_a_date` a `short`
 incident of 1 or 4 hours it writes when she accepts the user's date invitation
 ([activities.md](activities.md#the-event)).
-None of the twenty-one has a draw rule, and the caller's `kinds` rejects them.
+None of the twenty-five has a draw rule, and the caller's `kinds` rejects them.
 
 ### The draw
 
@@ -395,9 +395,9 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `is_virgin` | `true`, `false` (default) | while she is a virgin, `having_sex` weighs a fifth within `mid` and `just_have_sex` a fifth within `short` |
 | `sex_addict` | `true`, `false`, absent (default) | within `short`: `true` weighs `sudden_desire`, `strip`, `streaking` and `just_have_sex` 3 times, `false` a third; their gates hold either way. Only `true` lets her draw `having_sex` and `masturbating` |
 | `hygienic` | `true`, `false`, absent (default) | within `short`: `true` weighs `showering`, `bathing`, `want_hot_spring` and `want_sauna` 3 times, `false` a third; it also sets the chemistry tier [a bath together](#a-bath-together) needs |
-| `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` weigh a third, 1 time, 3 times within their categories; a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time` |
+| `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` weigh a third, 1 time, 3 times within their categories; a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time`. `full_time` also makes her career-minded: with `tones.focused` above 0, a turn that may draw a tone, off work and with no incident under way, is `focused` 1 time in 8 ([at work](#at-work)) |
 | `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | within each category, `outdoor` weighs the outdoor kinds 3 times and the indoor kinds a third, `indoor` the reverse; neutral kinds are untouched ([below](#outdoors-or-in)); any other value reads as `neutral` |
-| `setting` | `"modern"` (default), `"fantasy"` | the world she lives in ([below](#her-world)); a persona that is not `fantasy` refuses the user's `fight_together` ([together actions](#showering-bathing-and-the-sauna-together)); any other value reads as `modern` |
+| `setting` | `"modern"` (default), `"fantasy"` | the world she lives in ([below](#her-world)); a persona that is not `fantasy` refuses the user's `fight_together`, and a `fantasy` one the user's `cycle_together` ([together actions](#showering-bathing-and-the-sauna-together)); any other value reads as `modern` |
 | `species` | any word | `"robot"` and `"android"` are machines: she never draws `period`, `period_scare`, `pregnancy_scare` or `using_toilet`, and refuses the user's `toilet_together` ([together actions](#showering-bathing-and-the-sauna-together)); every other word leaves the draw alone. What the word does to the prompt is in [eros-character-v1.1.md](eros-character-v1.1.md) |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee, loves good food (`false`: she keeps off rich food): how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing, or the user's ask to smoke, smoke weed or drink with her (below); `smoking`, `alcoholic` and `drug` set to `true` also let her draw `smoking`, `drinking` and `smoking_weed` |
 
@@ -517,7 +517,7 @@ In the object, `allow` absent or `null` allows every kind and `[]` none; `disall
 kinds out without freezing the rest, so a kind the engine adds later is drawn too. An unknown
 key in the object or an unknown kind anywhere rejects the request, so a misspelt `disallow`
 cannot quietly serve a kind it meant to exclude; a caller lists a new kind only once the
-engine knows it. `taking_space`, `fell_out`, `traveling_together`, `bathing_together`, `on_a_date`, `showering_together`, `sauna_together` and the fourteen kinds of the other together actions are never drawn, so naming one anywhere in
+engine knows it. `taking_space`, `fell_out`, `traveling_together`, `bathing_together`, `on_a_date`, `showering_together`, `sauna_together` and the eighteen kinds of the other together actions are never drawn, so naming one anywhere in
 `kinds` is rejected the same way.
 
 Seven kinds carry adult themes: `sudden_desire`, `strip`, `streaking`, `having_sex`, `just_have_sex`, `masturbating`, and `pregnancy_scare`, which implies sex. The
@@ -588,7 +588,8 @@ Then:
 ### While it lasts
 
 The events under way at a moment are the background and the incident whose
-`started_at <= moment < ends_at`. They reach four readers in the chat; with the world system
+`started_at <= moment < ends_at`. They reach four readers in the chat, and the tone draw
+([below](#at-work)); with the world system
 on, the story and world directors read them too ([Beyond the chat](#beyond-the-chat)).
 
 - **The judge** gets one `[近期事件]` line, after `[需求]` and before `[身体状态]`. It lists the
@@ -630,12 +631,43 @@ on, the story and world directors read them too ([Beyond the chat](#beyond-the-c
   picture of an accepted [together action](#showering-bathing-and-the-sauna-together) shows the
   event it places. The standalone compose endpoint and image edit send no such section. See
   [the composer](model-config.md#taskschat_image_prompt_compose--image-prompt-composer-required-for-image-turns).
+  When the chat request carries a `user_gender` of `male` or `female` and a kind the section
+  names is one she shares with the user (`traveling_together`, `on_a_date` or any `…_together`
+  kind, the one an accepted together action places this turn included), a `[对方]` section after
+  it gives the user's gender, so a picture that shows the user draws them as it.
 - **The caller** gets them from `GET …/effects`: `event` is the incident under way, and
   `background_event` the background. An offline kind under way is reported as `event`
   like any incident, with `"offline": true`; how a client shows it is its call.
 
 A text turn reads the events as of its own user row's send time, so a turn that is driven
 again sees the same ones.
+
+### At work
+
+While the deployment has [`tones.focused`](model-config.md#tones--chat-tones-chat-task-only)
+above 0, some turns are answered in the `focused` tone: like someone with work in hand. She is
+at work when the incident under way is `temp_work`, or when the background is `business_trip`
+and no incident is under way. Both kinds are `modern`-only and neither is offline, so only a
+modern persona is ever at work.
+
+| the turn | chance it is `focused` |
+|---|---|
+| she is at work | the value of `tones.focused` |
+| off work, `employed` is `"full_time"` ([persona settings](#persona-settings)), no incident under way, any background | 1 in 8, whatever the key's value |
+| any other | none |
+
+Only a 1:1 text turn without a user action draws, and a turn that comes up `emotional` stays
+`emotional`. A `focused` reply keeps the chat history, the user profile, the memories and the
+relationship (`[relationship]`, `[mood]`, `[inner_state]`); it drops `[feelings]` and
+`[emotional_context]` and is held to one sentence of at most 40 characters. No nudge dice are
+rolled: its `[this_turn]` holds this one line and nothing else:
+
+```
+- 你手上有工作，心思在工作上：回得简短利落，先顾手上的事
+```
+
+The reply's rows carry `metadata.tone = "focused"`. The draw is in
+[model-config.md](model-config.md#tones--chat-tones-chat-task-only).
 
 ### Offline kinds
 
@@ -801,6 +833,7 @@ Five kinds give her an afternoon of her own and, for a close relationship, somet
 The female gate reads `art_metadata.gender`, the key `period` already uses. No needs factor
 touches them, and the three `mid` kinds join `prefer_events`' vocabulary like any `mid` kind.
 All five are ruled out during `hospitalized` and `post_surgery`: she is not out and about.
+`saw_bag`, `saw_clothes` and `out_shopping` fit a `modern` persona only ([her world](#her-world)).
 
 **The finds.** `saw_bag` and `saw_clothes` are ordinary told incidents. At intimacy rung 1 the
 find is daily-life texture and nothing more. From rung 2 she is allowed to want it out loud,
@@ -866,16 +899,17 @@ see. Her clothing in the message is 刚把衣服脱了, or 刚把「{outfit}」�
 
 The user can ask to take a shower, a bath or a sauna with her: the `shower_together`,
 `bath_together` and `sauna_together` actions, none of which carries a field
-([the send route](api-reference.md#post-compchatsession_idmessagestream)). Fourteen more together
+([the send route](api-reference.md#post-compchatsession_idmessagestream)). Eighteen more together
 actions, also without a field, ask her to do something else with the user (the table below). The
 judge decides, as for any action. Before it, a shower, a bath, a `sex_together` or a
 `streak_together` is ruled out for a pair whose `affinity_scope` is not romance-compatible, as
 `strip` is, a `toilet_together` for a machine persona ([persona settings](#persona-settings)),
-and a `fight_together` for a persona whose world is not `fantasy` ([her world](#her-world)):
-she refuses whatever the judge answers, with or without the LLM judge. The other together actions
+and an action whose event does not fit her world ([her world](#her-world)): a `fight_together`
+for a persona that is not `fantasy`, a `cycle_together` for one that is. She refuses whatever
+the judge answers, with or without the LLM judge. The other together actions
 have no such rule; `smoke_together`, `smoke_weed_together` and `drink_together` take the habit
-roll (below). A refusal places nothing and drops the chemistry line a tier, but a
-`fight_together` her world rules out drops no line; her own
+roll (below). A refusal places nothing and drops the chemistry line a tier, but an action her
+world rules out drops no line; her own
 `bathe_together` ask ([a bath together](#a-bath-together)) and its cooldown neither read these
 actions nor are read by them.
 
@@ -900,17 +934,21 @@ An accepted one puts her in an event, written in the same transaction as the sto
 | `drink_together` | `drinking_together` | 和对方一起喝酒 | 1 h |
 | `hot_spring_together` | `hot_spring_together` | 和对方一起泡温泉 | 1 h |
 | `fight_together` | `fighting_together` | 和对方并肩作战 | 1–2 h |
+| `workout_together` | `working_out_together` | 和对方一起健身 | 1 h |
+| `swim_together` | `swimming_together` | 和对方一起游泳 | 1 h |
+| `cycle_together` | `cycling_together` | 和对方一起骑单车 | 1 h |
+| `hike_together` | `hiking_together` | 和对方一起爬山 | 2–3 h |
 
-Each is a `short` incident but `asleep_together` and `fighting_together`, `mid` ones whose length
-is drawn in whole hours. Starting it ends an incident under way and leaves a background going, as the bath she asks for
+Each is a `short` incident but `asleep_together`, `fighting_together` and `hiking_together`,
+`mid` ones whose length is drawn in whole hours. Starting it ends an incident under way and leaves a background going, as the bath she asks for
 does. The event is keyed on the user's message, so a re-driven turn places it once. While a date
 of hers is on, nothing is placed: the date's `on_a_date` stays as it is and the date goes on.
 She does not tell the event, since her reply to the action already does; none is offline, so she
-still answers during `asleep_together`, and none of the seventeen is drawn. While it lasts it is the
+still answers during `asleep_together`, and none of the twenty-one is drawn. While it lasts it is the
 incident under way, so `正在经历`, the judge and the picture composer read it like any incident.
 `showering_together`, `bathing_together`, `having_sex_together`, `streaking_together`,
 `using_toilet_together` and `asleep_together` stay out of the story director's events, as the
-outcome of her sleep ask does; the other eleven reach it.
+outcome of her sleep ask does; the other fifteen reach it.
 
 `smoke_together`, `smoke_weed_together` and `drink_together` have her take one `cigarette`,
 `herb` or `alcohol`, and count as a give of it for three things only: the habit roll
@@ -939,7 +977,7 @@ above 0, the reply to a shower, a bath, a `sex_together` or a `streak_together` 
 ### Small things in her day
 
 Eight told incidents fill in her day. All are `short`; none takes her offline or carries a
-picture, and all fit both worlds ([below](#her-world)):
+picture, and all but `want_to_quit_job` fit both worlds ([below](#her-world)):
 
 | kind | label | category | weight | cooldown | lasts | gate | cue |
 |---|---|---|---|---|---|---|---|
@@ -1053,14 +1091,17 @@ whatever the request's `kinds` or her `prefer_events` say:
 
 | fits | kinds |
 |---|---|
-| `modern` only | `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery`, `temp_work`, `scolded_superior`, `on_a_cruise`, `on_a_bus`, `on_a_train`, `on_a_plane`, `driving` |
+| `modern` only | `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery`, `temp_work`, `scolded_superior`, `on_a_cruise`, `on_a_bus`, `on_a_train`, `on_a_plane`, `driving`, `saw_bag`, `saw_clothes`, `out_shopping`, `want_to_quit_job`, `admiring_art`, `cycling_together` |
 | `fantasy` only | `on_the_road`, `fighting_together` |
 | both | every other kind |
 
 `on_the_road` is the one drawn `fantasy`-only kind: a modern persona travels by [vehicle](#on-the-move)
-instead. A modern persona whose `prefer_events` lists it keeps a value that does nothing.
-`fighting_together` is never drawn; only a `fantasy` persona can accept the user's
-`fight_together` that places it ([together actions](#showering-bathing-and-the-sauna-together)).
+instead. A modern persona whose `prefer_events` lists it keeps a value that does nothing, and so
+does a fantasy persona whose list names `out_shopping`. `fighting_together` and
+`cycling_together` are never drawn: a together action whose event does not fit her world is
+refused before the judge and costs nothing, so only a
+`fantasy` persona can accept the user's `fight_together` and only a `modern` one the user's
+`cycle_together` ([together actions](#showering-bathing-and-the-sauna-together)).
 
 ### Going out and going home
 
@@ -1611,6 +1652,8 @@ choice's session with the two wordings in
   cold-war streak rules and `sleep_ask_is_sex`.
 - `crates/eros-engine-core/src/scope.rs`: `romance_compatible`, the criterion the romantic
   choices read.
+- `crates/eros-engine-core/src/tone.rs`: `at_work` and `focused_probability`, the chance of a
+  `focused` turn.
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`: the needs read and write (the
   accepted give's move goes through `after_give`), the `[需求]` and `[近期事件]` lines
   (`build_pde_ctx`), the offline branch ahead of the judge, the give roll's refusal

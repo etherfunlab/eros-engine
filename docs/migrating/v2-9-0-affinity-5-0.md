@@ -8,6 +8,8 @@
 Migration `0088` must run before the new image serves, and every machine still on the previous image must be replaced right after it. Every field on the wire is additive, but two behaviours change: her ask for space (`ask_for_space`) is retired, and the user's `propose` is refused unless the pair's status allows it.
 **Design:** [`2026-11-23-affinity-50-design.md`](../superpowers/specs/2026-11-23-affinity-50-design.md)
 
+The other note for this release is [the focused tone, four together actions and the user's gender in a picture](v2-9-0-focused-tone-together-actions-user-gender.md).
+
 Each session now stores a relationship status, moved only by answered asks, with a cold war that can sit on top of it. The rules are in:
 - [the relationship status](../affinity-model.md#relationship-status) and [the composed relation](../affinity-model.md#the-composed-relation);
 - [life choices](../life-events-needs.md#life-choices), [the cold war](../life-events-needs.md#the-cold-war) and [the romantic choices](../life-events-needs.md#the-romantic-choices);
