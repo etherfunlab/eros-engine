@@ -9,9 +9,10 @@ things that happen to her, drawn when a caller asks: a trip, an illness, a stray
 hour away from her phone. Both reach the judge and the reply as plain facts in the present
 tense. Neither tells her how to behave; the exception is an event that is silence (the
 offline kinds). A
-third piece sits on top of both: *life choices*. When a relationship has worn thin she can
-ask for a break ([the ask-for-space choice](#the-ask-for-space-choice)); when it has grown
-warm she can ask to sleep together or propose ([the romantic choices](#the-romantic-choices)).
+third piece sits on top of both: *life choices*. She can ask the user what they are to each
+other (confess, offer a partnership, propose, break up), ask to spend the night, to bathe
+together or to go away together ([life choices](#life-choices)); and when the user wears her
+patience out, the pair falls into a cold war ([the cold war](#the-cold-war)).
 
 Request and response shapes are in [api-reference.md](api-reference.md), the judge's
 context and verdict in
@@ -244,9 +245,9 @@ Twenty-one more kinds are never drawn: `taking_space` (说好暂时分开), `fel
 (和对方一起洗澡), `on_a_date` (和对方约会), `showering_together` (和对方一起淋浴),
 `sauna_together` (和对方一起蒸桑拿) and the fourteen kinds of the other together actions, from
 `using_toilet_together` to `fighting_together`
-([together actions](#showering-bathing-and-the-sauna-together)). The engine writes the first
-two itself when she asks for space and the
-user answers or ignores her ([the ask-for-space choice](#the-ask-for-space-choice)). They are
+([together actions](#showering-bathing-and-the-sauna-together)). The first two belong to the
+retired ask for space: the engine no longer writes them, and they remain only in stored data
+([where the choice is stored](#where-the-choice-is-stored)). They are
 `mid` incidents by shape, and `taking_space` is the one that outlasts the category's four
 hours: it lasts 12 to 24. `traveling_together` is a `trip` background the engine writes when the
 user accepts her suggestion ([going away together](#going-away-together)),
@@ -256,8 +257,9 @@ or when she accepts the user's `shower_together` or `bath_together`, `sauna_toge
 `short` incident it writes when she accepts the user's `sauna_together`
 ([together actions](#showering-bathing-and-the-sauna-together)), the fourteen others the incidents
 it writes when she accepts the user's other together actions, all `short` but the `mid`
-`asleep_together` and `fighting_together` (`having_sex_together` is also written when the user
-accepts her `sleep_together`, [the romantic choices](#the-romantic-choices)), and `on_a_date` a `short`
+`asleep_together` and `fighting_together` (`having_sex_together` and `asleep_together` are also
+written when the user accepts her `sleep_together` or `fall_asleep_together`,
+[the romantic choices](#the-romantic-choices)), and `on_a_date` a `short`
 incident of 1 or 4 hours it writes when she accepts the user's date invitation
 ([activities.md](activities.md#the-event)).
 None of the twenty-one has a draw rule, and the caller's `kinds` rejects them.
@@ -339,9 +341,8 @@ is under way, and a background is not written while any event is.
   a week, whichever kinds are involved. `short` and `mid` have none.
 - **Shared by the offline kinds.** For 12 hours after any offline kind started, no offline kind
   is eligible, whichever kind it was; each kind's own cooldown still applies. It bounds how often
-  she goes silent, the way the category cooldowns bound trips and body states. An accepted
-  separation starts it too, and `out_shopping` counts as an offline kind only for a persona it
-  takes offline.
+  she goes silent, the way the category cooldowns bound trips and body states. `out_shopping`
+  counts as an offline kind only for a persona it takes offline.
 - **Per key.** The same `event_key` in the same session returns the same event with no draw
   and no generation.
 - **Not capped.** The engine sets no limit on how often a caller may ask. Frequency is the
@@ -601,8 +602,8 @@ on, the story and world directors read them too ([Beyond the chat](#beyond-the-c
   A span under one hour reads `不到 1 小时` (and the end then drops the `约`); under 48 hours it
   is whole hours, rounded; from 48 hours it is whole days, rounded. `{label}` is a fixed
   Chinese name per kind (`reading` is `在看书`, `long_trip` is `长途旅游`). The line is absent
-  when nothing is under way, no offline stretch is unexplained, no separation awaits its return
-  mark and no false alarm is unresolved (below).
+  when nothing is under way, no offline stretch is unexplained, no stored separation awaits its
+  return mark and no false alarm is unresolved (below).
 - **The reply** gets `- 正在经历：` under `[now]`, after the time, holiday, birthday and anniversary lines,
   listing the same two events with only the end. The `- 刚才：` line below follows it. Both sit
   outside `[character_state]`, whose header defers to the blocks above it, so a story digest
@@ -645,9 +646,9 @@ Eight drawable kinds make a persona unreachable while they last: `away_from_phon
 silence, the same exemptions and the same explanation afterwards; they differ in wording and
 in whether she announces them. `in_battle` is worded so that her world decides what it is: a
 modern persona reads it as a hard negotiation, a business dinner or a difficult matter, a
-historical or fantasy persona as a real fight. The engine's own `taking_space` is offline for
-every persona and rides the same machinery ([the ask-for-space
-choice](#the-ask-for-space-choice)). The kinds and their durations are in
+historical or fantasy persona as a real fight. A stored `taking_space` is offline for every
+persona and rides the same machinery ([stored data of the ask for
+space](#where-the-choice-is-stored)). The kinds and their durations are in
 [the events route](api-reference.md#post-v2compsessionsession_idevents).
 
 **Announced or silent.** Which kinds are offline, and which are told when they start:
@@ -659,7 +660,7 @@ choice](#the-ask-for-space-choice)). The kinds and their durations are in
 | `out_shopping` | a female persona; any other persona keeps replying | a female persona from rung 2 and silent below; any other persona at every rung, as an ordinary incident |
 | `bros_gathering`, `sis_gathering` | every persona | never; she explains afterwards |
 | `having_sex` | a sex addict, the only persona it is drawn for | never; she explains afterwards, in as many words (`在做爱，对方那时发来的消息你现在才看到`); who she was with is hers to say |
-| `taking_space` | every persona | not by the draw; the ask-for-space flow has her say goodbye |
+| `taking_space` (stored rows only) | every persona | never |
 
 At intimacy rung 2 and up, `busy`, `in_battle` and a female persona's `out_shopping` are told in
 one proactive message like any other kind, with a stage cue that states the fact:
@@ -740,8 +741,9 @@ event started, before it ended. The text of every kind is in
 The gatherings are never announced, so this is where she accounts for them:
 `去了兄弟聚会，对方那时发来的消息你现在才看到` and `去了姐妹聚会，对方那时发来的消息你现在才看到`,
 with the judge's suffix `兄弟聚会（{span}前结束，期间对方的消息你没有回）` and its twin. A female
-persona's `out_shopping` reads `在逛街，对方那时发来的消息你现在才看到`. The engine's separation
-has two wordings of its own ([below](#the-return)).
+persona's `out_shopping` reads `在逛街，对方那时发来的消息你现在才看到`. A stored separation
+has two wordings of its own
+([model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
 
 ### False alarms
 
@@ -907,8 +909,8 @@ She does not tell the event, since her reply to the action already does; none is
 still answers during `asleep_together`, and none of the seventeen is drawn. While it lasts it is the
 incident under way, so `正在经历`, the judge and the picture composer read it like any incident.
 `showering_together`, `bathing_together`, `having_sex_together`, `streaking_together`,
-`using_toilet_together` and `asleep_together` stay out of the story director's events, as a
-romantic choice's outcome does; the other eleven reach it.
+`using_toilet_together` and `asleep_together` stay out of the story director's events, as the
+outcome of her sleep ask does; the other eleven reach it.
 
 `smoke_together`, `smoke_weed_together` and `drink_together` have her take one `cigarette`,
 `herb` or `alcohol`, and count as a give of it for three things only: the habit roll
@@ -922,7 +924,9 @@ for the session ([the romantic choices](#the-romantic-choices)), and her accepte
 `sleep_together` places the same event. That event is sex: it ends
 her virginity ([persona settings](#persona-settings)) and makes a pregnancy scare likelier
 ([follow-on factors](#follow-on-factors)). The user may ask again after an accept; the judge
-decides each time.
+decides each time. `fall_asleep_together` is likewise her own `fall_asleep_together` ask made by
+the user: an accepted one settles that ask for the session, and her accepted
+`fall_asleep_together` places the same `asleep_together`.
 
 An accepted together action is a picture turn when the request carries `image` and the
 deployment has the composer, like an accepted `photo`, `strip` or `ask_dancing`: her words, then
@@ -1093,17 +1097,19 @@ offline kind or a date is under way.
   event's kind and times live in `persona_events`.
 - Needs live on the rated user row, as `metadata.needs`, with a partial index
   (`chat_messages_needs_idx`) that keeps the newest-rating read an index probe per session.
-- `taking_space` and `fell_out` are rows of `persona_events` like any other, with `message_id`
-  NULL; the choice that wrote them lives in `engine.life_choices` ([below](#where-the-choice-is-stored)).
+- Stored `taking_space` and `fell_out` rows are rows of `persona_events` like any other, with
+  `message_id` NULL; the choice that wrote them lives in `engine.life_choices`
+  ([below](#where-the-choice-is-stored)).
 
 ### Beyond the chat
 
 With [World Stories](world-system.md#world-stories) enabled, the story director reads the
 instance's events directly, each with its label, a relative time and the message she told it
-in, plus the background under way and the pair's asks for space with their outcome. It takes
-them as settled fact. A bath together, a shower together, a date, and `having_sex_together`,
-`streaking_together`, `using_toilet_together` and `asleep_together` are left out: like a romantic
-choice's outcome, they live in the conversation only. The messages she sends on her own are not part of its chat evidence, so
+in, plus the background under way, the pair's relationship status and cold war, and its
+`confess`, `partner_up`, `propose` and `break_up` choices (and stored `ask_for_space` ones) with
+their outcome. It takes them as settled fact. A bath together, a shower together, a date, and
+`having_sex_together`, `streaking_together`, `using_toilet_together` and `asleep_together` are
+left out: like the outcome of her sleep, bath and trip asks, they live in the conversation only. The messages she sends on her own are not part of its chat evidence, so
 an event is never read as her answer to an unrelated line. The World Memories director reads a
 background under way for every persona in the roster, stories or not, so a persona in hospital
 is not scripted into a party. Neither director writes events or changes the persona settings
@@ -1157,77 +1163,80 @@ Put together, the two form a loop with the judge in the middle: a persona who wa
 is likelier to draw `want_to_go_out`; the event reaches the judge's context; the judge rates
 `outing` again.
 
-## The ask-for-space choice
+## Life choices
 
-When chemistry has run two tiers past bond and her patience has been worn low for three judged
-turns running, the relationship is lopsided: passion ahead of friendship, and she is tired. She
-asks for a break. It is a *life choice*, a real request with a real cost on every path,
-and it is built from the machinery above: her ask is a proactive message, the break is an
-offline event, and the user answers through one endpoint. Two romantic choices share that
-machinery ([the romantic choices](#the-romantic-choices)); this chapter describes the ask for
-space unless it says otherwise.
+A *life choice* is a real request she puts to the user, with a real cost on some answers. It is
+built from the machinery above: her ask is a proactive message, an accepted ask can place an
+event, and the user answers through one endpoint. There are eight kinds:
+
+| kind | she asks the user | rules |
+|---|---|---|
+| `confess` | to be together | [the romantic choices](#the-romantic-choices) |
+| `partner_up` | to become partners | [the romantic choices](#the-romantic-choices) |
+| `propose` | to marry her | [the romantic choices](#the-romantic-choices) |
+| `break_up` | to break up | [the romantic choices](#the-romantic-choices) |
+| `sleep_together` | to sleep with her | [the romantic choices](#the-romantic-choices) |
+| `fall_asleep_together` | to fall asleep side by side, and no more | [the romantic choices](#the-romantic-choices) |
+| `travel_together` | to go away together | [going away together](#going-away-together) |
+| `bathe_together` | to take a bath together | [a bath together](#a-bath-together) |
+
+The first four are the only things that move the pair's
+[relationship status](affinity-model.md#relationship-status). Over any status the pair can fall
+into a [cold war](#the-cold-war), which no one asks for.
 
 ### When she asks
 
 The engine checks at the end of every 1:1 text turn whose affinity evaluation committed (a
 *judged turn*: the affinity evaluator ran and its verdict landed, whether or not the deployment
-runs the PDE judge), after the commit. She asks when all of these hold, read from the
-committed, time-decayed state:
+runs the PDE judge), after the commit. It first starts or ends a [cold war](#the-cold-war), then
+checks the kinds in this order: `break_up`, `confess`, `partner_up`, then `propose` or her sleep
+ask, then `bathe_together`, then `travel_together`. Each kind has a trigger of its own, read from
+the committed, time-decayed state, and every kind also needs:
 
-- **Gap.** Chemistry tier minus bond tier is at least 2, on the two five-tier ladders. Signed:
-  only chemistry above bond counts.
-- **Patience.** The derived `patience` is below 0.5 on this turn and on the two judged turns
-  before it. A turn whose evaluation was skipped or failed neither counts nor breaks the run.
-  The values are read from the session's affinity turn events (`state_after.patience`), not
-  stored anew; 0.5 is a rule threshold the engine owns, not a judge band.
-- **Fresh streak.** All three turns come after the session's newest episode, of any kind of
-  choice: her ask, its resolution, and any separation it started (the latest of `asked_at`,
-  `resolved_at` and, for an accepted choice, the separation's `ends_at`). A judged action turn
-  that fell while she waited for an answer that came, or during the separation, belongs to the
-  episode and counts for nothing; a lapsed ask anchors at `asked_at`, so action turns during its
-  wait do count. The turn that converts an ignored ask is the first of the new streak. Asking
-  consumes the streak: the next ask needs three fresh judged turns.
-- **Clear runway.** No session of the persona has a pending choice, and the persona has no
-  separation (`taking_space`) and no [date](activities.md) under way. She has one life, so at
-  most one ask is pending at a time. A date's own turns are never judged turns, so they never
-  trigger one.
-- **The right session.** A 1:1 text session of a genome persona. A voice session never
-  triggers, delivers or resolves a choice, and a group session writes no affinity at all. A BYOC
-  session never triggers one, because the resolution endpoint refuses BYOC.
+- **A fresh streak.** Only judged turns after the session's *streak anchor* count. The anchor is
+  the latest of its newest choice's `asked_at` and `resolved_at` (for a stored accepted
+  `ask_for_space`, the end of its separation) and its newest `relationship` event, which every
+  change of status or cold war writes. A judged action turn that fell while she waited for an
+  answer that came belongs to that episode and counts for nothing; a lapsed ask anchors at
+  `asked_at`, so action turns during its wait do count. The turn that converts an ignored ask is
+  the first of the new streak. Asking consumes the streak: the next ask needs fresh judged turns.
+- **A clear runway.** No session of the persona has a pending choice, and the persona has no
+  [date](activities.md) under way. She has one life, so at most one ask is pending at a time: once
+  one kind has asked, the later checks of the same turn find the runway closed. A date's own turns
+  are never judged turns, so they never trigger one.
+- **The right session.** A 1:1 text session of a genome persona. A voice session never triggers,
+  delivers or resolves a choice, and a group session writes no affinity at all. A BYOC session
+  never triggers one, because the resolution endpoint refuses BYOC.
 
-The trigger is engine math over committed state; no judge takes part. There is no cooldown
-beyond these mechanics. If the user keeps recreating the condition she keeps asking: the tier
-drop below lowers both lines, so the gap closes only once bond is at tier 1 (a tier-1 line
-cannot drop further while chemistry still can) or the user raises bond. Repeated asks are the
-consequence of a relationship kept lopsided.
+The triggers are engine math over committed state; no judge takes part.
 
 ### Her ask and its delivery
 
-When the trigger fires, in order:
+When a trigger fires, in order:
 
 1. **Her words.** The companion chat model generates the request through the same proactive
    path as an event message (persona, history window, memory recall, `[now]`; no judge, no
-   streaming, no user row). The stage cue is the final `user` turn and is never persisted:
-
-   ```
-   （这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）
-   ```
-
-   The message is an ordinary assistant row, `assistant_action_type = 'proactive'`,
+   streaming, no user row), with the engine's default scopes. The stage cue is the final `user`
+   turn and is never persisted; the cue of every kind is in
+   [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge). The message is an
+   ordinary assistant row, `assistant_action_type = 'proactive'`,
    `metadata.proactive = 'life_choice'`, unread until the read call, with no post-process.
 2. **The choice row.** One row in `engine.life_choices`, written in the same transaction as her
-   message: kind `ask_for_space`, status `pending`, the tier gap at this moment (2 to 4), and
-   `asked_at`, which is the message's `sent_at`. The pending window is 24 hours; the expiry is
-   `asked_at` plus 24 hours, derived and never stored.
+   message: the kind, status `pending`, and `asked_at`, which is the message's `sent_at`. The
+   pending window is 24 hours; the expiry is `asked_at` plus 24 hours, derived and never stored.
+   The write yields to a choice already pending in the persona, and to a streak anchor that moved
+   since the trigger read it.
 
 A blank or stripped-empty generation, or a failed one, writes nothing: no message, no choice
 row, and a later qualifying turn may ask again. The check runs last in the turn's post-process,
 after the affinity commit and the feeling clause, so its generation delays neither, and the
-turn's own affinity write (state and event row, one transaction) is untouched.
+turn's own affinity write (state and event row, one transaction) is untouched. The pair's
+recorded scopes decide eligibility and nothing else; her replies at resolution use the
+resolution request's own scopes.
 
 While a choice is pending and unexpired, the events route draws nothing for the persona. An
-incident that was already under way when she asked keeps running until the answer; an accept or
-an ignore caps it.
+incident that was already under way when she asked keeps running until the answer; an accept
+that places an event, and an accepted `confess`, `partner_up` or `propose`, caps it.
 
 **Delivery.** The notification rides the per-turn affinity delta fetch,
 [`GET /bff/v1/comp/affinity/{session_id}/event`](api-reference.md#get-bffv1compaffinitysession_idevent).
@@ -1240,10 +1249,10 @@ the delta when a history row carries `occasion: "life_choice"`. Both history rou
 [BFF](api-reference.md#get-bffv1compchatsession_idhistorylimit50offset0)) expose a proactive
 assistant row's `metadata.proactive` as an optional `occasion`, omitted on every other row. Her
 ask row also carries a `life_choice` receipt (`id`, `kind`, `status`, `resolved_at`) on both
-history routes and in the BFF start bundle, so a reload shows how the choice ended. The
-tier-drop affinity event is not served on this route, so a client never meets an unknown
-`event_type`; the new state comes back in the resolution response, and any other device reads
-it from the absolute affinity route.
+history routes and in the BFF start bundle, so a reload shows how the choice ended. Neither the
+tier drop nor the status move of an answer is served on this route, so a client never meets an
+unknown `event_type`; the new state comes back in the resolution response, and any other device
+reads it from the absolute affinity route.
 
 **Degradation is the design.** A downstream that has not adapted ignores the unknown field and
 renders the ask as an ordinary proactive message, and its user replies in words. That is the
@@ -1254,54 +1263,42 @@ ignore path below. Nothing breaks; the choice UI is strictly additive.
 The answer is `POST /v2/comp/session/{session_id}/life-choices/{choice_id}` with
 `{"response": "accept" | "decline"}`
 ([API reference](api-reference.md#post-v2compsessionsession_idlife-choiceschoice_id)),
-or the user's own words, or silence. For the ask for space:
+or the user's own words, or silence:
 
-| path | how it happens | choice status | tier drop | separation | her words |
-|---|---|---|---|---|---|
-| accept | the endpoint, `accept` | `accepted` | yes | `taking_space`, 6 h per tier of the gap | a generated goodbye |
-| decline | the endpoint, `decline` | `declined` | yes | none | a generated hurt reply |
-| ignore | the first ordinary user message while it is pending | `ignored` | no | none; a one-hour `fell_out` incident | none of its own: the turn is answered with the falling-out in view |
-| lapse | 24 hours with no answer and no message | stays `pending`, reads as expired | no | none | none |
+| path | how it happens | choice status | cost |
+|---|---|---|---|
+| accept | the endpoint, `accept` | `accepted` | none; what it starts or moves depends on the kind |
+| decline | the endpoint, `decline` | `declined` | a tier drop for some kinds |
+| ignore | the first ordinary user message while it is pending | `ignored` | none, and no event |
+| lapse | 24 hours with no answer and no message | stays `pending`, reads as expired | none |
 
-**Accept.** In one transaction the choice becomes `accepted`, a `taking_space` event
-(说好暂时分开) starts now and lasts 6 hours per tier of the gap stored at ask time (gap 2, 3, 4:
-12, 18, 24 hours), and the tier drop is applied. An incident under way ends at that moment, as
-she drops what she was doing; a background (a trip, an illness) keeps running underneath. Then
-her goodbye is generated and returned, as an ordinary proactive row with
-`metadata.proactive = 'life_choice'`:
+**Accept and decline.** One transaction answers the choice and pays for it: the event an accept
+places, the status it moves and the line a decline drops. What each kind does is in its section.
+She then answers in one proactive message, `metadata.proactive = 'life_choice'`, generated with
+the request's scopes and returned; a failed or empty reply leaves the answer and everything it
+did in place. The tier drop's affinity event and its context keys are in
+[affinity-model.md](affinity-model.md#life-choice-drops-and-the-cold-war-halving).
 
-```
-（对方同意了你提出的分开请求，接下来 {n} 小时你们不联系。你跟对方道别。）
-```
-
-`{n}` is the separation's length in hours. A failed or empty goodbye still leaves the
-resolution, the event and the drop in place: the choice was made.
-
-**Decline.** The same tier drop in the same transaction, no event and no slowdown. Her hurt
-reply is generated and returned:
-
-```
-（对方不同意你提出的分开请求，你心里不好受。）
-```
+**A status that moved.** An action turn leaves her pending ask open, so the status can move
+while the ask waits: her `propose` is pending and the user's own `break_up` is accepted. An
+answer to `confess`, `partner_up`, `propose` or `break_up` that arrives when the status is no
+longer one the kind is asked from is refused with `409` and writes nothing; the ask lapses on its
+own. Only the status is read: a `break_up` asked in a cold war that has since ended can still be
+answered.
 
 **Ignore.** The first ordinary user text message that arrives while the choice is pending
-resolves it: the status becomes `ignored`, and a `fell_out` event (为分开的事闹得不愉快, an
-incident shaped like `quarrel`: one hour, not offline, no message of its own) is written in the
-same transaction, before the turn runs. The very turn that ignored her is therefore answered
-with the falling-out in `[近期事件]` and `正在经历`. An incident under way is capped there, as
-on accept: the falling-out displaces it, and the one-incident rule holds. No tier changes; the
-judge sees the context and rates the turn itself. The clock is the user row's `sent_at`: only a
-message sent after her ask converts it (one already in flight when the ask landed answers
-nothing), and a queued or re-driven turn reads the same. An **action turn** (a give, a tip, a
-kiss) does not resolve the choice: it is answered by its own rules and the ask stays pending, as
-a gift while she waits is an attempt to mend, not an answer. `/open` greetings and reactions
-resolve nothing. A romantic ask is ignored the same way but costs nothing: no `fell_out`, no event
-([the romantic choices](#the-romantic-choices)).
+resolves it: the status becomes `ignored`, at no cost and with no event, whatever the kind. No
+tier changes; the judge reads the user's words like any other turn's and rates the turn itself.
+The clock is the user row's `sent_at`: only a message sent after her ask converts it (one already
+in flight when the ask landed answers nothing), and a queued or re-driven turn reads the same. An
+**action turn** (a give, a tip, a kiss) does not resolve the choice: it is answered by its own
+rules and the ask stays pending, as a gift while she waits is an attempt to mend, not an answer.
+`/open` greetings and reactions resolve nothing.
 
 **Lapse.** With no answer and no message for 24 hours the choice simply lapses. Its status stays
 `pending` in the table and reads as expired everywhere: the delta field stops being attached,
-the endpoint answers `409`, and a later message does not convert to `fell_out`. There is no
-cost; a later ask needs the full trigger again.
+the endpoint answers `409`, and a later message converts nothing. There is no cost; a later ask
+needs its full trigger again.
 
 A resolution and an incoming user message race transactionally. The first writer wins and the
 loser writes nothing (the endpoint answers `409`).
@@ -1310,142 +1307,175 @@ The endpoint can answer as a server-sent event stream: a `resolved` frame with t
 answer and the new affinity first, then her reply as it is generated. See
 [the API reference](api-reference.md#streaming-open-events-and-life-choices).
 
-### The costs
+### The cold war
 
-**The tier drop (accept and decline).** Bond and chemistry each drop one tier, by the
-rejected-action landing rule applied to each line: the line lands at the same relative position
-one tier down, its two axes scaled by the same factor, and a tier-1 line goes to 0. Both lines'
-pending deltas are cleared. It is applied at resolution time, atomically with it: on accept the
-drop is the state she comes back to, and nothing further happens at return. The affinity event
-and its context keys are in [affinity-model.md](affinity-model.md#life-choice-drops-and-the-slowdown).
+When the user wears her patience out, the pair falls into a **cold war**. It is a flag on the
+session's affinity row, over whatever status the pair has; ending it uncovers the status
+underneath unchanged ([affinity-model.md](affinity-model.md#the-cold-war)). No one asks for it.
 
-**The slowdown (accept only).** For 72 hours after the separation ends, every positive committed
-delta on the four line axes is halved before it is applied; the cut part is dropped, not parked in
-`pending_deltas`. Negative deltas apply in full, and the derived `warmth` and `patience` are not
-scaled. It applies in the choice's session only: the
-cost is that relationship's, like the drop, and another session of the same persona pays
-nothing. The window is derived through the choice row (`life_choices.event_id`, the
-`taking_space` row's `ends_at`, to `ends_at` plus 72 hours): no new state, wall-clock rather than
-turn count, so it runs even if the user only returns later. The returned `effective_deltas` show
-the halved values.
+**When it starts.** After every judged 1:1 text turn, before her asks are checked, the engine
+reads the judge's patience levels (`patience_grade`, 1 to 3, from each judged turn's
+`state_after`) of the judged turns after the streak anchor, newest first. A cold war starts when
+the newest three are all at the lowest level, 1, or when at least five of the newest seven are.
+It also starts when a break-up is refused, hers or the user's, unless one is already on. No tier
+gap, compatibility or status is read.
 
-### The separation
+The levels are the judge's own, not the derived `patience`: the derived value is the level
+boosted by the bond line, so with a low bond even the top level stays under 0.5, and a threshold
+on it could hold a new relationship in a cold war for good. A turn whose `state_after` lacks the
+level reads as the middle level, 2.
 
-`taking_space` is a non-drawable offline incident and reuses [the offline
-machinery](#offline-kinds) wholesale:
+**When it ends.** When the newest three judged turns after the anchor are all above the lowest
+level, or when a break-up is accepted. Each start and each end writes a `relationship` event,
+which moves the streak anchor: the turns that started a cold war do not count toward ending it,
+and its end starts a fresh streak for every ask.
 
-- Every 1:1 text turn of the persona, in any session, ghosts without the judge: `meta(ghost)`,
-  `done`, `final`; no needs rating, no ghost-streak write.
-- Action turns and forced-image turns are exempt, as for any offline stretch.
-- `/open` returns `null`.
-- No event is drawn while it is under way, and it starts the shared 12-hour offline cooldown.
-- It is instance-scoped like every `persona_events` row: she has one life, and taking space
-  means her phone is down everywhere.
+**What she says.** When a streak starts it, she says so in one proactive message through the same
+path as an ask, with no choice row: `metadata.proactive = 'cold_war'` (the history routes'
+`occasion`), on the cue
 
-With the ghosting switch off it silences no turn, like any offline stretch, though `/open`
-still returns `null`; the drop, the slowdown and the return line do not depend on the switch. During a separation a message only
-ghosts and never converts any pending ask.
-While it lasts, `正在经历` and the exempt action turns read it as 说好暂时分开.
+```
+（你对对方的耐心被磨光了。你决定不再给对方好脸色，告诉对方你现在不想好好说话。）
+```
 
-### The return
+The flag is committed first: a failed or blank message leaves the cold war on, and she says
+nothing. A cold war started by a refused break-up has no message of its own, her refusal being
+that turn's reply, and ending one writes no message.
 
-The return is acknowledged either way. The standard unexplained rule needs a ghosted user row
-inside the window, but a user who honours the break sends nothing, and she must still mark the
-return or the arc fizzles. So in the choice's session, `taking_space` is unexplained from its
-`ends_at` until the first assistant row with text after it, ghosted rows or none, and the
-wording follows whether the user wrote during the window. Her goodbye was written when the
-separation started, so it does not close the return. The persona's other sessions use the
-standard ghosted-row rule with the first wording.
+**While it lasts.**
 
-| the user | `- 刚才：` | judge suffix |
-|---|---|---|
-| wrote during the window | `你们之前说好分开一阵，现在时间到了；对方那时发来的消息你现在才看到` | `说好暂时分开（{span}前结束，期间对方的消息你没有回）` |
-| honoured the break | `你们之前说好分开一阵，现在时间到了，你们重新开始联系` | `说好暂时分开（{span}前结束，对方等到了约定之后）` |
+- She keeps replying, coldly: the reply's `[relationship]` block ends with `你们正在冷战`, and
+  the judge reads `冷战中=是`.
+- Every positive committed delta on the four line axes is halved, on every judged turn of the
+  session and on a date's settlement ([affinity-model.md](affinity-model.md#life-choice-drops-and-the-cold-war-halving)).
+  Nothing drops when it starts.
+- She asks for nothing warm: no `confess`, `partner_up`, `propose`, `sleep_together`,
+  `fall_asleep_together`, `bathe_together` or `travel_together`.
+- From a breakable status she can ask to break up ([below](#the-romantic-choices)).
+
+A pending choice or a date under way holds a cold war back neither from starting nor from ending.
+Only a 1:1 text session of a genome persona has one; a BYOC session stays at `none` with no cold
+war.
 
 ### The romantic choices
 
-Two more kinds of choice share the machinery above: `sleep_together`, where she asks the user to
-sleep with her, and `propose`, where she proposes. They are the warm counterparts of the ask for
-space: they fire when the relationship is close and she has been warm and patient, and only a
-decline costs anything.
+Six kinds follow the relationship itself. Four move its status: `confess`, where she confesses
+and asks to be together; `partner_up`, where she offers to become partners; `propose`; and
+`break_up`. The other two are her ask to spend the night: `sleep_together`, for sex, or
+`fall_asleep_together`, to fall asleep side by side and no more. The pair's status decides which
+of the two she asks.
 
-**Who qualifies.** A pair the caller has marked romantically compatible through the
-`affinity_scope` it sends (the criterion is in the [API
-reference](api-reference.md#post-v2compsessionsession_idlife-choiceschoice_id)). A pair that
-does not meet it, or has no recorded scopes, is never asked. The engine takes no gender or
-orientation and decides nothing about who is attracted to whom.
+**Who qualifies.** `confess`, `propose`, `sleep_together` and `fall_asleep_together` are asked
+only of a pair the caller has marked romantically compatible through the `affinity_scope` it
+sends (the criterion is in the [API
+reference](api-reference.md#post-v2compsessionsession_idlife-choiceschoice_id)). A pair that does
+not meet it, or has no recorded scopes, is never asked them. `partner_up` and `break_up` do not
+read the scopes: an incompatible pair whose chemistry leads is asked nothing, and once bond
+overtakes, she offers a partnership. A status already reached is not undone when the scopes
+change. The engine takes no gender or orientation and decides nothing about who is attracted to
+whom.
 
-**When she asks.** The check runs where the ask for space's does, after every judged 1:1 text
-turn, over the same committed, time-decayed state and the same clear runway and right session.
-A judged turn is *warm* when its derived `warmth` and `patience` are both above 0.7, read from
-the turn's `state_after`; 0.7 is a rule threshold the engine owns, not a judge band.
+**The status they are asked from.**
 
-| kind | tiers | warm turns |
-|---|---|---|
-| `sleep_together` | chemistry tier 3 or more | the 3 newest judged turns are all warm |
-| `propose` | chemistry and bond tier 4 or more | at least 5 of the newest 8 judged turns are warm |
+| kind | asked from |
+|---|---|
+| `confess` | `none`, `ex`, `partner`, `peer` |
+| `partner_up` | `none`, `ex`, `peer` |
+| `propose` | `dating`, `fwb`, `situationship` |
+| `break_up` | a breakable status (`dating`, `partner`, `fwb`, `situationship`, `engaged`) while a cold war is on |
+| `sleep_together` | `dating`, `engaged`, `fwb`, `situationship`, and `partner` at chemistry tier 4 or more |
+| `fall_asleep_together` | `none`, `peer`, `ex`, and `partner` at chemistry tier 3 |
 
-Only judged turns after the session's newest choice episode, of any kind, count. When both kinds
-qualify on one turn, `propose` fires. Neither can fire together with the ask for space:
-`sleep_together` needs its three newest turns above 0.7 patience where the ask needs them below
-0.5, and `propose` needs both tiers at 4 or more, which leaves no two-tier gap.
+So `dating`, `engaged`, `fwb` and `situationship` are never offered a partnership, even when bond
+later overtakes chemistry, and `engaged` is asked neither to confess nor to marry.
 
-A kind that was accepted or ignored in the session never fires again there: the user was asked
-once, and an answer typed in words is an answer. Nor does it once she has accepted the user's
-own ask of it in the session or in a date of it: `sex_together` for `sleep_together`
-([together actions](#showering-bathing-and-the-sauna-together)), and `propose`, the user
-proposing to her, for `propose`. A refused one settles nothing, and her ask already pending
-stays as it is, to be answered or to lapse. After a decline or a lapse the kind fires again
-once the session has a fresh streak, unless it is settled as above.
+**When she asks.** The checks run where every choice's do, over the same committed, time-decayed
+state and the same clear runway and right session; none of the warm ones while a cold war is on.
+The *leading* line is the one with the higher tier; on equal tiers, the higher score, and an exact
+tie is bond's. A judged turn is *warm* when its derived `warmth` and `patience` are both above
+0.7, read from the turn's `state_after`; 0.7 is a rule threshold the engine owns, not a judge
+band.
 
-The user's `propose` carries no field and is not a together action: it places no event and is
-not a picture turn of its own. The judge decides it with no rule before it, a refusal drops
-nothing, and the user may propose again, the judge deciding each time. While the deployment has
-[`tones.emotional`](model-config.md#tones--chat-tones-chat-task-only) above 0, her reply is in
-the `emotional` tone, accepted or refused.
+| kind | tiers | judged turns | waits |
+|---|---|---|---|
+| `break_up` | none | the newest 3 all at the judge's lowest patience level | none beyond a fresh streak |
+| `confess` | chemistry leads, at tier 3 or more | the newest 3 all with `warmth` above 0.7 | 14 days from the session's latest status change, and from `confess`'s last answer of any kind |
+| `partner_up` | bond leads, at tier 3 or more | the newest 3 all with `patience` above 0.7 | 14 days from the session's latest status change, and from `partner_up`'s last answer of any kind |
+| `propose` | chemistry and bond at tier 4 or more | at least 5 of the newest 8 warm | 14 days from an accepted or ignored `propose`; after a decline or a lapse, a fresh streak |
+| `sleep_together`, `fall_asleep_together` | chemistry tier 3 or more | the newest 3 all warm | never again once settled (below) |
 
-**Her ask.** It is delivered like the ask for space: her words first, as an ordinary assistant
-row with `metadata.proactive = 'life_choice'`, then the choice row beside them (kind
-`sleep_together` or `propose`, no tier gap), the same 24-hour window, and the same `life_choice`
-field on the affinity delta. Her ask is generated with the engine's default scopes, as the ask
-for space is; her replies at resolution use the resolution request's own scopes. The pair's
-recorded scopes decide eligibility and nothing else. The stage cues are in
+`confess` reads warmth alone and `partner_up` patience alone: warmth is boosted by chemistry and
+patience by bond, so with the other line under about 0.415 a warm turn cannot happen, and a
+clearly one-sided pair would never be asked. A *status change* is a `relationship` event whose
+status moved; a cold war starting or ending is not one. An answer of any kind is an accept, a
+decline or an ignore; a lapse is not. The turn that starts a cold war moves the streak anchor, so
+`break_up` needs three more turns at the lowest level after it. When `propose` and her sleep ask
+both qualify on one turn, `propose` fires.
+
+The four status kinds can be asked again whenever their status, wait and streak allow, so after a
+break-up the pair can go round again. Her sleep ask is once only, each kind on its own: a kind the
+user accepted or ignored in the session never fires there again, nor does it once she has accepted
+the user's own ask of it in the session or in a date of it, `sex_together` for `sleep_together`
+([together actions](#showering-bathing-and-the-sauna-together)) and `fall_asleep_together` for
+`fall_asleep_together`. A refused one settles nothing, and her ask already pending stays as it is,
+to be answered or to lapse. A pair once asked to fall asleep together can still be asked for sex
+once its status qualifies.
+
+**The user's `propose` and `break_up`.** Both carry no field and are not together actions: they
+place no event and are not picture turns of their own. Before the judge, the user's `propose` is
+refused unless the status is `dating`, `fwb` or `situationship`, and the user's `break_up` unless
+the status is breakable; such a refusal has no effect, and the judge is told the outcome.
+Otherwise the judge decides: an accepted `propose` makes the pair `engaged`; an accepted
+`break_up` makes them `ex` and ends a cold war, and a refused one keeps the status and starts a
+cold war if none is on. A refusal drops no line. The status moves in the transaction that stores
+the answer, on the turn's session, or on a date on the session the invitation was sent in. On a
+BYOC instance no status moves: the user's `propose` goes to the judge from any status and moves
+nothing, and `break_up` is always refused. The user may ask again; the judge decides each time.
+While the deployment has [`tones.emotional`](model-config.md#tones--chat-tones-chat-task-only)
+above 0, her reply to either is in the `emotional` tone, accepted or refused.
+
+**Her ask.** It is delivered as every ask is ([above](#her-ask-and-its-delivery)), with no tier
+gap. The stage cues are in
 [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge).
 
-**The answer.** The same endpoint, the same `409` rules and the same response shape; `event` is
-the `having_sex_together` a `sleep_together` accept starts, and `null` otherwise.
+**The answer.** The same endpoint, the same `409` rules, a `409` too when the status has moved
+([above](#the-users-answer)), and the same response shape.
 
-| path | choice status | cost | her words |
-|---|---|---|---|
-| accept | `accepted` | none: no tier change, no slowdown. `sleep_together` starts a one-hour `having_sex_together` now, returned as `event`, as the user's accepted `sex_together` does; `propose` starts no event. Either way an incident under way ends there and a background keeps running | a generated reply to the yes |
-| decline | `declined` | `sleep_together`: chemistry drops one tier. `propose`: bond and chemistry each drop one tier | a generated reply to the no |
-| ignore | `ignored` | none: no `fell_out`, no event | none of its own: the turn runs as any other and the judge reads the user's words |
-| lapse | stays `pending`, reads as expired | none | none |
+| kind | accept | decline |
+|---|---|---|
+| `confess` | `none` or `ex` becomes `dating`, `partner` becomes `fwb`, `peer` becomes `situationship`; an incident under way ends | the status stays; chemistry drops one tier |
+| `partner_up` | the pair becomes `partner`; an incident under way ends | the pair becomes `peer`; nothing drops |
+| `propose` | the pair becomes `engaged`; an incident under way ends | the status stays; bond and chemistry each drop one tier |
+| `break_up` | the pair becomes `ex` and the cold war ends | the status stays and the cold war goes on, or starts if it had ended; nothing drops |
+| `sleep_together` | a one-hour `having_sex_together` starts now, returned as `event`, as the user's accepted `sex_together` does; an incident under way ends | chemistry drops one tier |
+| `fall_asleep_together` | an `asleep_together` of one to four hours starts now, returned as `event`, as the user's accepted `fall_asleep_together` does; she keeps replying, and an incident under way ends | chemistry drops one tier |
 
-A decline's drop is the ask for space's landing rule applied to the lines named, in the same
-transaction as the resolution, and its pending deltas are cleared
-([affinity-model.md](affinity-model.md#life-choice-drops-and-the-slowdown)). An action turn resolves
-nothing, as for the ask for space. The slowdown belongs to the ask for space alone: an accepted
-romantic choice never slows growth. The story director reads only the ask for space, so a
-romantic choice's outcome lives in the conversation and leaves no trace in her world story.
+An accept costs nothing and leaves a background running; only `sleep_together` and
+`fall_asleep_together` return an `event`. An ignore and a lapse cost nothing, whatever the kind.
+A status move is written with a `relationship` event in the same transaction
+([affinity-model.md](affinity-model.md#relationship-status)). A decline's drop is the landing
+rule of a refused action applied to the lines named, in the same transaction as the resolution,
+and its pending deltas are cleared. An action turn resolves nothing.
+
+The story director reads the four status kinds with their outcome, and the pair's status and
+cold war, as engine-recorded facts ([beyond the chat](#beyond-the-chat)); the outcome of her
+sleep ask lives in the conversation only.
 
 ### Going away together
 
-`travel_together` is the fourth choice: she suggests that the two of them go away together. It
-is warm like the romantic choices, but it does not read the pair's scopes, so a pair they never
-reach can be asked.
+`travel_together`: she suggests that the two of them go away together. It is warm like the
+romantic choices, but it does not read the pair's scopes, so a pair they never reach can be asked.
 
-**When she asks.** The check runs after the romantic one and the bath's, after every judged 1:1 text turn, over
-the same committed, time-decayed state and the same clear runway and right session. It needs
-bond tier 3 or more and the 3 newest judged turns warm, and no background may be under way. An
-accepted or ignored `travel_together` holds the next ask back for 14 days from its answer; after
-a decline or a lapse she asks again once the session has a fresh streak. When a romantic kind or
-the bath qualifies on the same turn it goes first, and its pending ask closes the runway.
+**When she asks.** The check runs last, after the romantic ones and the bath's, after every
+judged 1:1 text turn, over the same committed, time-decayed state and the same clear runway and
+right session, and never while a cold war is on. It needs bond tier 3 or more and the 3 newest
+judged turns warm, and no background may be under way. An accepted or ignored `travel_together`
+holds the next ask back for 14 days from its answer; after a decline or a lapse she asks again
+once the session has a fresh streak. When an earlier kind qualifies on the same turn it goes
+first, and its pending ask closes the runway.
 
-**Her ask.** It is delivered like the romantic asks: her words first, then the choice row beside
-them, no tier gap, the same 24-hour window and the same `life_choice` field on the affinity
-delta. Her ask is generated with the engine's default scopes; her replies at resolution use the
-resolution request's own scopes.
+**Her ask.** It is delivered as every ask is: her words first, then the choice row beside them,
+no tier gap, the same 24-hour window and the same `life_choice` field on the affinity delta.
 
 **The answer.** The same endpoint, the same `409` rules and the same response shape.
 
@@ -1453,7 +1483,7 @@ resolution request's own scopes.
 |---|---|---|---|---|
 | accept | `accepted` | none | a `traveling_together` event starts now, returned as `event` | a generated reply that knows how long the trip is |
 | decline | `declined` | none | nothing | a generated, disappointed reply |
-| ignore | `ignored` | none: no `fell_out`, no event | nothing | none of its own: the turn runs as any other |
+| ignore | `ignored` | none | nothing | none of its own: the turn runs as any other |
 | lapse | stays `pending`, reads as expired | none | nothing | none |
 
 **The trip.** `traveling_together` (和对方一起旅行) is a non-drawable background in the `trip`
@@ -1465,26 +1495,25 @@ is drawn, `on_the_road`, `admiring_scenery` and `taking_selfie` follow it as the
 own trips, and [the vehicles](#on-the-move) come up with the cue that she is travelling with the
 user. It is instance-scoped like every event.
 
-**Other asks during the trip.** Only the separation of an ask for space holds the streak until
-its event ends. An accepted trip anchors the streak at the answer, so a romantic ask or a bath
-can come while they are away. She does not ask for space during a trip.
+**Other asks during the trip.** An accepted trip anchors the streak at the answer, so another
+ask can come while they are away.
 
 ### A bath together
 
-`bathe_together` is the fifth choice: she asks the user to take a bath with her. Like the
-romantic choices, she asks it only of a romantically compatible pair, a reply typed in words
-settles it at no cost, and only a decline costs anything.
+`bathe_together`: she asks the user to take a bath with her. Like the romantic choices, she asks
+it only of a romantically compatible pair, a reply typed in words settles it at no cost, and only
+a decline costs anything.
 
-**When she asks.** The check runs after the romantic one and before the trip's, after every
+**When she asks.** The check runs after the romantic ones and before the trip's, after every
 judged 1:1 text turn, over the same committed, time-decayed state and the same clear runway and
-right session. It needs all of:
+right session, and never while a cold war is on. It needs all of:
 
 - a romantically compatible pair, read as for the romantic choices;
 - chemistry tier 2 or more for a persona whose `hygienic` is `true`, tier 3 or more when the key
   is absent; a persona whose `hygienic` is `false` never asks;
 - at least 3 of the newest 7 judged turns with `warmth` 0.5 or more, read from the turn's
   `state_after`. Patience is not read, and 0.5 is a rule threshold the engine owns, not a judge
-  band. As for every choice, only judged turns after the session's newest choice episode count.
+  band. As for every choice, only judged turns after the session's streak anchor count.
 
 An accepted or ignored `bathe_together` holds the next ask back for 7 days from its answer;
 after a decline or a lapse she asks again on the next turn that qualifies.
@@ -1495,7 +1524,7 @@ waits for the other to settle, and a trip under way does not hold the bath back.
 pending at a time, so when a romantic kind qualifies on the same turn it goes first and its
 pending ask closes the runway.
 
-**Her ask.** It is delivered like the romantic asks: her words first, then the choice row beside
+**Her ask.** It is delivered as every ask is: her words first, then the choice row beside
 them, no tier gap, the same 24-hour window and the same `life_choice` field on the affinity
 delta. Her ask is generated with the engine's default scopes, on the cue
 `（你们最近越来越亲密，你很想和对方一起洗个澡。你决定主动开口，问对方愿不愿意和你一起洗，希望对方给你一个答复。）`;
@@ -1507,7 +1536,7 @@ her replies at resolution use the resolution request's own scopes.
 |---|---|---|---|---|
 | accept | `accepted` | none | a `showering_together` or `bathing_together` event starts now, one or the other at even odds, returned as `event` | a generated reply on `（对方答应了和你一起洗澡，你们现在一起站在花洒下。）` for a shower, `（对方答应了和你一起洗澡，你们现在一起泡在浴缸里。）` for a bath |
 | decline | `declined` | chemistry drops one tier, as for `sleep_together` | nothing | a generated reply on `（对方没有答应和你一起洗澡，你有点失落。）` |
-| ignore | `ignored` | none: no `fell_out`, no event | nothing | none of its own: the turn runs as any other |
+| ignore | `ignored` | none | nothing | none of its own: the turn runs as any other |
 | lapse | stays `pending`, reads as expired | none | nothing | none |
 
 **The bath.** The accept turns out a shower or a bath at even odds: `showering_together`
@@ -1520,18 +1549,31 @@ under way, so no other incident is drawn, and `正在经历` and the judge read 
 It is instance-scoped like every event. No picture comes with the accept.
 
 The bath stays out of her world story: the story director's events leave out every
-`showering_together` and `bathing_together`, so, as with the romantic choices, its outcome lives
-in the conversation only.
+`showering_together` and `bathing_together`, so, as with her sleep ask, its outcome lives in the
+conversation only.
 
 ### Where the choice is stored
 
 `engine.life_choices` holds one row per choice: `session_id` (non-null, cascades with the
-session), `kind` (`ask_for_space`, `sleep_together`, `propose`, `travel_together` or `bathe_together`), `status` (`pending`,
-`accepted`, `declined`, `ignored`), `tier_gap` (the gap at ask time; set for `ask_for_space`
-and NULL for the other kinds), `asked_at`, `resolved_at`, `message_id` (the ask; set to
-NULL if the message goes) and `event_id` (the `taking_space`, `traveling_together`, `showering_together`, `bathing_together` or `having_sex_together` row an accept wrote, NULL on every
-other path, a `propose` accept included; set to NULL if the event goes). Expiry and the slowdown window are derived, never stored. The separation and
-falling-out rows live in `engine.persona_events` like any event.
+session), `kind` (`confess`, `partner_up`, `propose`, `break_up`, `sleep_together`,
+`fall_asleep_together`, `travel_together` or `bathe_together`, and `ask_for_space` on stored
+rows), `status` (`pending`, `accepted`, `declined`, `ignored`), `tier_gap` (set only on stored
+`ask_for_space` rows), `asked_at`, `resolved_at`, `message_id` (the ask; set to NULL if the
+message goes) and `event_id` (the `traveling_together`, `showering_together`,
+`bathing_together`, `having_sex_together` or `asleep_together` row an accept wrote, NULL on every
+other path, an accept of a status kind included; set to NULL if the event goes). Expiry is
+derived, never stored. The status and the cold war are not stored here: they sit on the session's
+affinity row ([affinity-model.md](affinity-model.md#relationship-columns)).
+
+**Stored data of the ask for space.** Her ask for space (`ask_for_space`) is retired: the engine
+writes no such choice and no `taking_space` or `fell_out` event, but rows from earlier stay
+readable. A stored `ask_for_space` shows in the history receipts and in the story director's
+choices with its outcome; a pending one lapses on its own or is converted by a typed reply at no
+cost, and answering it at the endpoint returns `409`. A `taking_space` (说好暂时分开) still under
+way keeps her offline like any offline kind until it ends, and her return is then marked in its
+choice's session with the two wordings in
+[model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge); a `fell_out`
+(为分开的事闹得不愉快) reads as any ended incident. Neither kind can be drawn or named in `kinds`.
 
 ## Without the LLM judge
 
@@ -1543,7 +1585,7 @@ falling-out rows live in `engine.persona_events` like any event.
 | `正在经历` and `刚才` | reach replies, `/open` greetings and event messages |
 | `[近期事件]` | not rendered: there is no judge to read it |
 | Offline kinds | silence turns as with the judge, since the check runs before it: the ghosting switch and the action and forced-image exemptions apply |
-| The life choices | unchanged: the trigger reads the affinity evaluator's judged turns, not the PDE judge |
+| The life choices and the cold war | unchanged: the triggers read the affinity evaluator's judged turns and patience levels, not the PDE judge. The user's `propose` and `break_up` keep their status gate, and past it the rule engine accepts |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | a `false` key still rolls on a give, or on the together action that counts as one, and can turn it into a refusal; `smoking`, `alcoholic` and `drug` still gate the habit kinds; there is no `indulgence` to drift, name or weigh them |
 
 ## Code pointers
@@ -1560,8 +1602,10 @@ falling-out rows live in `engine.persona_events` like any event.
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`: the `life_choice` field on the delta.
 - `crates/eros-engine-server/src/pipeline/proactive.rs`: the event message and the choice's
   messages, their cues and their write (`kind_cue`, `find_cue`).
-- `crates/eros-engine-server/src/pipeline/life_choice.rs`: the triggers and her ask, the ignore
-  conversion, the slowdown read.
+- `crates/eros-engine-server/src/pipeline/life_choice.rs`: the cold war, the triggers and her
+  ask, the ignore conversion, the growth scale of a cold war.
+- `crates/eros-engine-core/src/relationship.rs`: the statuses, `settle`, `leading_line`, the
+  cold-war streak rules and `sleep_ask_is_sex`.
 - `crates/eros-engine-core/src/scope.rs`: `romance_compatible`, the criterion the romantic
   choices read.
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`: the needs read and write (the
@@ -1583,9 +1627,9 @@ falling-out rows live in `engine.persona_events` like any event.
   world director's `current_background`; `prompt.rs::event_when_text`: the relative times both
   read.
 - `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`: the choice rows, `pending`,
-  `resolve_in_tx`, `settled`, `growth_slowed`.
+  `resolve_in_tx`, `settled`, `settled_since`, `answered_since`, `streak_anchor`.
 - `crates/eros-engine-store/src/affinity.rs::AffinityRepo`: `persist_life_choice_drop_in_tx`,
-  `last_judged_endpoints`.
+  `last_judged_endpoints`, `latest_status_change`, `write_relationship_in_tx`, `set_cold_war`.
 - `crates/eros-engine-store/src/chat.rs::ChatRepo`: `set_needs` and `latest_needs`; `latest_scopes`,
   the scopes the romantic choices judge a pair by.
 - `crates/eros-engine-store/migrations/0000_baseline.sql`: the events and choices
