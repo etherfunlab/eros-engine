@@ -11692,8 +11692,17 @@ data: [DONE]\n\n";
         image: bool,
         art: Option<serde_json::Value>,
     ) -> (Vec<ProtocolFrame>, String, Uuid) {
-        let (frames, mock, umid) =
-            run_together_turn_mock(pool, action, response, compatible, events, image, art).await;
+        let (frames, mock, umid) = run_together_turn_mock(
+            pool,
+            action,
+            response,
+            "reply_text",
+            compatible,
+            events,
+            image,
+            art,
+        )
+        .await;
         let composer = mock
             .received_requests()
             .await
@@ -11707,11 +11716,14 @@ data: [DONE]\n\n";
     }
 
     /// [`run_together_turn_in`] returning the mock, for request inspection,
-    /// in place of the composer bodies.
+    /// in place of the composer bodies, with the judge answering the action
+    /// `judge_action`.
+    #[allow(clippy::too_many_arguments)]
     async fn run_together_turn_mock(
         pool: &PgPool,
         action: eros_engine_core::types::UserAction,
         response: Option<&str>,
+        judge_action: &str,
         compatible: bool,
         events: &[EventSeed],
         image: bool,
@@ -11730,7 +11742,7 @@ data: [DONE]\n\n";
             .await;
         if let Some(response) = response {
             let verdict = serde_json::json!({
-                "action": "reply_text", "inner_state": "", "action_response": response
+                "action": judge_action, "inner_state": "", "action_response": response
             });
             let judge_body = serde_json::json!({
                 "id": "gj", "model": "pde/judge",
@@ -12063,18 +12075,29 @@ data: [DONE]\n\n";
 
     /// One `sex_together` turn of a female human with `events` seeded, on
     /// romance-compatible scopes, the judge answering `judge` (`None`: no
-    /// judge, so the rule engine accepts). Returns whether the turn was
-    /// refused, once it has checked that the judge was told 「这次你不会答应」
-    /// exactly then, that an accept placed the event and a refusal did not,
-    /// and that neither dropped a line.
-    async fn period_sex_turn(pool: &PgPool, events: &[EventSeed], judge: Option<&str>) -> bool {
+    /// judge, so the rule engine accepts). With `picture` pictures are
+    /// available and the judge proposes one (`reply_text_image`). Returns
+    /// whether the turn was refused, once it has checked that the judge was
+    /// told 「这次你不会答应」 exactly then, that an accept placed the event and
+    /// a refusal did not, and that neither dropped a line.
+    async fn period_sex_turn(
+        pool: &PgPool,
+        events: &[EventSeed],
+        judge: Option<&str>,
+        picture: bool,
+    ) -> bool {
         let (frames, mock, umid) = run_together_turn_mock(
             pool,
             eros_engine_core::types::UserAction::SexTogether,
             judge,
+            if picture {
+                "reply_text_image"
+            } else {
+                "reply_text"
+            },
             true,
             events,
-            false,
+            picture,
             Some(serde_json::json!({"gender": "female"})),
         )
         .await;
@@ -12107,7 +12130,9 @@ data: [DONE]\n\n";
     /// judge accepts, so a refusal is the roll's; the roll is random, so the
     /// turns run until both outcomes have been seen. Her period started 28
     /// days and an hour ago: the next one began an hour before the turn.
-    /// With no `period` row nothing is rolled.
+    /// With no `period` row nothing is rolled, nor during a late period
+    /// (§6): her period started 27 days ago, so the next is due in a day,
+    /// and the scare began a day ago and ends two days after the due moment.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn her_period_turns_sex_down_before_the_judge(pool: PgPool) {
         let day = 24 * 60;
@@ -12115,16 +12140,40 @@ data: [DONE]\n\n";
         for judge in [Some("accept"), None] {
             let mut seen = [false; 2];
             for _ in 0..40 {
-                seen[usize::from(period_sex_turn(&pool, &period, judge).await)] = true;
+                seen[usize::from(period_sex_turn(&pool, &period, judge, false).await)] = true;
                 if seen == [true; 2] {
                     break;
                 }
             }
             assert_eq!(seen, [true; 2], "{judge:?}: [accepted, refused]");
         }
-        for _ in 0..8 {
-            assert!(!period_sex_turn(&pool, &[], Some("accept")).await);
+        let late = [
+            ev("period", 27 * day, -24 * day),
+            ev("period_scare", day, 3 * day),
+        ];
+        for events in [&[][..], &late[..]] {
+            for _ in 0..8 {
+                assert!(!period_sex_turn(&pool, events, Some("accept"), false).await);
+            }
         }
+    }
+
+    /// A refusal her period's roll ruled drops nothing when the judge
+    /// proposed a picture either: `picture_action` then rebuilds the refused
+    /// plan as text only through `plan_for` (spec 2026-11-24-period-cycle-
+    /// design.md §8). The turns run until the roll refuses.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn her_period_refusal_drops_nothing_when_the_judge_proposes_a_picture(pool: PgPool) {
+        let day = 24 * 60;
+        let period = [ev("period", 28 * day + 60, -(25 * day + 60))];
+        let mut refused = false;
+        for _ in 0..40 {
+            if period_sex_turn(&pool, &period, Some("accept"), true).await {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "no turn of forty was refused");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -26081,6 +26130,43 @@ data: [DONE]\n\n"
             assert!(!body.contains("虚惊"));
             assert!(!body.contains("后结束"));
             assert!(!body.contains("前开始"));
+        }
+    }
+
+    /// A period the cycle derives, with no row of its own, shows right after
+    /// a trip under way, in the judge's `[近期事件]` and the reply's
+    /// `正在经历` (spec 2026-11-24-period-cycle-design.md §7). Her period
+    /// started 28 days and an hour ago: the next one began an hour before
+    /// the turn.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_derived_period_shows_after_a_trip(pool: PgPool) {
+        let day = 24 * 60;
+        let t = run_event_turn_in(
+            &pool,
+            &[],
+            &[
+                ev("period", 28 * day + 60, -(25 * day + 60)),
+                ev("long_trip", 30 * 60, 70 * 60),
+            ],
+            &[],
+            Some(serde_json::json!({"action": "reply_text", "inner_state": ""})),
+            0,
+            None,
+            true,
+            Some(serde_json::json!({"gender": "female"})),
+        )
+        .await;
+        let reqs = t.mock.received_requests().await.unwrap();
+        let judge = judge_request(&reqs);
+        let chat = chat_request_body(&reqs);
+        for (body, opening) in [
+            (&judge, "[近期事件] 长途旅游（"),
+            (&chat, "- 正在经历：长途旅游（"),
+        ] {
+            let from = body.find(opening).unwrap_or_else(|| panic!("{body}"));
+            let line = &body[from..];
+            let line = &line[..line.find("\\n").unwrap_or(line.len())];
+            assert!(line.contains("）；月经中（"), "{line}");
         }
     }
 

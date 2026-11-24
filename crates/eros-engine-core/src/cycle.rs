@@ -242,6 +242,30 @@ mod tests {
         );
     }
 
+    /// The window is `[due − 3 days, due)` (spec §5): a scare that starts on
+    /// its first instant delays that period; one that starts on the due
+    /// moment belongs to no cycle. Under way, either row reads as late, so
+    /// the second is read once it has ended.
+    #[test]
+    fn the_scare_window_holds_its_start_and_not_the_due_moment() {
+        let first = scare(t(1, 26, 8), t(1, 30, 8));
+        let r = rows(Some(first));
+        assert_eq!(state(&r, Health::Normal, t(1, 29, 8)), Some(first));
+        assert_eq!(
+            state(&r, Health::Normal, t(1, 30, 8)),
+            Some(period(t(1, 30, 8), t(2, 2, 8)))
+        );
+        assert_eq!(next_period_start(&r, t(1, 27, 0)), Some(t(1, 30, 8)));
+
+        let on_due = scare(t(1, 29, 8), t(1, 30, 8));
+        let r = rows(Some(on_due));
+        assert_eq!(state(&r, Health::Normal, t(1, 29, 12)), Some(on_due));
+        assert_eq!(
+            state(&r, Health::Normal, t(1, 30, 12)),
+            Some(period(t(1, 29, 8), t(2, 1, 8)))
+        );
+    }
+
     #[test]
     fn a_scare_that_ends_before_the_due_moment_delays_nothing() {
         // Old one-hour rows.
@@ -274,6 +298,9 @@ mod tests {
             next_period_start(&rows(None), t(1, 30, 0)),
             Some(t(2, 26, 8))
         );
+        // A scare under way in the next cycle's window.
+        let next = rows(Some(scare(t(2, 24, 8), t(2, 28, 8))));
+        assert_eq!(next_period_start(&next, t(2, 24, 12)), Some(t(2, 28, 8)));
     }
 
     #[test]
@@ -292,11 +319,24 @@ mod tests {
         // Due has passed, the period has not started.
         let late = rows(Some(scare(t(1, 27, 10), t(1, 31, 8))));
         assert_eq!(latest_period(&late, Health::Normal, t(1, 30, 0)), None);
+        // The delayed period, from its first instant.
+        assert_eq!(
+            latest_period(&late, Health::Normal, t(1, 31, 8)),
+            Some(period(t(1, 31, 8), t(2, 3, 8)))
+        );
     }
 
     #[test]
     fn a_scare_ends_one_to_three_days_late() {
-        for (roll, days) in [(0.0, 1), (0.5, 2), (0.99, 3), (1.0, 3)] {
+        // Thirds of the roll: 1/3 and 2/3 open the second and third.
+        for (roll, days) in [
+            (0.0, 1),
+            (1.0 / 3.0, 2),
+            (0.5, 2),
+            (2.0 / 3.0, 3),
+            (0.99, 3),
+            (1.0, 3),
+        ] {
             assert_eq!(
                 scare_ends(t(1, 29, 8), roll),
                 t(1, 29, 8) + Duration::days(days)
