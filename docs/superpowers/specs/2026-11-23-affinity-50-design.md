@@ -244,7 +244,7 @@ cold-war check therefore read the instance kind first.
   `confess` and `partner_up` additionally wait 14 days after the session's
   latest status change and after that kind's last answer of any sort *(my
   call)*. `propose` keeps its existing re-ask behaviour after a decline and
-  waits 14 days after an ignore *(my call)*. `sleep_together`,
+  waits 14 days after an accept or an ignore *(my call)*. `sleep_together`,
   `fall_asleep_together`, `bathe_together` and `travel_together` keep their
   current rules.
 - Runway, session and delivery rules are unchanged: one pending ask per
@@ -286,8 +286,9 @@ cold-war check therefore read the instance kind first.
   own *(my call)*. Only the status is checked: a `break_up` asked during a
   cold war that has since ended can still be answered.
 - Order within `maybe_ask`: cold-war entry or exit, then `break_up`,
-  `propose`, `confess`, `partner_up`, then today's sleep, bath and travel
-  checks *(my call)*.
+  `confess`, `partner_up`, then `propose` or her sleep ask, then today's bath
+  and travel checks *(my call)*. `propose` is never askable in a status that
+  allows `confess` or `partner_up`, so its place among them changes nothing.
 
 Stage cues, working copy (same register as the existing ones; the owner
 reviews them with the rest of the copy):
@@ -350,7 +351,7 @@ constraint stay.
   `dating`, `fwb` or `situationship`, it is refused, nothing drops, and the
   refusal is not a rejection of the user (same shape as `world_ruled_out`).
   From those three the judge decides as today; an accept sets `engaged` in
-  the turn's affinity transaction.
+  the transaction that stores the action's answer.
 - **`break_up`** (new `UserAction::BreakUp`, no fields). Before the judge:
   refused with no effect unless the status is breakable. Otherwise the judge
   decides: an accept sets `ex` and ends the cold war; a refusal keeps the
