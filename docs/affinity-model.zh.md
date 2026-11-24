@@ -7,8 +7,10 @@
 好感度是每个关系（即每个 session）一份的六轴向量，每轴限定在 `[0, 1]`，每次更新都
 clamp。它只在文本通道、非 `product_qa` 的聊天回合上移动。语音回合与 `product_qa`
 回合从不写好感度事件，群聊回合也不写（群只读取各成员的好感度，从不写入）。不属于回合的变动有两种：
-被回答的生活选择带来的降档（见[生活选择的降档与放缓](#生活选择的降档与放缓)），以及一场约会结算时的那一次结论（见[约会](#约会)）。判官（LLM 评估器）在任何地方都只输出 ordinal 的档位或等级；
+被回答的生活选择带来的降档（见[生活选择的降档与冷战减半](#生活选择的降档与冷战减半)），以及一场约会结算时的那一次结论（见[约会](#约会)）。判官（LLM 评估器）在任何地方都只输出 ordinal 的档位或等级；
 引擎拥有每一个数字、每一个标签、每一次档位迁移，是唯一权威来源。
+
+六轴之上，每个 session 还存一个[关系状态](#关系状态)：这一对说定了是什么关系，只由生活选择和用户的两种动作挪动，上面还可以叠一层冷战。
 
 六轴分三组，全文都围绕这三组组织：**基础对**（`warmth`、`patience`）、**Bond**
 友情线（`trust`、`intrigue`）、**Chemistry** 浪漫线（`intimacy`、`tension`）。
@@ -39,8 +41,8 @@ patience = clamp01( max(base(p_level)·B(bond),      φ·bond)      × decay )
 
 基础对是用户逐回合能直接感受到的东西，直接喂给：
 
-- `[relationship]` 提示词段落：`warmth` × `patience` 四象限，各以 `0.5` 为界。
-  四格里的名词是真实的提示词字符串，逐字引用：
+- `[relationship]` 提示词段落，在这一对没有关系状态、没有组合关系、也不在冷战时（见 [`[relationship]`](#relationship)）：
+  `warmth` × `patience` 四象限，各以 `0.5` 为界。四格里的名词是真实的提示词字符串，逐字引用：
 
   | | patience ≥ 0.5 | patience < 0.5 |
   |---|---|---|
@@ -164,8 +166,8 @@ penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
 
 **4. 阈值门。** 每条线轴维护一个有符号累加器；本轮真实分并入后，只有
 `|累计| ≥ AFFINITY_DELTA_THRESHOLD`（默认 `0` = 每轮都提交）才整体提交，否则
-缓存在 `pending_deltas`。提交的增量 1:1 应用并 clamp 到 `[0,1]`（她提出的分开结束后的 72 小时内，
-为正的增量先减半，见[生活选择的降档与放缓](#生活选择的降档与放缓)）；随后（若本轮
+缓存在 `pending_deltas`。提交的增量 1:1 应用并 clamp 到 `[0,1]`（冷战期间，
+为正的增量先减半，见[生活选择的降档与冷战减半](#生活选择的降档与冷战减半)）；随后（若本轮
 读到）判官档位覆写存储档位，两个端点按回合后的线值重新派生。
 
 ### 时间
@@ -199,43 +201,45 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 - **被拒的打赏：** `tip` 不降档。回复照判官的结论写，这一轮按常规打分。
 - **社交动作：** 被拒的 `bluff`、`threaten`、`trick` 表示她识破了，被拒的 `challenge`、`bet` 表示她没接，同样不降档；这一轮按常规打分。
 - **脱衣服：** `affinity_scope` 性向不相容的一对发来的 `strip`，不管判官怎么说都判为拒绝，并像任何被拒的身体动作一样让 Chemistry 降一档。这样的一对发来的 `shower_together`、`bath_together`、`sex_together` 或 `streak_together` 同样如此，机器角色收到的 `toilet_together` 也一样。`setting` 不是 `fantasy` 的角色收到的 `fight_together` 同样判为拒绝，但哪条线都不降。其余一起做的动作没有这条规则。掷骰拒掉的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 同样降 Chemistry，不降 Bond。
-- **求婚：** 被拒的 `propose` 不降档，这一轮按常规打分。
+- **求婚与分手：** 被拒的 `propose` 或 `break_up` 不降档，这一轮按常规打分。关系状态不是 `dating`、`fwb` 或 `situationship` 时的 `propose`，以及关系状态不可分手时的 `break_up`，在判官之前就同样判为拒绝；被回答的则会挪动[关系状态](#关系状态)。
 - **礼物：** 被接受时还会进入角色的持有物品或衣柜；被拒时什么也不进，并像被拒的 `give` 一样让 Bond 掉一档。
 - **约会：** 被拒的 `date` 邀约不降档，这一轮按常规打分。被接受的根本不打分：它开启约会，约会在结算时整场评一次（见[下文](#约会)）。
 
 例：chemistry `0.80`（第 4 档内 64% 处）落到第 3 档内 64% 处，约 `0.524`。
 
-### 生活选择的降档与放缓
+### 生活选择的降档与冷战减半
 
 她向用户提出一次生活选择，有些回答会让这段关系付出代价
-（见[提出分开](life-events-needs.zh.md#提出分开的选择)与[浪漫选择](life-events-needs.zh.md#浪漫选择)）。
+（见[生活选择](life-events-needs.zh.md#生活选择)）。
 这里没有任何一步是聊天回合：不跑判官。
 
-- **降档。** 哪种回答降哪条线，取决于种类：
+- **降档。** 只有拒绝才降档，降哪条线取决于种类：
 
   | 种类 | 接受 | 拒绝 |
   |---|---|---|
-  | `ask_for_space` | bond 和 chemistry | bond 和 chemistry |
-  | `sleep_together` | 不降 | chemistry |
+  | `confess` | 不降 | chemistry |
+  | `partner_up` | 不降 | 不降 |
   | `propose` | 不降 | bond 和 chemistry |
+  | `break_up` | 不降 | 不降 |
+  | `sleep_together` | 不降 | chemistry |
+  | `fall_asleep_together` | 不降 | chemistry |
   | `bathe_together` | 不降 | chemistry |
 
   被点名的每条线都用被拒动作的落点规则降一档：落在下一档内的相同相对位置，这条线的两个轴按同一比例缩放，
   第 1 档的线直接归 `0`。它的 `pending_deltas` 清零；没被点名的线，轴和余额都保持不变。
   它按时间衰减和端点刷新之后的快照计算（用部署的 affinity 调参值），在行锁内、与结算这次选择的同一个事务里完成，
-  所以结算回滚时不会留下降档。`ask_for_space` 接受之后，降档就是她归来时的状态，归来时不再有别的事发生。
-  用文字打出的回答（`ignored`）和过期，不论哪种选择都不降档。
+  所以结算回滚时不会留下降档。用文字打出的回答（`ignored`）和过期，不论哪种选择都不降档。
 - **它的事件行。** 每次降档写一行自己类型的非回合事件，`event_type = 'life_choice'`。
   `deltas` 与 `effective_deltas` 的数字相同，因为降档就是全部的原始变化；`label_changes`、
   `effective_line_deltas` 和前后两份状态快照记录档位的移动。`context` 里有 `life_choice`（`accept` | `decline`）
-  和 `choice_id`。被接受的 `sleep_together`、`propose` 或 `bathe_together` 什么都不挪动，也不写这一行，所以 `accept` 只会出现在 `ask_for_space` 上。
+  和 `choice_id`。接受从不降档，所以这一行带的是 `decline`；`accept` 只出现在已退役的 `ask_for_space` 存量行上。
   这一行没有 `user_message_id`。逐轮 delta 路由
   `GET /bff/v1/comp/affinity/{session_id}/event` 从不返回它，和 `time_decay` 一样，它也不算被判官评过的回合。
-- **放缓（只在接受 `ask_for_space` 时）。** 分开结束之后的 72 小时内，四个线轴上每一个为正的已提交增量，在应用前减半。负增量全额应用，
-  `warmth` 与 `patience` 照常从回合后的线值重新派生。被削掉的部分就没了：不会存进门的余额里。它只作用于这次选择所在的
-  session；窗口是推算出来的，没有新状态：选择的 `event_id` 指向分开那一行的 `ends_at`，窗口是 `ends_at` 到
-  `ends_at` 加 72 小时，按墙钟算。被放缓的回合，事件行带 `context.growth_scale`（`0.5`），全速时没有这个键，
-  它的 `effective_deltas` 显示的是减半后的值。被接受的浪漫选择从不放缓增长。
+  回答挪动了关系状态时，另写一行自己的 `relationship` 事件（见[事件行](#事件行)）。
+- **冷战减半。** 这个 session 的[冷战](#冷战)进行期间，四个线轴上每一个为正的已提交增量，在应用前减半，被判官评过的回合和约会结算都是如此。
+  负增量全额应用，`warmth` 与 `patience` 照常从回合后的线值重新派生。被削掉的部分就没了：不会存进门的余额里。
+  冷战开始时什么都不降。读的是 session 好感度行上存着的冷战标记；读取失败时按全速提交。
+  被减半的回合，事件行带 `context.growth_scale`（`0.5`），全速时没有这个键，它的 `effective_deltas` 显示的是减半后的值。
 
 ### 约会
 
@@ -251,7 +255,7 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
 
   `turns` 是约会里有效回合的数目，`cap` 按约会时长取 `AFFINITY_ACTIVITY_TURN_CAP_SHORT` 或
   `AFFINITY_ACTIVITY_TURN_CAP_MID`（见[调参旋钮](#调参旋钮)）。每个轴的原始分、真实分和评估出的跨线惩罚都在阈值门之前乘 `weight`；
-  档位衰减、`AFFINITY_NEG_FACTOR`、demo 加成、clamp 和分开之后的放缓都和回合上一样。结论解析成功时，等级覆写存储的等级，两个端点重新派生。
+  档位衰减、`AFFINITY_NEG_FACTOR`、demo 加成、clamp 和冷战减半都和回合上一样。结论解析成功时，等级覆写存储的等级，两个端点重新派生。
 - **一档上限。** 之后每条线相对写入前的位置最多挪一档：往上最多到上一档内的相同相对位置（被拒动作落点规则的镜像），
   往下最多到下一档内的相同相对位置。越过上限的线，两个轴沿各自的增量按同一个比例拉回，让这条线正好落在上限上。
   第 1 档的线可以掉到 `0`，第 5 档的线由 clamp 限住。被上限削掉的部分就没了：被限住的线的 `pending_deltas` 清零。
@@ -308,9 +312,117 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
 逐回合的档位迁移记在事件行的 `label_changes` JSONB 上：
 `{bond: {from, to}, chemistry: {from, to}}`，两条线都没动时为 `NULL`。
 
+## 关系状态
+
+两条线说的是这一对有多近，说不出他们对彼此是什么。两样东西叠在线之上，都不会反过来影响各轴、档位或写入管线：
+
+- **关系状态**：这一对说定了是什么关系，按 session 存储，只由被回答的请求挪动；任何状态之上都可以叠一层**冷战**。
+- **组合关系**：给这一对的 bond 档 × chemistry 档起的名字，现算，不存，只有她的提示词读它。
+
+### 状态
+
+八种状态，每个 session 一种。中文说法就是判官 `[关系]` 一行读到的字样（它从不写出 `none`）；提示词的状态行也用它，两个分性别的称呼除外（见 [`[relationship]`](#relationship)）。
+
+| 状态 | 说法 | 可分手 |
+|---|---|---|
+| `none` | 未确定 | 否 |
+| `dating` | 伴侣 | 是 |
+| `partner` | 伙伴 | 是 |
+| `peer` | 同事 | 否 |
+| `fwb` | 伙伴，也是情人 | 是 |
+| `situationship` | 同事，私下在交往 | 是 |
+| `engaged` | 已订婚 | 是 |
+| `ex` | 前任 | 否 |
+
+每个 session 都从 `none` 开始，离开之后不再回到它。`engaged` 是最高的状态。*可分手*的状态是分手能结束的状态。
+
+### 迁移
+
+挪动状态的只有四种请求：她的 `confess` 和 `partner_up`，以及她和用户都能提出的 `propose` 与 `break_up`
+（见[生活选择](life-events-needs.zh.md#浪漫选择)与[用户的动作](api-reference.zh.md#post-compchatsession_idmessagestream)）。
+
+| 从 | 发生了什么 | 到 |
+|---|---|---|
+| `none`、`ex` | `confess` 被接受 | `dating` |
+| `partner` | `confess` 被接受 | `fwb` |
+| `peer` | `confess` 被接受 | `situationship` |
+| `none`、`ex`、`peer` | `partner_up` 被接受 | `partner` |
+| `none`、`ex`、`peer` | `partner_up` 被拒绝 | `peer` |
+| `dating`、`fwb`、`situationship` | `propose` 被接受 | `engaged` |
+| 任一可分手的状态 | `break_up` 被接受 | `ex`，冷战结束 |
+| 任一可分手的状态 | `break_up` 被拒绝 | 不变；没有冷战时开始冷战 |
+
+被拒绝的 `confess` 或 `propose` 保持状态不变。每种请求只从它那几行里的状态提出：别的状态下她不提，用户在别的状态下提出的
+`propose` 或 `break_up` 在判官之前就被拒绝，什么都不发生。已经到达的状态，不会因为调用方的 scope 变了而撤回。
+
+挪动在结算这次请求的事务里、在好感度行的锁下写入：她的请求在生活选择路由回答时写入，状态已经变成这种请求不会从中提出的状态时，
+路由返回 `409`，什么都不写；用户的动作在它的回答落库时写入，落在这一轮的 session 上（约会里是发出邀约的那个 session）。
+状态或冷战每变一次，写一行 `relationship` 事件（见[事件行](#事件行)）。
+
+### 冷战
+
+冷战是叠在状态上的一个标记（`cold_war_since`）；冷战结束，底下的状态原样露出来。
+
+- **开始：** 一个被判官评过的 1:1 文字回合之后，该 session 从连续起算点之后被判官评过的回合里，最新三个全是判官的最低耐心档，
+  或最新七个里至少五个是；此外，分手被拒绝时也开始。不读档位差距、相容与否或关系状态。
+- **结束：** 起算点之后最新三个被判官评过的回合，耐心档全都高于最低档；此外，分手被接受时也结束。
+- **读的档** 是判官自己的档（`patience_grade`，`1..=3`，读自每个被判官评过的回合的 `state_after`；快照里没有它的回合读作 `2`），
+  不是推算出的 `patience`：后者是档位乘上 bond 线的加成，bond 低时就算最高档也到不了 `0.5`，拿它设门槛，可能把一段新关系永远困在冷战里。
+- **起算点** 取该 session 最新一次生活选择（它的请求、它的回答）和最新一行 `relationship` 事件里较晚的那个，所以冷战的每一次开始与结束、
+  每一次状态变化，都会开启新的连续。
+- **冷战期间** 她照常回复，只是冷淡：`[relationship]` 会写明。四个线轴上为正的已提交增量一律减半（见[上文](#生活选择的降档与冷战减半)）。
+  她不提任何暖向的请求（`confess`、`partner_up`、`propose`、上床或一起睡、`bathe_together`、`travel_together`）；处在可分手的状态时，她可以提出分手。
+- **她会说出来：** 由连续触发的冷战开始时，她发一条主动消息，用 engine 默认的 scope 生成，不带选择行，`metadata.proactive = 'cold_war'`。标记先落库：
+  消息生成失败或为空，冷战照样开着，她什么都不说。分手被拒绝而开始的冷战没有单独的消息，冷战结束也不写消息。
+
+只有 genome 角色的 1:1 文字 session 才有冷战；待回答的请求或进行中的约会都挡不住它。规则和舞台提示见
+[life-events-needs.zh.md](life-events-needs.zh.md#冷战)。
+
+### BYOC session
+
+[BYOC](byoc.zh.md) session 不在关系状态之内：永远是 `none`，没有冷战。她的请求在那里从不触发；用户的 `propose`
+和任何动作一样交给判官，什么都不挪动；用户的 `break_up` 在判官之前就被拒绝，什么都不发生。
+
+### 组合关系
+
+给这一对的两个档位起的名字，每格一个，`(1, 1)` 为 `null`。名字是真实的提示词字符串，逐字引用；键是 API 返回的值：
+
+| bond \ chemistry | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| **1** | 无 | 有好感的陌生人 `fond_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
+| **2** | 普通朋友 `casual_friend` | 有点暧昧的朋友 `flirty_friend` | 暗恋的朋友 `secret_crush` | 朋友以上的情人 `friend_and_lover` | 热恋的人 `new_flame` |
+| **3** | 好朋友 `good_friend` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 亲密的情人 `close_lover` | 难分难舍的人 `inseparable` |
+| **4** | 知己 `confidant` | 心照不宣的知己 `knowing_confidant` | 暗生情愫的知己 `smitten_confidant` | 知心爱人 `heart_lover` | 挚爱 `beloved` |
+| **5** | 灵魂之交 `kindred_spirit` | 动了心的灵魂之交 `stirred_kindred` | 柏拉图式的爱人 `platonic_love` | 灵魂爱人 `soul_lover` | 命中注定的人 `destined` |
+
+名字里不用状态词（伴侣、伙伴、同事、前任、未婚）。组合关系不作任何门槛：没有事件、生活选择或动作读它。
+
+- **提示词里**，这一轮 `affinity_scope` 不浪漫相容的一对，不管 chemistry 多高，都取 chemistry 第 1 列的名字（普通朋友、好朋友、知己、灵魂之交；bond 第 1 档没有）。
+- **API 里**，`composed_relation` 是真实档位那一格的键，不套用相容与否。快照不带 scope，调用方自己知道有没有把这一对标为相容。
+
+### `[relationship]`
+
+文字聊天提示词的 `[relationship]` 段落说用户对她来说是谁，最多三行，每行只在有话可说时出现：
+
+```
+[relationship]
+你是用户的未婚妻
+论感情，你们现在是知心爱人
+你们正在冷战
+```
+
+- **状态行**，状态不是 `none` 时：`你是用户的{称呼}`。`dating` 读作 女朋友 或 男朋友，`engaged` 读作 未婚妻 或 未婚夫，
+  按角色的 `art_metadata.gender`（`female` / `male`；其他值或没有时用 伴侣 和 订婚对象）；其余状态读上表的说法。
+- **组合关系行**，有组合关系时（不相容的一对取 chemistry 第 1 列的名字）：前面有状态行时是 `论感情，你们现在是{名字}`，没有时是 `你是用户的{名字}`。
+- **冷战行**，冷战期间：`你们正在冷战`。
+
+三行都没有时，这一段是基础对的四象限名词（见[上文](#基础对warmth-与-patience)），照四象限的 scope 门槛。
+这三行是对这一对已经下了的结论，不是左右回复的某个轴，所以 `affinity_scope` 的单个轴不管它们；只有没有好感度行或 scope 为空时才省略这一段。
+群聊发言人的提示词带同一段，从该成员的 1:1 会话读取。语音提示词和群聊导演不读关系状态，仍用各自的档位标签行。
+
 ## 谁在读好感度
 
-- `[relationship]`：基础对四象限（见「基础对：warmth 与 patience」）。
+- `[relationship]`：状态行、两个档位的组合关系和冷战行；三者都没话可说时是基础对四象限（见 [`[relationship]`](#relationship)）。
 - `[mood]`：逐轴阈值门（冷淡禁令与热络解锁）。
 - `[feelings]`：LLM 写就的感受分句，存在好感度行上（`feeling_clause`，在有
   移动的回合和动作被拒绝而降档的回合重写）。
@@ -320,17 +432,19 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
   （`warmth ≤ 0.2` / `trust < 0.3` / `intrigue < 0.3`）。
 - PDE 判官上下文：intimacy 档（`1..=3` 的画图闸门，取
   `max(bond, chemistry)`；档 3 在 `0.76` 开启，刻意落在档 4 内部而不是档 5
-  的边界上）与 patience 分带。
+  的边界上）、patience 分带，以及一行 `[关系]`，让它的接受与拒绝和这段关系对得上：
+  `[关系] 状态={说法}；冷战中={是|否}`（`engaged` 读作 已订婚）。状态为 `none` 时，冷战期间这一行是 `[关系] 冷战中=是`，
+  否则不出现。它不带组合关系。判官审计的 `inputs` 记下 `relationship_status` 与 `cold_war`。
 - 群聊导演：每位成员的 Bond 与 Chemistry 档位标签和 intimacy 档，从该成员的
   1:1 会话里读取，从不写入。
 - 生活事件抽取：intimacy 档决定能否抽到 `ex_message`、`breakup` 与 `period_scare`（档 1 时不会抽到）、
   `sudden_desire` 与 `pregnancy_scare`（只在档 3），以及 `busy`、`in_battle` 和女性角色的 `out_shopping`
   讲不讲出来（档 2 起）；从档 2 起，她也会说自己想要购物小发现（`saw_bag`、`saw_clothes`）里看中的东西
   （见 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)）。
-- 提出分开：两条档位阶梯（chemistry 比 bond 高出两档或更多）和最近三个被判官评过的回合推算出的 `patience`，
-  决定她要不要提出先分开一阵（见[选择](life-events-needs.zh.md#提出分开的选择)）。
-- 浪漫选择：chemistry 档位（`propose` 还要 bond 档位）和最近几个被判官评过的回合推算出的 `warmth`、`patience`，
-  决定她要不要提出上床或求婚，前提是调用方的 scope 把这一对标明为浪漫相容
+- 冷战：最近几个被判官评过的回合里判官给的耐心档，决定冷战的开始与结束，也是她提出分手的依据
+  （见[冷战](life-events-needs.zh.md#冷战)）。
+- 关系选择与浪漫选择：关系状态、领先的那条线和它的档位，以及最近几个被判官评过的回合推算出的 `warmth`、`patience`，
+  决定她要不要告白、提出结成伙伴、求婚，或者提出上床或一起睡；除了结成伙伴，前提都是调用方的 scope 把这一对标明为浪漫相容
   （见[这些选择](life-events-needs.zh.md#浪漫选择)）。
 - 一起旅行：bond 档位和最近几个被判官评过的回合推算出的 `warmth`、`patience`，决定她要不要提议一起去旅行
   （见[一起去旅行](life-events-needs.zh.md#一起去旅行)）。
@@ -340,6 +454,8 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
 - Ghost 打分：`score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2`，
   带硬否决（前 10 条消息、连续 ghost ≥2、1 小时冷却），阈值 `0.65`，会话已经
   ghost 过一次后升为 `0.85`。
+- 故事导演：六轴和两个档位标签之外，还读关系状态和冷战标记，作为引擎记录的事实，它写的 `user_relationship` 不得与之矛盾
+  （见 [world-system.zh.md](world-system.zh.md#world-stories人生故事)）。
 
 ## `affinity.rs` 与 `scope.rs`
 
@@ -348,7 +464,7 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
 档位、标签。`crates/eros-engine-core/src/scope.rs` 是逐请求的注入闸门：
 `AffinityScope`（六个布尔量，决定哪些轴可以影响*这一次*请求的提示词）加
 `MemoryScope`；它管提示词注入与 `length_score` 的门控，请求记录下来的 `affinity_scope` 还是
-`romance_compatible` 判断一对关系有没有资格得到浪漫生活选择的依据。post-process 阶段
+`romance_compatible` 判断一对关系有没有资格得到浪漫生活选择的依据（逐轮也决定提示词读[组合关系](#组合关系)的哪一列）。post-process 阶段
 的写入（insight 抽取、记忆写入、六轴评估）不受影响。
 
 **共享什么。** 两者都在 core 里；都把六轴分成两个命名的半区；scope 的否决与
@@ -398,32 +514,46 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
 `pending_deltas` JSONB 只存线轴（4.0 起如此；旧行里残留的 `warmth` 键被
 忽略并自然排空）。`NULL` 读作全零。
 
+### 关系状态的两列
+
+`engine.companion_affinity` 上的两列（迁移 `0088`）承载[关系状态](#关系状态)：
+
+- `relationship_status text NOT NULL DEFAULT 'none'`，CHECK 限定为八个键之一；
+- `cold_war_since timestamptz`，冷战开始的时刻；`NULL` 表示没有冷战，它是冷战标记唯一的载体。
+
+它们就是权威：状态从不从生活选择或聊天消息里重新推算。写这两列不动这一行的 `updated_at`，因为那是时间衰减的时钟。
+
 ### 事件行
 
 每个增量回合向 `companion_affinity_events` 追加一行：
 
 - `deltas`：本轮线轴的原始分（档位换算加规则微调，衰减前），`activity` 行上再乘它的 `weight`；这里的
   `warmth`/`patience` 恒为 `0.0`，`life_choice` 行除外，它的 `deltas` 与
-  `effective_deltas` 相同（见[上文](#生活选择的降档与放缓)）。
+  `effective_deltas` 相同（见[上文](#生活选择的降档与冷战减半)）。
 - `effective_deltas`：实际应用的逐轴变化，`after − before`；基础对上它
   就是本轮派生 delta。
 - `context`：`affinity_reason`、`eval_skip_reason`、判官原样的有符号
   `grades`、门的 `pending_after`，以及端点审计（本轮实际读到时的
   `warmth_grade`/`patience_grade`、`boost_warmth`/`boost_patience`、
   `decay_factor`、`units`）；被收税的回合另有 `cross_penalty_assessed`；动作被拒绝而降档的回合另有
-  `tier_drop`（`bond` | `chemistry`），标明被降的那条线；分开之后的放缓减半了为正的增长时，另有 `growth_scale`（`0.5`）。
-  生活选择自己的 `life_choice` 行，`context` 是 `life_choice` 与 `choice_id`（见[上文](#生活选择的降档与放缓)）。
+  `tier_drop`（`bond` | `chemistry`），标明被降的那条线；冷战减半了为正的增长时，另有 `growth_scale`（`0.5`）。
+  生活选择自己的 `life_choice` 行，`context` 是 `life_choice` 与 `choice_id`（见[上文](#生活选择的降档与冷战减半)）。
   约会的 `activity` 行另有 `activity_id`、`turns`、`weight`、判官的 `reason`，上限限住某条线时还有 `capped`（见[上文](#约会)）。
+  `relationship` 行的 `context` 是 `from` 与 `to`（状态键），冷战标记切换了时另有 `cold_war`（`entered` | `ended`），
+  她的请求被回答而挪动时另有 `choice_id`（见下）。
 - `user_message_id`：对 `chat_messages` 的真外键，
   `ON DELETE SET NULL`；`proactive`/`time_decay`/`life_choice`/`activity` 行与迁移前写入的行为
-  `NULL`，不回填。
+  `NULL`，不回填。用户自己的 `propose` 或 `break_up` 挪动了状态时，`relationship` 行带它；由她的请求或耐心连续挪动时为 `NULL`。
 - `label_changes`（见「档位与标签」）、`effective_line_deltas`（本轮精确的
   bond/chemistry delta，API 上服务为 `effective_deltas_computed`）、
   `state_after`（本轮结束时的整个向量）。`state_before`
   列存在但不对外服务，要重放请直接查表。
 
-`event_type` 取值为 `message`、`ghost`、`gift`、`proactive`、`time_decay`、`life_choice` 或 `activity`。
-后三个不是回合：逐轮 delta 路由只读 `message`、`gift`、`proactive` 和 `ghost`。
+`event_type` 取值为 `message`、`ghost`、`gift`、`proactive`、`time_decay`、`life_choice`、`activity` 或 `relationship`。
+后四个不是回合：逐轮 delta 路由只读 `message`、`gift`、`proactive` 和 `ghost`。
+
+状态或冷战标记每变一次，就在做出这次变化的事务里写一行 `relationship`，也只在变了时写：回答之后两者都没变（例如从 `peer`
+拒绝 `partner_up`）就不写。它的 `deltas` 保持默认值，不取状态快照。它不算被判官评过的回合，但会挪动生活选择的连续起算点。
 
 ### API 表面
 
@@ -445,11 +575,17 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
   "chem_tier": 1,
   "bond_label": "acquaintance",
   "chemistry_label": "spark",
+  "relationship_status": "none",
+  "cold_war": false,
+  "composed_relation": null,
   "ghost_streak": 0,
   "total_ghosts": 0,
   "updated_at": "2026-08-16T12:00:00.000000Z"
 }
 ```
+
+`relationship_status` 是八个状态键之一，`cold_war` 表示是否在冷战。`composed_relation` 是真实档位那一格的键，`(1, 1)` 时为 `null`；
+不套用这一对的相容与否（见[组合关系](#组合关系)）。生活选择的回答和约会的结束路由返回同样的形状。
 
 `GET /bff/v1/comp/affinity/{session_id}/event` 返回逐回合事件：
 
@@ -516,19 +652,24 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
 - `crates/eros-engine-core/src/affinity.rs`：类型、`grade_turn` 写入管线、
   端点派生、时间衰减、bond/chemistry 分数、档位、标签、`diff_labels`；约会用的
   `grade_weighted`、`cap_line_shift` 和 `AffinityTuning::activity_weight`
+- `crates/eros-engine-core/src/relationship.rs`：状态和它们的说法、`settle`（迁移表）、`composed_relation`、
+  `leading_line`、冷战的连续规则、`sleep_ask_is_sex`
 - `crates/eros-engine-core/src/scope.rs`：`AffinityScope` / `MemoryScope`、
   `length_score`、`romance_compatible`（见「`affinity.rs` 与 `scope.rs`」）
 - `crates/eros-engine-store/src/affinity.rs`：`AffinityRepo`
-  （`persist_with_event`、`record_ghost`、`persist_life_choice_drop_in_tx`、`persist_activity_in_tx`、`last_judged_endpoints`）；表在 `migrations/0000_baseline.sql`，
-  `activity` 事件类型在 `migrations/0085_activities.sql`
+  （`persist_with_event`、`record_ghost`、`persist_life_choice_drop_in_tx`、`persist_activity_in_tx`、`last_judged_endpoints`、
+  `write_relationship_in_tx`、`set_cold_war`）；表在 `migrations/0000_baseline.sql`，
+  `activity` 事件类型在 `migrations/0085_activities.sql`，关系状态的两列和 `relationship` 事件类型在 `migrations/0088_relationship_status.sql`
 - `crates/eros-engine-server/src/pipeline/activity.rs`：约会的结算和约会判官调用
 - `crates/eros-engine-store/src/life_choices.rs`：`LifeChoiceRepo`
-  （选择行；`growth_slowed` 推算放缓窗口）
+  （选择行、连续起算点）
+- `crates/eros-engine-server/src/pipeline/life_choice.rs`：冷战的开始与结束、她的各种请求、`growth_scale_for`（冷战减半）
 - `crates/eros-engine-server/src/pipeline/post_process.rs`：LLM 评估、
   档位解析
-- `crates/eros-engine-server/src/prompt.rs`：好感度 → 态度指令 + 评估提示词
+- `crates/eros-engine-server/src/prompt.rs`：好感度 → 态度指令 + 评估提示词；`relationship_ground`（`[relationship]` 段落）
+- `crates/eros-engine-server/src/pipeline/stream.rs`：`build_pde_ctx`（判官的 `[关系]` 一行）；用户 `propose` 与 `break_up` 的状态门槛
 - `crates/eros-engine-server/src/routes/dto.rs`：`AffinitySnapshot`
-  （合成分 + 标签）
+  （合成分、标签、关系状态、冷战、组合关系）
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`：BFF 好感度表面
   （value + event）
 - 设计 spec：`docs/superpowers/specs/2026-08-16-affinity-40-design.md`，
@@ -536,5 +677,6 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
 - 设计 spec：`docs/superpowers/specs/2026-08-17-affinity-41-design.md`，
   档位列落库、事件状态快照、绝对值端点
 - 设计 spec：`docs/superpowers/specs/2026-10-05-chat-user-actions-design.md` —— 用户动作、判官的接受与拒绝、降档
-- 设计 spec：`docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md` —— 提出分开的选择、双线降档、增长放缓
+- 设计 spec：`docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md` —— 生活选择的机制、回答带来的降档（其中的提出分开已退役）
 - 设计 spec：`docs/superpowers/specs/2026-11-12-activity-sub-session-design.md` —— 约会作为子会话、加权的结论和一档上限
+- 设计 spec：`docs/superpowers/specs/2026-11-23-affinity-50-design.md` —— 关系状态、冷战与冷战减半、组合关系

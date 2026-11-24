@@ -386,14 +386,14 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 ≤ 16 个 key，key 满足 `[A-Za-z0-9_.-]{1,64}`，value 必须是 string
 且 ≤ 512 字符。违反作为 pre-stream 错误返回 `400 BadRequest`。
 
-**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 和 `gift` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip`、`bluff`、`threaten`、`trick`、`challenge`、`bet`、`propose` 不降档，她的世界不允许的 `fight_together` 被拒也不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
+**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 和 `gift` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip`、`bluff`、`threaten`、`trick`、`challenge`、`bet`、`propose`、`break_up` 不降档，她的世界不允许的 `fight_together` 被拒也不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
 
 | `type` | 字段 |
 |---|---|
 | `give` | `item`：下表中的一类，必填；`name`：可选，1–32 字符；`quantity`：可选，1–99，默认 1 |
 | `kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip`、`shower_together`、`bath_together`、`sauna_together`、`toilet_together`、`smoke_together`、`fall_asleep_together`、`sex_together`、`walk_together`、`smoke_weed_together`、`jog_together`、`yoga_together`、`stargaze_together`、`ride_horse_together`、`streak_together`、`drink_together`、`hot_spring_together`、`fight_together` | 无 |
 | `bluff`、`threaten`、`trick`、`challenge`、`bet` | 无 |
-| `propose` | 无 |
+| `propose`、`break_up` | 无 |
 | `custom` | `text`：必填，1–100 字符 |
 | `tip` | `amount_usd`：必填，有限数值，`> 0` 且 `≤ 1_000_000_000` |
 | `gift` | `kind`：`item` \| `clothing`（必填）；`name`：必填，1–64 字 |
@@ -449,11 +449,13 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 它开始时，正在进行的插曲结束，背景继续。这些事件都不让她离线：`asleep_together` 期间她也照常回复。在约会里被接受时什么都不写：约会的 `on_a_date` 保持原样，约会继续。事件持续期间在 [`GET …/effects`](#get-v2compsessionsession_ideffects) 里以 `event` 出现。有出图能力时，被接受的这一回合回她的图（见下），图里画的就是这个事件。被接受的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 在习惯掷骰（见上）、挪动的需求和余效（见上）这三件事上算作给了 1 份 `cigarette`、`herb` 或 `alcohol` 的 `give`，此外都不算：被拒时降 chemistry，不降 bond。规则见 [life-events-needs.zh.md](life-events-needs.zh.md#一起淋浴泡澡和蒸桑拿)。
 
-**上床与求婚。** `sex_together` 和 `propose` 是请她上床、向她求婚：她自己提出的 `sleep_together` 和 `propose`（见[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)）由用户反过来提。她在一个 session 或它的约会里答应过用户的 `sex_together` 之后，在这个 session 里不会再自己提出 `sleep_together`，答应过用户的 `propose` 之后不会再自己提出 `propose`；被拒的不算，她已经提出、还在等回答的请求保持原样。约会之外被接受的 `sex_together` 写入 `having_sex_together`，在抽取看来结束她的处女身份（见[事件](#post-v2compsessionsession_idevents)）。`propose` 不是一起做的动作：不写事件，本身也不是出图回合（判官选了出图时照常出图），判官之前没有任何规则，被拒时哪条线都不降。两者用户都可以再提，每次都由判官决定。
+**上床与求婚。** `sex_together`、`fall_asleep_together` 和 `propose` 是请她上床、一起躺下睡觉、向她求婚：她自己提出的 `sleep_together`、`fall_asleep_together` 和 `propose`（见[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)）由用户反过来提。她在一个 session 或它的约会里答应过用户的 `sex_together` 之后，在这个 session 里不会再自己提出 `sleep_together`，答应过用户的 `fall_asleep_together` 之后不会再自己提出 `fall_asleep_together`；被拒的不算，她已经提出、还在等回答的请求保持原样。约会之外被接受的 `sex_together` 写入 `having_sex_together`，在抽取看来结束她的处女身份（见[事件](#post-v2compsessionsession_idevents)）。这几种用户都可以再提，每次都由判官决定。
+
+**关系状态。** `propose` 和 `break_up` 挪动这一对的[关系状态](affinity-model.zh.md#关系状态)。两者都不是一起做的动作：不写事件，本身也不是出图回合（判官选了出图时照常出图），被拒时哪条线都不降。在判官之前，状态不是 `dating`、`fwb` 或 `situationship` 时 `propose` 被拒，状态不可分手（可分手的是 `dating`、`partner`、`fwb`、`situationship`、`engaged`）时 `break_up` 被拒：不管判官怎么答、有没有 LLM 判官，回应都是 `refuse`，什么都不变。其余由判官决定。`propose` 被接受，这一对变为 `engaged`。`break_up` 的回应表示她同不同意分手，即 同意分手 或 不同意分手：接受时这一对变为 `ex`，冷战结束；拒绝时状态不变，没有冷战就开始冷战。状态在保存回答时挪动，落在这个 session 上，约会里落在发出邀约的那个 session 上，之后各个快照路由都会报告它。BYOC 实例上什么状态都不挪动：`propose` 在任何状态下都交给判官、什么都不挪动，`break_up` 一律被拒。
 
 **让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复，被接受的 `ask_dancing`（用户想看她跳支舞，图是她在跳舞）和任何被接受的一起做的动作也一样。被拒的 `photo`、`strip`、`ask_dancing` 或一起做的动作，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
 
-**情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、`shower_together`、`bath_together`、`sex_together`、`streak_together`、`propose`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。
+**情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、`shower_together`、`bath_together`、`sex_together`、`streak_together`、`propose`、`break_up`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。
 
 **约会。** `date` 是约她出去。先过 engine 的门槛：`short` 没有门槛，`mid` 要求 bond 达到第 2 档，她离线或正在另一场约会里时一律不通过；
 门槛不通过就是拒绝，不管判官怎么答。被拒时这一回合是没有代价的普通回合。被接受时，这一回合的 `final` 帧带 `activity`：
@@ -871,7 +873,7 @@ key 下已有消息就重放它（见下），否则就是一次新的调用。`
 { "greeting": { "message_id": "01J…", "content": "好久不见，最近忙什么呢", "sent_at": "…", "occasion": "returning" } }
 ```
 
-响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened` 或 `check_in`。同样形状的消息在生活事件的消息上带 `event`（见下面的 events 路由），在她提出分开或浪漫选择的请求、以及对用户回答的回应上带 `life_choice`（见下面的生活选择路由）。
+响应里的 `occasion` 取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened` 或 `check_in`。同样形状的消息在生活事件的消息上带 `event`（见下面的 events 路由），在她提出生活选择的请求、以及对用户回答的回应上带 `life_choice`（见下面的生活选择路由）。
 
 - **同步：** 一次生成，需要几秒，不要阻塞 UI。想让她的话边生成边到，就要流式响应：见
   [`/open`、`/events`、`/life-choices` 的流式响应](#openeventslife-choices-的流式响应)。
@@ -988,8 +990,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 
 时长写成区间的，在事件开始时从区间里抽定。以上共 70 种可抽取的种类。两种性别都会抽到两个聚会，权重相同，这是有意为之。
 
-另有二十一种永远不会被抽到：`taking_space`（她提出、用户同意的分开，12–24 小时，离线）、`fell_out`（用户不理会她提出的分开请求时的那场不愉快，1 小时）、`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）、`bathing_together`（她提议、用户同意的一起洗澡，或她答应的 `bath_together`，30 分钟，`short` 类插曲，不离线）、`on_a_date`（用户约她、她答应了的约会，1 或 4 小时，`short` 类插曲，不离线）、`showering_together`（她答应的 `shower_together`，或她提议的一起洗澡落成淋浴，30 分钟，`short` 类插曲，不离线）、`sauna_together`（她答应的 `sauna_together`，1 小时，`short` 类插曲，不离线），以及其余一起做的动作写入的十四种，从 `using_toilet_together` 到 `fighting_together`（她答应的对应动作，除 `mid` 的 `asleep_together` 和 `fighting_together` 外都是 `short` 类插曲，都不离线；时长见[一起做的动作](#post-compchatsession_idmessagestream)的表）。
-前四种由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入（第四种也为那个动作写入），`on_a_date` 为[约会](activities.zh.md)写入，其余为[一起做的动作](#post-compchatsession_idmessagestream)写入；`showering_together` 和 `having_sex_together` 也会为生活选择流程写入。它们作为 `…/effects` 里的 `event` 出现，由生活选择流程写入的那些也作为生活选择响应里的 `event` 出现，
+另有二十一种永远不会被抽到：`taking_space`（已退役的提出分开里的分开，12–24 小时，离线）和 `fell_out`（它的那场不愉快，1 小时），engine 不再写入，只留在存量数据里；`traveling_together`（她提议、用户同意的旅行，48–72 小时，`trip` 类背景，不离线）、`bathing_together`（她提议、用户同意的一起洗澡，或她答应的 `bath_together`，30 分钟，`short` 类插曲，不离线）、`on_a_date`（用户约她、她答应了的约会，1 或 4 小时，`short` 类插曲，不离线）、`showering_together`（她答应的 `shower_together`，或她提议的一起洗澡落成淋浴，30 分钟，`short` 类插曲，不离线）、`sauna_together`（她答应的 `sauna_together`，1 小时，`short` 类插曲，不离线），以及其余一起做的动作写入的十四种，从 `using_toilet_together` 到 `fighting_together`（她答应的对应动作，除 `mid` 的 `asleep_together` 和 `fighting_together` 外都是 `short` 类插曲，都不离线；时长见[一起做的动作](#post-compchatsession_idmessagestream)的表）。
+`traveling_together` 和 `bathing_together` 由 engine 为[生活选择流程](#post-v2compsessionsession_idlife-choiceschoice_id)写入（后者也为那个动作写入），`on_a_date` 为[约会](activities.zh.md)写入，其余为[一起做的动作](#post-compchatsession_idmessagestream)写入；`showering_together`、`having_sex_together` 和 `asleep_together` 也会为生活选择流程写入。它们作为 `…/effects` 里的 `event` 出现，由生活选择流程写入的那些也作为生活选择响应里的 `event` 出现，
 不能写进 `kinds`。
 
 `sudden_desire`、`strip`、`streaking`、`having_sex`、`just_have_sex`、`masturbating` 与 `pregnancy_scare`（后者隐含性行为）带成人题材；只对部分用户提供这类内容的调用方，用
@@ -1085,7 +1087,7 @@ composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），�
 
 它们持续期间，角色任何一个 session 里的每一轮文字消息都会被 ghost，不经过判官，也不计入 ghost 连续次数，
 `/open` 返回 `null`。已经讲出来的 `busy`、`in_battle` 或 `out_shopping` 同样让轮次沉默。
-带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip`、`shower_together`、`bath_together`、`sauna_together`、`toilet_together`、`smoke_together`、`fall_asleep_together`、`sex_together`、`walk_together`、`smoke_weed_together`、`jog_together`、`yoga_together`、`stargaze_together`、`ride_horse_together`、`streak_together`、`drink_together`、`hot_spring_together`、`fight_together`、`propose`、`bluff`、`threaten`、`trick`、`challenge`、`bet`、`date`、`custom`）或 `image.force = true` 是例外：
+带用户 `action` 的轮次（任何 `type`：`give`、`gift`、`tip`、`kiss`、`hug`、`touch`、`lick`、`french_kiss`、`hug_from_behind`、`tease`、`pat`、`wink`、`blink`、`ask_for_dance`、`ask_dancing`、`photo`、`strip`、`shower_together`、`bath_together`、`sauna_together`、`toilet_together`、`smoke_together`、`fall_asleep_together`、`sex_together`、`walk_together`、`smoke_weed_together`、`jog_together`、`yoga_together`、`stargaze_together`、`ride_horse_together`、`streak_together`、`drink_together`、`hot_spring_together`、`fight_together`、`propose`、`break_up`、`bluff`、`threaten`、`trick`、`challenge`、`bet`、`date`、`custom`）或 `image.force = true` 是例外：
 它走正常路径并得到回复，因为动作在语义上是线下互动，用不着手机，强制出图的轮次永远是 `reply_image`。
 角色只在 ghost 保护允许的地方才会这样沉默：部署的 ghosting 开关关闭（`ghosting = false`）时不会抽到任何离线类种类，已经在进行的一段也不再让轮次沉默，
 用户消息不足 10 条的会话里也不会抽到；调用方完全不想要它们，就在 `kinds` 里不写。这样被 ghost 的消息没有回执（没有判官读过它），
@@ -1140,28 +1142,42 @@ composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），�
 
 回答她提出的一次生活选择。她用一条主动消息（`metadata.proactive = "life_choice"`）向用户提出一个选择，
 这个 session 随之带着一次待回答的选择，有效期 24 小时；她在与该用户的所有 session 里同一时间最多只有一个这样的选择待回答。
-用户可以在这里回答、用文字回复，或者什么都不说。选择共有五种：
+用户可以在这里回答、用文字回复，或者什么都不说。选择共有八种：
 
 | `kind` | 她提出 | 何时 |
 |---|---|---|
-| `ask_for_space` | 先分开一阵 | chemistry 比 bond 高出两档，且她的耐心连续三个被判官评过的回合都很低 |
-| `sleep_together` | 问用户愿不愿意和她上床 | 这一对在浪漫上相容（见下），chemistry 在第 3 档或以上，且最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7 |
-| `propose` | 向用户求婚 | 这一对在浪漫上相容，chemistry 和 bond 都在第 4 档或以上，且最新的 8 个被判官评过的回合里至少 5 个 warmth 和 patience 都高于 0.7 |
+| `confess` | 问用户愿不愿意和她在一起 | 这一对在浪漫上相容（见下），状态是 `none`、`ex`、`partner` 或 `peer`，chemistry 领先且在第 3 档或以上，且最新的 3 个被判官评过的回合 warmth 都高于 0.7 |
+| `partner_up` | 提出和用户结成伙伴 | 状态是 `none`、`ex` 或 `peer`，bond 领先且在第 3 档或以上，且最新的 3 个被判官评过的回合 patience 都高于 0.7。不读这一对的 scope |
+| `propose` | 向用户求婚 | 这一对在浪漫上相容，状态是 `dating`、`fwb` 或 `situationship`，chemistry 和 bond 都在第 4 档或以上，且最新的 8 个被判官评过的回合里至少 5 个 warmth 和 patience 都高于 0.7 |
+| `break_up` | 提出分手 | 正在冷战，状态可分手（`dating`、`partner`、`fwb`、`situationship`、`engaged`），且最新的 3 个被判官评过的回合都在判官的最低耐心档。不读这一对的 scope |
+| `sleep_together` | 问用户愿不愿意和她上床 | 这一对在浪漫上相容，状态是 `dating`、`engaged`、`fwb` 或 `situationship`，或 chemistry 在第 4 档或以上的 `partner`，chemistry 在第 3 档或以上，且最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7 |
+| `fall_asleep_together` | 问用户愿不愿意和她躺在一起睡觉 | 同 `sleep_together`，状态是 `none`、`peer` 或 `ex`，或 chemistry 在第 3 档的 `partner` |
 | `travel_together` | 提议一起去旅行 | bond 在第 3 档或以上，最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7，且没有背景事件在进行。不读这一对的 scope |
 | `bathe_together` | 问用户愿不愿意和她一起洗澡 | 这一对在浪漫上相容；chemistry 在第 2 档或以上（`hygienic` 为 `true` 的角色）或第 3 档或以上（不写 `hygienic` 的角色），`hygienic` 为 `false` 时从不提出；且最新的 7 个被判官评过的回合里至少 3 个 warmth 达到 0.5。不读 patience |
 
-只有该 session 最新一段选择经过（她的请求、它的结算以及它开启的分开，不论哪一种选择）之后的、被判官评过的回合才计数。她的[约会](activities.zh.md)进行期间她什么都不提，约会自己的回合也从来不是被判官评过的回合。`sleep_together` 与 `propose` 同一轮都满足时，触发 `propose`。
-`bathe_together` 有自己的触发条件，和这两种无关，也不受进行中的旅行影响。她同一时间只有一个请求待回答，所以一轮里有几种同时满足时，
-先轮到 `sleep_together` 或 `propose`，再到 `bathe_together`，最后是 `travel_together`。
-在一个 session 里被用户接受或不理会过的 `sleep_together` 或 `propose`，在那里不会再次提出；她在那里或它的约会里答应过用户自己的 `sex_together`（对应 `sleep_together`）或 `propose`（对应 `propose`）之后也不会（见[上床与求婚](#post-compchatsession_idmessagestream)）；`travel_together` 则 14 天内不再提出，`bathe_together` 7 天内不再提出；被拒绝或过期、又没有按上面的方式了结的，等出现新的连续后会再次提出。她怎么提出、什么时候提出、
-每条路各付什么代价，见 [life-events-needs.zh.md](life-events-needs.zh.md#提出分开的选择)、
+`confess`、`partner_up`、`propose` 和 `break_up` 挪动这一对的[关系状态](affinity-model.zh.md#关系状态)，每个好感度快照都以 `relationship_status` 报告它。
+领先的线是档位较高的那条；档位相同时看分数。冷战期间她除了 `break_up` 什么都不提。
+
+只有该 session 连续起算点之后的、被判官评过的回合才计数：她最新的请求、它的回答，以及最近一次状态或冷战的变化。她的[约会](activities.zh.md)进行期间她什么都不提，
+约会自己的回合也从来不是被判官评过的回合。她同一时间只有一个请求待回答，所以一轮里有几种同时满足时，顺序是 `break_up`、`confess`、`partner_up`，
+然后 `propose` 或她的同睡请求（`propose` 优先），然后 `bathe_together`，最后 `travel_together`。
+
+- `confess` 和 `partner_up` 在该 session 最近一次状态变化之后、以及这种请求上一次被回答（接受、拒绝或不理会）之后，等 14 天。
+- `propose` 在被接受或不理会之后等 14 天；被拒绝或过期的，等出现新的连续后会再次提出。
+- `break_up` 等出现新的连续后会再次提出。
+- 在一个 session 里被用户接受或不理会过的 `sleep_together` 或 `fall_asleep_together`，在那里不会再次提出；她在那里或它的约会里答应过用户自己的
+  `sex_together`（对应 `sleep_together`）或 `fall_asleep_together`（对应 `fall_asleep_together`）之后也不会（见[上床与求婚](#post-compchatsession_idmessagestream)）；
+  被拒绝或过期的，等出现新的连续后会再次提出。
+- `travel_together` 在被接受或不理会之后 14 天内不再提出，`bathe_together` 7 天内不再提出；被拒绝或过期的，等出现新的连续后会再次提出。
+
+她怎么提出、什么时候提出、每条路各付什么代价，见 [生活选择](life-events-needs.zh.md#生活选择)、[冷战](life-events-needs.zh.md#冷战)、
 [浪漫选择](life-events-needs.zh.md#浪漫选择)、[一起去旅行](life-events-needs.zh.md#一起去旅行)和[一起洗澡](life-events-needs.zh.md#一起洗澡)。
 
-**浪漫相容。** 只有调用方的 scope 标明为浪漫上相容的一对，她才会提出 `sleep_together`、`propose` 或 `bathe_together`：
+**浪漫相容。** 只有调用方的 scope 标明为浪漫上相容的一对，她才会提出 `confess`、`propose`、`sleep_together`、`fall_asleep_together` 或 `bathe_together`：
 `affinity_scope` 里至少有 trust、intrigue、patience 之一（`"chemistry"`、`"full"`、`"bond_and_chemistry"`，或点名了这三者之一的轴数组），
 `memory_scope` 是什么都不影响。默认的 `"bond"` 永远不满足。
 engine 读的是这个 session 里最新一条同时记录了 `memory_scope` 和 `affinity_scope` 的 assistant 回复上的 scope，她自己的生活选择消息不算；
-没有这样的回复，或值解析不了，这一对就不相容。调用方在自己的回合里发来满足这条判据的 scope，这一对就有了资格。
+没有这样的回复，或值解析不了，这一对就不相容。调用方在自己的回合里发来满足这条判据的 scope，这一对就有了资格。已经到达的状态，不会因为 scope 变了而撤回。
 engine 不接收也不保存用户的性别或性取向。
 
 客户端从
@@ -1183,42 +1199,50 @@ engine 不接收也不保存用户的性别或性取向。
 | 字段 | 规则 |
 |---|---|
 | `response` | 必填：`"accept"` 或 `"decline"`；其他取值返回 `422` |
-| `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成她的回应。她那条请求本身用的是 engine 默认的 scope。engine 在两次调用之间不保存任何东西 |
+| `user_timezone`、`user_country`、`user_region`、`tier`、`prompt_traits`、`memory_scope`、`affinity_scope`、`audit` | 与 `/open` 相同，用于生成她的回应。她那条请求本身用的是这一对的回复记录下来的 scope（没有记录时按浪漫相容处理）。engine 在两次调用之间不保存任何东西 |
 
-只服务 1:1 文字 session。一个事务里完成回答并付清代价。回答带来什么，取决于 `kind`：
+只服务 1:1 文字 session。一个事务里完成回答并付清代价：接受让选择变为 `accepted`，拒绝变为 `declined`。回答带来什么，取决于 `kind`：
 
-| | `ask_for_space` | `sleep_together` | `propose` | `travel_together` | `bathe_together` |
-|---|---|---|---|---|---|
-| **`accept`** | 状态 `accepted`。一段 `taking_space` 分开从此刻开始，持续时长是她提出时的档位差距每一档 6 小时（差距 2、3、4 对应 12、18、24 小时）；期间她在所有 session 里都离线，正在进行的插曲在这一刻结束。bond 和 chemistry 各降一档，分开结束后的 72 小时内，这个 session 里为正的增长减半 | 状态 `accepted`。一段 `having_sex_together` 插曲从此刻开始，持续 1 小时，和用户的 `sex_together` 被接受时一样；她照常回复，正在进行的插曲在这一刻结束，背景照旧。别的都不变 | 状态 `accepted`；正在进行的插曲在这一刻结束，背景照旧；别的都不变 | 状态 `accepted`。一段 `traveling_together` 背景从此刻开始，持续 48 到 72 小时；她照常回复，正在进行的插曲在这一刻结束。别的都不变 | 状态 `accepted`。一段 `showering_together` 或 `bathing_together` 插曲（两者机会均等）从此刻开始，持续 30 分钟；她照常回复，正在进行的插曲在这一刻结束。别的都不变 |
-| **`decline`** | 状态 `declined`。同样的降档；没有分开，也没有放缓 | 状态 `declined`；chemistry 降一档 | 状态 `declined`；bond 和 chemistry 各降一档 | 状态 `declined`；别的都不变 | 状态 `declined`；chemistry 降一档 |
-| **不理会**（用户改为打字） | 状态 `ignored`；一场一小时的 `fell_out` 插曲；不改任何档位 | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` | 状态 `ignored`；没有代价，没有 `fell_out` |
-| **过期**（24 小时） | 没有代价 | 没有代价 | 没有代价 | 没有代价 | 没有代价 |
+| `kind` | `accept` | `decline` |
+|---|---|---|
+| `confess` | 状态挪动：`none` 或 `ex` 变为 `dating`，`partner` 变为 `fwb`，`peer` 变为 `situationship`；正在进行的插曲结束 | 状态不变；chemistry 降一档 |
+| `partner_up` | 状态变为 `partner`；正在进行的插曲结束 | 状态变为 `peer`；什么都不降 |
+| `propose` | 状态变为 `engaged`；正在进行的插曲结束 | 状态不变；bond 和 chemistry 各降一档 |
+| `break_up` | 状态变为 `ex`，冷战结束 | 状态不变，冷战继续，已经结束的话重新开始；什么都不降 |
+| `sleep_together` | 一段 `having_sex_together` 插曲从此刻开始，持续 1 小时，和用户的 `sex_together` 被接受时一样；正在进行的插曲结束 | chemistry 降一档 |
+| `fall_asleep_together` | 一段 `asleep_together` 插曲从此刻开始，持续 1 到 4 小时，和用户的 `fall_asleep_together` 被接受时一样；她照常回复，正在进行的插曲结束 | chemistry 降一档 |
+| `travel_together` | 一段 `traveling_together` 背景从此刻开始，持续 48 到 72 小时；她照常回复，正在进行的插曲结束 | 别的都不变 |
+| `bathe_together` | 一段 `showering_together` 或 `bathing_together` 插曲（两者机会均等）从此刻开始，持续 30 分钟；她照常回复，正在进行的插曲结束 | chemistry 降一档 |
 
-然后她用一条主动消息回应，与普通回复一样落库并返回。`ask_for_space` 接受之后是道别，拒绝之后是受伤的回应；
-其他种类则是她对用户答“好”或“不”的回应。生成时用的是这次请求带的 scope。
+接受没有代价，背景照旧。用户改为打字（不理会）或放了 24 小时（过期），不论哪种都没有代价，什么都不变。
+
+然后她用一条主动消息回应，与普通回复一样落库并返回：她对用户答“好”或“不”的回应。生成时用的是这次请求带的 scope。
 
 ```json
 {"status": "accepted",
- "message": {"message_id": "…", "content": "好，那我们先各自安静一下。", "sent_at": "2026-10-20T12:00:00Z", "occasion": "life_choice"},
- "affinity": {"bond_tier": 1, "chem_tier": 3, "bond_label": "acquaintance", "chemistry_label": "crush", "…": "…"},
- "event": {"kind": "taking_space", "category": "mid", "offline": true, "started_at": "2026-10-20T12:00:00Z", "ends_at": "2026-10-21T06:00:00Z", "message_id": null}}
+ "message": {"message_id": "…", "content": "真的吗？那我们以后就是男女朋友了。", "sent_at": "2026-11-24T12:00:00Z", "occasion": "life_choice"},
+ "affinity": {"bond_tier": 3, "chem_tier": 4, "bond_label": "close_friend", "chemistry_label": "lover", "relationship_status": "dating", "cold_war": false, "composed_relation": "close_lover", "…": "…"},
+ "event": null}
 ```
 
-`status` 为 `accepted` 或 `declined`。`affinity` 是回答之后的关系：`ask_for_space` 的接受以及除 `travel_together` 外任何种类的拒绝之后是降档后的，
-其他情况保持原样；形状同
-[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`。`event` 是 `ask_for_space` 接受时开始的分开、`travel_together` 接受时开始的旅行、`bathe_together` 接受时开始的淋浴或泡澡，或 `sleep_together` 接受时开始的 `having_sex_together`，
-任何拒绝以及 `propose` 的所有回答都为 `null`。
-她的生成失败、回复为空，或用户有更新的消息先落库时，`message` 为 `null`：回答、分开和降档照样生效。
+`status` 为 `accepted` 或 `declined`。`affinity` 是回答之后的关系，形状同
+[`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id) 里的 `affinity`：会降档的拒绝之后是降档后的，
+`confess`、`partner_up`、`propose` 或 `break_up` 的回答挪动了什么，都体现在 `relationship_status` 和 `cold_war` 上。
+`event` 是 `travel_together` 接受时开始的旅行、`bathe_together` 接受时开始的淋浴或泡澡、`sleep_together` 接受时开始的 `having_sex_together`，
+或 `fall_asleep_together` 接受时开始的 `asleep_together`；任何拒绝，以及 `confess`、`partner_up`、`propose`、`break_up` 的所有回答都为 `null`。
+她的生成失败、回复为空，或用户有更新的消息先落库时，`message` 为 `null`：回答和它做的一切照样生效。
 
 用户不调用这个路由时，还有两件事会让选择结算：
 
-- **不理会。** 选择待回答期间到达的第一条普通用户文字消息（不带 `action` 的轮次）会转换它：状态变为 `ignored`。
-  `ask_for_space` 还会从那条消息起开始一场一小时的 `fell_out` 插曲，所以正是这一条不理会她的消息，回复时她的上下文里已经带着这场不愉快；
-  其他请求则没有代价，也没有 `fell_out`，这一轮照常运行。不改任何档位。
-  只有在她提出之后发出的消息才会触发。动作轮次不会结算它，`/open` 和 reaction 也不会。分开期间的消息一律只是 ghost，不会转化任何挂起的请求。
+- **不理会。** 选择待回答期间到达的第一条普通用户文字消息（不带 `action` 的轮次）会转换它：状态变为 `ignored`，不论哪种都没有代价、没有事件，
+  这一轮照常运行。不改任何档位。只有在她提出之后发出的消息才会触发。动作轮次不会结算它，`/open` 和 reaction 也不会。
 - **过期。** 她提出 24 小时后，这次选择处处读作已过期：delta 上的 `life_choice` 不再附带，这个路由返回 `409`，之后的消息什么都不转换，也没有任何代价。
 
 结算和一条进来的消息按事务竞争；先写入的赢，输的一方得到这个路由的 `409`。
+
+**状态变了。** 动作轮次不会结算她待回答的请求，所以请求等着的时候状态可能已经变了（她的 `propose` 还在等，用户自己的 `break_up` 被接受了）。
+`confess`、`partner_up`、`propose` 或 `break_up` 的回答到达时，如果状态已经不是这种请求会从中提出的状态，就返回 `409`，什么都不写；请求自己过期。
+只看状态：冷战里提出的 `break_up`，冷战结束之后照样可以回答。
 
 错误。下面这些拒绝用流前错误的响应体 `{code, message, user_message}`：
 
@@ -1230,7 +1254,7 @@ engine 不接收也不保存用户的性别或性取向。
 | 404 | `session_not_found` | session 不存在 |
 | 404 | `life_choice_not_found` | 这次选择不属于这个 session |
 | 409 | `wrong_channel` | 语音或群 session，或约会的子会话 |
-| 409 | `life_choice_closed` | 选择已经结算（被这个路由，或被用户的消息），或已过期 |
+| 409 | `life_choice_closed` | 选择已经结算（被这个路由，或被用户的消息），或已过期；状态已经变成这种请求不会从中提出的状态，什么都不写；或者这是一条存量的 `ask_for_space`，已退役的种类从不回答 |
 
 `response` 不是 `accept` 或 `decline`、或其他字段格式不对返回 `422`；达到单用户并发上限返回 `429`，这一步发生在写入任何东西之前，所以选择仍然开着。
 
@@ -1341,7 +1365,7 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
 
 `speaker_session_id`（只出现在群 session 的 assistant 行上，其余省略）是说这句话的成员 session；已离群的发言者，其名字通过 session 再到 instance 解析。
 
-`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）说明她为什么开口：这一行的 `metadata.proactive`，取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened`、`check_in`、`event` 或 `life_choice`（她提出分开或浪漫选择的请求，以及她对回答的回应）。适配了[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)的客户端读到 `life_choice` 时，应当重新拉一次好感度 delta。
+`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）说明她为什么开口：这一行的 `metadata.proactive`，取值为 `birthday`、`holiday`、`first_meet`、`returning`、`just_opened`、`check_in`、`event`、`life_choice`（她提出任何一种生活选择的请求，以及她对回答的回应）或 `cold_war`（她说[冷战](life-events-needs.zh.md#冷战)刚刚开始；不带选择）。适配了[生活选择](#post-v2compsessionsession_idlife-choiceschoice_id)的客户端读到 `life_choice` 时，应当重新拉一次好感度 delta。
 
 `life_choice`（只出现在她提出请求的那条 assistant 行上，其余行省略）是这一行向用户提出的选择，以及它现在的状态，这样重新加载的客户端或第二台设备也能在她的请求与她的回应之间画出用户的回答：
 
@@ -1350,7 +1374,7 @@ SSE 帧是整轮最后一帧且只走线上——在它发出前断线，光看 
   "life_choice": { "id": "…", "kind": "propose", "status": "accepted", "resolved_at": "2026-10-30T12:00:00Z" } }
 ```
 
-`kind` 为 `ask_for_space`、`sleep_together`、`propose`、`travel_together` 或 `bathe_together`。`status` 为 `pending`、`accepted`、`declined`、`ignored` 或 `expired`；`expired` 是超过 24 小时的 `pending` 选择，在这一页返回时现算，不落库。`resolved_at` 在状态为 `pending` 或 `expired` 时是 `null`；`accepted` 和 `declined` 时是回答落库的时刻，`ignored` 时是用文字回答她的那条用户消息的 `sent_at`。后面她的回应行照常带 `occasion: "life_choice"`。好感度 delta 里的 `life_choice` 字段是另一个对象，仍然只在待回答时出现。
+`kind` 为 `confess`、`partner_up`、`propose`、`break_up`、`sleep_together`、`fall_asleep_together`、`travel_together` 或 `bathe_together`，较早的行上还可能是已退役的 `ask_for_space`。`status` 为 `pending`、`accepted`、`declined`、`ignored` 或 `expired`；`expired` 是超过 24 小时的 `pending` 选择，在这一页返回时现算，不落库。`resolved_at` 在状态为 `pending` 或 `expired` 时是 `null`；`accepted` 和 `declined` 时是回答落库的时刻，`ignored` 时是用文字回答她的那条用户消息的 `sent_at`。后面她的回应行照常带 `occasion: "life_choice"`。好感度 delta 里的 `life_choice` 字段是另一个对象，仍然只在待回答时出现。
 
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行。assistant 行和
 `system_error` 通知行上都有，user 行本身省略。通知行最要紧：队列 worker 和
@@ -2152,7 +2176,7 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 所以同样带这个标记。
 `user_message_id` 指向产生这一行的那一轮的 `role='user'` 行 —— assistant 行和
 `system_error` 通知行上都有，user 行省略。`speaker_session_id` 标出群 session 里 assistant 行的发言者，其余行省略。
-`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）与上面 canonical history 里的同名字段相同，包括 `life_choice`；
+`occasion`（只出现在角色主动写下的 assistant 行上，其余省略）与上面 canonical history 里的同名字段相同，包括 `life_choice` 和 `cold_war`；
 `start` 打包的历史同样带它。`life_choice`（只出现在她提出请求的那条 assistant 行上，其余省略）是 canonical 路由里同名的回执，
 `{id, kind, status, resolved_at}`，五种状态和 `resolved_at` 的规则都一样；`start` 打包的历史同样带它。
 `activity`（只出现在被接受的约会邀约那一行用户消息上，其余省略）是 canonical 路由里同名的回执，约会的子会话 id 在这里同样能读；`start` 打包的历史同样带这个回执。
@@ -2238,7 +2262,7 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
     "user_message_id": "…",
     "life_choice": {
       "id": "…",
-      "kind": "ask_for_space",
+      "kind": "confess",
       "options": ["accept", "decline"],
       "asked_at": "…",
       "expires_at": "…",
@@ -2252,7 +2276,7 @@ canonical `/comp/*` 路由永遠不會為了遷就前端而被改形狀——而
 `event` 为 `null` 的情况：还没有任何用户轮次事件（全新 session，或只有
 time-decay），或最近一次事件早于 affinity migration `0014`。`event_type`
 ∈ `message | gift | proactive | ghost`；ghost 轮次的 `effective_deltas`
-全为零。生活选择的降档是它自己类型的好感度事件，`life_choice`，这条路由和 `time_decay` 一样从不返回它：
+全为零。生活选择的降档是它自己类型的好感度事件，`life_choice`，关系状态或冷战的变化是类型为 `relationship` 的好感度事件；这条路由和 `time_decay` 一样从不返回它们：
 新的状态在结算响应里带回，别的设备从下面的绝对值路由读。结算后的约会写的 `activity` 事件同样从不返回：它的结果由[结束路由](#post-v2compsessionsession_idactivitiesactivity_idend)带回。
 
 这条路由接受约会的子会话 id，返回这段关系最新的回合，这些回合记在约会的父会话上。约会期间那就是约会的最后一轮，它什么都不挪动
@@ -2269,7 +2293,7 @@ time-decay），或最近一次事件早于 affinity migration `0014`。`event_t
   或它的回复（`chat_messages.user_message_id`）上。`proactive` / `time_decay` 事件
   以及 migration `0056` 之前写入的行没有这个键。
 - `life_choice` —— 该 session 待回答的选择，在响应时现场拼出，只要有一次选择未被回答、也没过 24 小时，就附在 `event` 上；
-  没有时不带。`kind` 为 `ask_for_space`、`sleep_together`、`propose`、`travel_together` 或 `bathe_together`。`options` 列出
+  没有时不带。`kind` 为 `confess`、`partner_up`、`propose`、`break_up`、`sleep_together`、`fall_asleep_together`、`travel_together` 或 `bathe_together`。`options` 列出
   [生活选择路由](#post-v2compsessionsession_idlife-choiceschoice_id)接受的回答；`message_id` 是提出它的那条聊天消息
   （那一行没了就不带）。请求落在触发它的那一轮之后几秒，所以历史里某一行带 `occasion: "life_choice"` 时，
   应当重新拉一次 delta。忽略这个字段的客户端会降级成那里描述的“不理会”。
@@ -2289,6 +2313,8 @@ session 403）。
     "bond": 0.4213, "chemistry": 0.1802,
     "bond_tier": 3, "chem_tier": 2,
     "bond_label": "close_friend", "chemistry_label": "flirtation",
+    "relationship_status": "partner", "cold_war": false,
+    "composed_relation": "more_than_friends",
     "ghost_streak": 0, "total_ghosts": 2,
     "updated_at": "2026-08-17T14:02:11Z"
   }
@@ -2305,6 +2331,12 @@ session 403）。
   迟早会漂。
 - `bond_label` ∈ `acquaintance | friend | close_friend | confidant | soulmate`
 - `chemistry_label` ∈ `spark | flirtation | crush | lover | beloved`
+- `relationship_status` ∈ `none | dating | partner | peer | fwb | situationship | engaged | ex`：这一对说定了是什么关系，
+  只由 `confess`、`partner_up`、`propose` 和 `break_up` 挪动（见 [affinity-model.zh.md](affinity-model.zh.md#关系状态)）。BYOC 关系永远是 `none`。
+- `cold_war` —— 是否在冷战（见[冷战](life-events-needs.zh.md#冷战)）。
+- `composed_relation` —— 两个档位合起来的名字的键（`good_friend`、`more_than_friends`……，bond 档 × chemistry 档每格一个），
+  两条线都在第 1 档时为 `null`。它是真实档位那一格：不套用这一对的相容与否，虽然她的提示词对不相容的一对读 chemistry 第 1 列的名字
+  （见[组合关系](affinity-model.zh.md#组合关系)）。
 
 响应序列化前会跑 `apply_time_decay()` + `refresh_endpoints()`，这正是要调这条
 路由而不是直读 `engine.companion_affinity` 的理由：`warmth` 与 `patience` 由判官

@@ -541,8 +541,8 @@ tones = { emotional = 0.05 }
   | `compatible` | 这一轮的 `affinity_scope` 含暧昧感轴时 ×2 |
 
   `emotional = 0.05` 时，性向相容、又有一项需求成立，是 0.30；角色再是 `moody`，就是 0.90。
-- **带十二种用户动作之一的 1:1 回合**（`french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、
-  `shower_together`、`bath_together`、`sex_together`、`streak_together`、`propose`、`threaten`、`tip`）一律用 `emotional`，接受、拒绝都一样。其余带动作的回合从不用 `emotional`。
+- **带十三种用户动作之一的 1:1 回合**（`french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、
+  `shower_together`、`bath_together`、`sex_together`、`streak_together`、`propose`、`break_up`、`threaten`、`tip`）一律用 `emotional`，接受、拒绝都一样。其余带动作的回合从不用 `emotional`。
 - **生活事件开始时发的那条消息**，有十六种事件用 `emotional`（[life-events-needs.zh.md](life-events-needs.zh.md#她怎么讲出来)）。
 
 群聊回合、`/open` 和其他主动消息、编辑与改图回合、语音通话从不带语气。
@@ -644,12 +644,12 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 
 默认情况下，引擎使用内置规则引擎（`eros-engine-core/src/pde.rs`）决定每轮动作（reply / ghost / proactive）。在此块中设置 `filter_prompt` 会启用 LLM 判断器：
 
-- LLM 接收最近的对话、引擎算好的关系档位（`[亲密度] 当前档位=第 N 档` 与 `[耐心] 当前档位=高/中/低`——从不给原始好感度数字）和对话信号，并返回 JSON verdict，其中包含：
+- LLM 接收最近的对话、引擎算好的关系档位（`[亲密度] 当前档位=第 N 档` 与 `[耐心] 当前档位=高/中/低`——从不给原始好感度数字）、有可说时这一对的[关系状态](affinity-model.zh.md#关系状态)（`[关系] 状态=已订婚；冷战中=否`；状态为 `none` 时，冷战期间这一行是 `[关系] 冷战中=是`，否则不出现）和对话信号，并返回 JSON verdict，其中包含：
   - `action`：`"reply_text"` \| `"ghost"` \| `"reply_image"` \| `"reply_text_image"` \| `"product_qa"`（图片变体需要同时满足两个条件——请求包含 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置，因为判断器本身不写图片 prompt；否则降级为 `reply_text`。聊天流从不绘图——只发出 `image_request` 帧，由调用方自行调用图像供应商。`product_qa` 仅当 `[tasks.chat_product_qa]` 完全启用时才可用——见下文；不可用时降级为 `reply_text`，绝不升级。）
   - `inner_state`：融入 reply prompt 的简短情绪/语气描述
   - `reply_mode`（选填）：这一轮回复与用户消息的关系——`"listen"` / `"follow"` / `"ask"` / `"judge"`，拿不准就 `null`（由引擎的每轮骰子接管）。会切换 reply prompt 铁律 ① 的文案；`listen` 同时把回复长度上限降一档
   - `clothing`（选填）：角色此刻的穿着，一句话。上下文里有 `[你的衣柜]` 时判官应从中挑选；有 `[指定穿着]` 时 engine 采用指定的穿着并忽略本字段。注入 reply prompt 的 `[character_state]` 区块内的一行，也进画图 composer 的 `[此刻穿着]` 槽；缺省则不注入
-  - `action_response`（选填）：本轮带用户动作时（上下文里会有 `[用户动作]` 一行）填 `"accept"` 或 `"refuse"`；其他回合或拿不准时填 `null`。`null`、判官调用失败、规则 PDE 一律按接受处理；例外是在判官之前就判为拒绝的动作（见下），不管判官怎么答，回应都是 `refuse`。拒绝会让该动作对应的亲密度线降一档，`tip`、社交动作、`date`、`propose` 和角色的世界排除掉的 `fight_together` 除外（见 [affinity-model.zh.md](affinity-model.zh.md)）。`bluff`、`threaten`、`trick` 的回答表示她有没有中招，`challenge`、`bet` 的回答表示她接不接，`[用户动作]` 一行会写明两种回答各自的意思，例如 `[用户动作] 对方威胁你（accept：你被吓到了；refuse：你没吃这一套）` 或 `[用户动作] 对方向你发起挑战（accept：你应战了；refuse：你没应战）`。动作回合里 `ghost` 和 `product_qa` 会改判为 `reply_text`，也不掷每轮骰子
+  - `action_response`（选填）：本轮带用户动作时（上下文里会有 `[用户动作]` 一行）填 `"accept"` 或 `"refuse"`；其他回合或拿不准时填 `null`。`null`、判官调用失败、规则 PDE 一律按接受处理；例外是在判官之前就判为拒绝的动作（见下），不管判官怎么答，回应都是 `refuse`。拒绝会让该动作对应的亲密度线降一档，`tip`、社交动作、`date`、`propose`、`break_up` 和角色的世界排除掉的 `fight_together` 除外（见 [affinity-model.zh.md](affinity-model.zh.md)）。`bluff`、`threaten`、`trick` 的回答表示她有没有中招，`challenge`、`bet` 的回答表示她接不接，`break_up` 的回答表示她同不同意分手，`[用户动作]` 一行会写明两种回答各自的意思，例如 `[用户动作] 对方威胁你（accept：你被吓到了；refuse：你没吃这一套）`、`[用户动作] 对方向你发起挑战（accept：你应战了；refuse：你没应战）` 或 `[用户动作] 对方向你提出分手（accept：你同意分手；refuse：你不同意分手）`。被接受的 `propose` 或 `break_up` 会挪动关系状态（见 [affinity-model.zh.md](affinity-model.zh.md#迁移)）。动作回合里 `ghost` 和 `product_qa` 会改判为 `reply_text`，也不掷每轮骰子
   - `needs`（选填）：角色此刻的四项基本需要 `{social, emotional, outing, indulgence}`，各为 `"low"` | `"mid"` | `"high"`（`high` = 很想找人说话 / 很需要被在乎 / 很想出门 / 对成瘾物的渴求，来根烟、喝一杯、来口大麻、喝杯咖啡或吃顿好的；`low` 的 `outing` 是只想待在屋里），写 `null` 表示沿用上次的判定（被接受的 give 仍会挪动它涉及的那几项需求，见下）。严格的 `response_format` 下，非空对象四个键齐全。有 `social` 和 `emotional`、但缺 `outing` 或 `indulgence` 的对象，缺的那一项沿用判官看到的水平（第一次评定之前为 `mid`）；缺 `social` 或 `emotional`，整个对象解析不了。engine 不评的键，比如旧版判官 prompt 还会给的 `hunger`、`stamina`，一律忽略。判官只评角色自己，不评两人的关系。判定存在本轮的用户消息上。本轮有被接受的 give（或算作给 1 份的 `smoke_together`、`smoke_weed_together`、`drink_together`）时，由引擎写入存下的水平，判官弃权时也照写：give 挪动的那几项取自基线（判官看到的那组水平）再挪一档，其余各项取判官的评定，判官弃权时取基线（见 [life-events-needs.zh.md](life-events-needs.zh.md#give-会改动需求)）。两次判定之间由引擎按时间推算：社交欲每 12 小时升一档，外出每 8 小时向 `mid` 靠一档，情感需求每 12 小时向 `mid` 靠一档。`indulgence` 在 `art_metadata.smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` 都不为 `true` 的角色身上每 8 小时向 `mid` 靠一档，否则按为 `true` 的有一项、两项、三项及以上，分别每 12、8、4 小时向 `high` 升一档（见 [life-events-needs.zh.md](life-events-needs.zh.md#两次评定之间的漂移)）。不在 `mid` 的档位会作为 `[character_state]` 里的一行进入回复；`indulgence` 只在 `high` 时出现，点名一样值为 `true` 的习惯（很想抽根烟 / 很想喝一杯 / 很想抽口大麻 / 很想喝杯咖啡 / 很想吃顿好的），一样都没有时是很想放纵一下。无法解析的值会被忽略，不会让整个裁决失败。
   - `reason`：可选
 - **Fail-open：**任何 LLM 超时或错误都会回退到规则引擎——LLM 判断器绝不会阻塞 chat 响应。
@@ -664,17 +664,17 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 
   `reasoning = { enabled = false }` 或 `{ exclude = true }`（非 OpenRouter 端点用供应商对应的参数）可以关闭推理。帧在回复之前发出（见 [api-reference.zh.md](api-reference.zh.md)）。推理 token 计入该任务的 `max_tokens`，所以要和 `timeout_secs` 一起调高。回复要等判断器，首个 token 的延迟会增加判断器思考所花的时间。
 - **硬安全 guardrail**（在 LLM verdict 之后、规则引擎 fallback 之前强制执行）：前 10 条消息绝不 ghost，绝不连续 ghost 第三次（`ghost_streak ≥ 2` 否决；连两次是允许的），ghost cooldown 为一小时。
-- 每次判断器调用都会记录到 `companion_decision_events` 以供审计：`payload` 是模型返回的内容；`inputs`（JSONB，迁移 `0044`）冻结判断器当时看到的引擎计算状态——亲密度档位、耐心档位、bond/chemistry 与六个原始轴，以及 `[需求]` 行里给判官看的需求（没有时为 `null`）。fire-and-forget 写入；历史行保持 `NULL`。
+- 每次判断器调用都会记录到 `companion_decision_events` 以供审计：`payload` 是模型返回的内容；`inputs`（JSONB，迁移 `0044`）冻结判断器当时看到的引擎计算状态——亲密度档位、耐心档位、`relationship_status` 与 `cold_war`、bond/chemistry 与六个原始轴，以及 `[需求]` 行里给判官看的需求（没有时为 `null`）。fire-and-forget 写入；历史行保持 `NULL`。
 
 **图片能力上下文行。** 判断器上下文每轮必带一行——当本轮图片动作可用（请求带有 `image` 块，且 `[tasks.chat_image_prompt_compose]` 已配置——两者缺一不可）时为 `[图片能力] 本轮可发图=是`，否则为 `[图片能力] 本轮可发图=否`。prompt 作者应把 `本轮可发图=否` 当作硬约束（绝不要选 `reply_image` / `reply_text_image`——它们会被 `guard_action` 降级，白费 token 还会污染审计），把 `本轮可发图=是` 当作*允许*发图的开关，再按人格/语境决定要不要发（引擎不会因为"能发"就强制发图）。若下游 overlay 引用了这个 token，请逐字保留 `[图片能力] 本轮可发图=是/否`。
 
 只要还有被接受的 give 在起作用（被接受的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 算作给了 1 份 `cigarette`、`herb` 或 `alcohol`），引擎还会在 `[用户动作]` 之前加一行 `[身体状态]`，写明角色身上带着的余效（例如 `[身体状态] 3 杯「威士忌」，微醺，还在往上走`；见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)）；没有时这一行不出现。
 
-**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）为 `false` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。键为 `true` 或不写时从不掷。`smoke_together`、`smoke_weed_together` 或 `drink_together` 按一次给 1 份 `cigarette`、`herb` 或 `alcohol` 的 give 来掷，拒绝时这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你一起去抽根烟，这次你不会答应`。这一轮 `affinity_scope` 性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。同一条件下的 `shower_together`、`bath_together`、`sex_together` 和 `streak_together`，以及机器角色（`art_metadata.species` 为 `"robot"` 或 `"android"`）收到的 `toilet_together`，也一样，这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你一起淋浴，这次你不会答应`。`art_metadata.setting` 不是 `"fantasy"` 的角色收到的 `fight_together` 也一样，末尾相同（`[用户动作] 对方想和你一起去战斗，这次你不会答应`），这样的拒绝哪条线都不降。[门槛](activities.zh.md#门槛)不通过的 `date`（bond 不到第 2 档的 `mid` 约会，或她离线、正在另一场约会里时的任何约会）同样如此：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
+**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）为 `false` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。键为 `true` 或不写时从不掷。`smoke_together`、`smoke_weed_together` 或 `drink_together` 按一次给 1 份 `cigarette`、`herb` 或 `alcohol` 的 give 来掷，拒绝时这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你一起去抽根烟，这次你不会答应`。这一轮 `affinity_scope` 性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。同一条件下的 `shower_together`、`bath_together`、`sex_together` 和 `streak_together`，以及机器角色（`art_metadata.species` 为 `"robot"` 或 `"android"`）收到的 `toilet_together`，也一样，这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你一起淋浴，这次你不会答应`。`art_metadata.setting` 不是 `"fantasy"` 的角色收到的 `fight_together` 也一样，末尾相同（`[用户动作] 对方想和你一起去战斗，这次你不会答应`），这样的拒绝哪条线都不降。genome 实例上状态不是 `dating`、`fwb` 或 `situationship` 时的 `propose`（BYOC 实例上的 `propose` 照常交给判官），状态不可分手时的 `break_up`，以及 BYOC 实例上的任何 `break_up`（见 [affinity-model.zh.md](affinity-model.zh.md#迁移)）也一样：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方向你求婚，这次你不会答应`，这样的拒绝哪条线都不降，也不挪动状态。[门槛](activities.zh.md#门槛)不通过的 `date`（bond 不到第 2 档的 `mid` 约会，或她离线、正在另一场约会里时的任何约会）同样如此：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
 
 **需求上下文行。** 每个有判官的回合，上下文里都有一行 `[需求]`，位于 `[身体状态]` 之前：`[需求] 社交欲=低 情感需求=高 外出=中`，即上一次判定推算到本回合的结果；第一次判定之前为 `[需求] 尚未判定`。`外出` 每次都在；只有 `indulgence` 为 `high` 时才在末尾加上 ` 享受=高`（`[需求] 社交欲=低 情感需求=高 外出=中 享受=高`），没有它就读作“不高”，参考 prompt 里也这样告诉判官。严格模式下的判官每个回合仍然要评 `indulgence`，却看不出它原来是 `low` 还是 `mid`，所以连续聊天时它每一轮都在重新猜这一项，按习惯数目的漂移只在两次评定之间起作用。
 
-**事件上下文行。** 通过 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)抽到的事件进行期间，判官上下文带一行 `[近期事件]`，位于 `[需求]` 之后、`[身体状态]` 之前。先列背景、再列插曲，用 `；` 连接：`[近期事件] 长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）`。不满 1 小时写作 `不到 1 小时`，不满 48 小时取整小时，满 48 小时取整天。一段离线类事件（`away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的 `out_shopping`）结束之后，在被它 ghost 过消息的会话里、角色在那里写出一条带文字的消息之前，这一行末尾会多出 `{label}（{span}前结束，期间对方的消息你没有回）`。她提出的分开（`taking_space`）结束之后，在那次选择所在的 session 里、角色在那里写出一条带文字的消息之前，这一行末尾会多出：用户在分开期间发过消息时是 `说好暂时分开（{span}前结束，期间对方的消息你没有回）`，用户守约时是 `说好暂时分开（{span}前结束，对方等到了约定之后）`；回复里 `- 刚才：` 的文字也按同样的方式分两种（见下表 `taking_space` 的两行）。一场虚惊（`period_scare`、`pregnancy_scare`）结束之后，在讲出它的那个会话里、角色在那里写出一条带文字的消息之前，这一行末尾会多出 `{label}（{span}前结束，结果是虚惊一场）`。两者同时存在时，离线类那一项在前。一场[约会](activities.zh.md#回到主聊天)之后，在发出邀约的那个会话里、角色在那里写出一条带文字的消息之前，这一行末尾会多出 `和对方约会（{span}前结束）`，排在上面各项之后。`{label}` 与 `{text}` 按种类列在下面的表里。文字聊天回合的回复在 `[now]` 块里带 `- 正在经历：…`（背景和插曲），在这样一段或一场虚惊之后还带一行 `- 刚才：{text}`，有没有 LLM 判官都一样；`/open` 开场白和事件消息带同样的行。两者同时存在时，两段文字共用这一行，离线类在前，用 `；` 连接：`- 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场`。没有可说的内容时这些行不出现。约会自己的回合上，`- 正在经历：` 把约会当作插曲来读（`和对方约会（约 3 小时后结束）`），后面再跟一行 `- 约会：地点「{place}」；安排「{content}」`。事件不直接改任何已存的需求：判官读到这一行，自己评需求。
+**事件上下文行。** 通过 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)抽到的事件进行期间，判官上下文带一行 `[近期事件]`，位于 `[需求]` 之后、`[身体状态]` 之前。先列背景、再列插曲，用 `；` 连接：`[近期事件] 长途旅游（2 天前开始，约 3 天后结束）；在看书（不到 1 小时前开始，约 2 小时后结束）`。不满 1 小时写作 `不到 1 小时`，不满 48 小时取整小时，满 48 小时取整天。一段离线类事件（`away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的 `out_shopping`）结束之后，在被它 ghost 过消息的会话里、角色在那里写出一条带文字的消息之前，这一行末尾会多出 `{label}（{span}前结束，期间对方的消息你没有回）`。存量的分开（`taking_space`，来自已退役的提出分开）结束之后，在那次选择所在的 session 里、角色在那里写出一条带文字的消息之前，这一行末尾会多出：用户在分开期间发过消息时是 `说好暂时分开（{span}前结束，期间对方的消息你没有回）`，用户守约时是 `说好暂时分开（{span}前结束，对方等到了约定之后）`；回复里 `- 刚才：` 的文字也按同样的方式分两种（见下表 `taking_space` 的两行）。一场虚惊（`period_scare`、`pregnancy_scare`）结束之后，在讲出它的那个会话里、角色在那里写出一条带文字的消息之前，这一行末尾会多出 `{label}（{span}前结束，结果是虚惊一场）`。两者同时存在时，离线类那一项在前。一场[约会](activities.zh.md#回到主聊天)之后，在发出邀约的那个会话里、角色在那里写出一条带文字的消息之前，这一行末尾会多出 `和对方约会（{span}前结束）`，排在上面各项之后。`{label}` 与 `{text}` 按种类列在下面的表里。文字聊天回合的回复在 `[now]` 块里带 `- 正在经历：…`（背景和插曲），在这样一段或一场虚惊之后还带一行 `- 刚才：{text}`，有没有 LLM 判官都一样；`/open` 开场白和事件消息带同样的行。两者同时存在时，两段文字共用这一行，离线类在前，用 `；` 连接：`- 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场`。没有可说的内容时这些行不出现。约会自己的回合上，`- 正在经历：` 把约会当作插曲来读（`和对方约会（约 3 小时后结束）`），后面再跟一行 `- 约会：地点「{place}」；安排「{content}」`。事件不直接改任何已存的需求：判官读到这一行，自己评需求。
 
 | 种类 | `{label}` | `{text}` |
 |---|---|---|
@@ -692,7 +692,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 | `pregnancy_scare` | `验出怀孕` | `验出两条杠，后来复查是虚惊一场` |
 | `on_a_date`（约会之后，在发出邀约的那个会话里） | `和对方约会` | `你们刚约会回来（{place}，{content}）` |
 
-没有事后文字的种类不在上表里：`看中了一个包`（`saw_bag`）、`看中了一件衣服`（`saw_clothes`），以及 `为分开的事闹得不愉快`（`fell_out`，用户不理会她提出的分开时那场一小时的不愉快）。持续期间，它们的标签照常出现在 `[近期事件]` 和 `- 正在经历：` 两行里。
+没有事后文字的种类不在上表里：`看中了一个包`（`saw_bag`）、`看中了一件衣服`（`saw_clothes`），以及 `为分开的事闹得不愉快`（`fell_out`，已退役的提出分开带来的那场一小时的不愉快，只出现在存量数据里）。持续期间，它们的标签照常出现在 `[近期事件]` 和 `- 正在经历：` 两行里。
 
 **新增种类和生活选择的舞台提示。** 和每一条事件消息一样，它们是生成请求里最后一条 `user` 消息，由 engine 持有，不落库。`{p}` 是角色的 `tip_personality`（去掉首尾空白），档位指 session 的亲密度档。两个聚会从不讲出来，没有提示。更早那些种类的提示写在 [life-events-needs.zh.md](life-events-needs.zh.md#她怎么讲出来)、[离线类](life-events-needs.zh.md#离线类)和[虚惊](life-events-needs.zh.md#虚惊)里；下表只覆盖新增种类和生活选择。
 
@@ -706,12 +706,22 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 | `saw_clothes` | 档 2 及以上，有 `tip_personality` | `（你在逛街，看到一件特别喜欢的衣服，很想要。代入你「{p}」的打赏人格，把这份心动告诉对方。）` |
 | `out_shopping` | 女性角色，档 2 及以上（档 2 以下不讲） | `（你接下来要出门逛街，这段时间顾不上看手机。）` |
 | `out_shopping` | 其他角色 | `（你正在外面逛街。）` |
-| 她提出分开 | 触发条件满足 | `（这段关系最近让你很累：心动还在，但交情和耐心都被磨薄了。你决定郑重地告诉对方：你想先分开一阵子，希望对方给你一个答复。）` |
-| 她的道别 | 用户接受；`{n}` 是这段分开的小时数（12、18 或 24） | `（对方同意了你提出的分开请求，接下来 {n} 小时你们不联系。你跟对方道别。）` |
-| 她受伤的回应 | 用户拒绝 | `（对方不同意你提出的分开请求，你心里不好受。）` |
+| 她说冷战了 | 耐心连续触发了[冷战](life-events-needs.zh.md#冷战) | `（你对对方的耐心被磨光了。你决定不再给对方好脸色，告诉对方你现在不想好好说话。）` |
+| 她告白 | `confess` 触发条件满足 | `（你发现自己喜欢上对方了。你决定郑重地向对方告白，问对方愿不愿意和你在一起，希望对方给你一个答复。）` |
+| 她对“好”的回应（`confess`） | 用户接受 | `（对方答应了你的告白。）` |
+| 她对“不”的回应（`confess`） | 用户拒绝 | `（对方拒绝了你的告白，你心里很难受。）` |
+| 她提出结成伙伴 | `partner_up` 触发条件满足 | `（你越来越觉得对方是值得托付的人。你决定郑重地提出和对方结成伙伴，希望对方给你一个答复。）` |
+| 她对“好”的回应（`partner_up`） | 用户接受 | `（对方答应了和你结成伙伴。）` |
+| 她对“不”的回应（`partner_up`） | 用户拒绝 | `（对方没有答应和你结成伙伴，你有点失落。）` |
+| 她提出分手 | `break_up` 触发条件满足 | `（这段冷战让你心灰意冷。你决定郑重地向对方提出分手，希望对方给你一个答复。）` |
+| 她对“好”的回应（`break_up`） | 用户接受 | `（对方同意了分手。）` |
+| 她对“不”的回应（`break_up`） | 用户拒绝 | `（对方不同意分手，你们还在冷战。）` |
 | 她提出上床 | `sleep_together` 触发条件满足 | `（你们最近越来越亲密，你很想和对方更进一步。你决定主动开口，问对方愿不愿意和你上床，希望对方给你一个答复。）` |
 | 她对“好”的回应（`sleep_together`） | 用户接受 | `（对方答应了你的邀请。）` |
 | 她对“不”的回应（`sleep_together`） | 用户拒绝 | `（对方拒绝了你的邀请，你有点失落。）` |
+| 她提出一起躺下睡觉 | `fall_asleep_together` 触发条件满足 | `（你们最近越来越亲近，你很想今晚和对方睡在一起，只是躺在一起睡觉。你决定主动开口，问对方愿不愿意，希望对方给你一个答复。）` |
+| 她对“好”的回应（`fall_asleep_together`） | 用户接受 | `（对方答应了，你们现在一起躺下睡觉。）` |
+| 她对“不”的回应（`fall_asleep_together`） | 用户拒绝 | `（对方拒绝了你的邀请，你有点失落。）` |
 | 她求婚 | `propose` 触发条件满足 | `（你越来越确定想和对方共度一生。你决定郑重地向对方求婚，希望对方给你一个答复。）` |
 | 她对“好”的回应（`propose`） | 用户接受 | `（对方答应了你的求婚。）` |
 | 她对“不”的回应（`propose`） | 用户拒绝 | `（对方拒绝了你的求婚，你心里很难受。）` |
@@ -737,7 +747,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 `[tasks.world_stories_director]`、`[tasks.world_comment]` 也有这个字段，默认值
 相同。
 
-**`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设置 `ghosting = false` 可在*整个* PDE 路径上禁用 ghosting——包括 LLM verdict、规则 fallback 和纯规则引擎——从而确保 companion 永不沉默。适用于不希望出现静默轮次的产品。开关关闭时，离线类生活事件（`away_from_phone`、`busy`、`in_battle`、`asleep`、两个聚会、`having_sex`，以及女性角色的 `out_shopping`）也永远不会被抽到，已经在进行的一段（包括她提出的分开）也不再让轮次沉默（见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)）。
+**`ghosting` 字段**（bool，默认 `true`）：面向下游产品的安全开关。设置 `ghosting = false` 可在*整个* PDE 路径上禁用 ghosting——包括 LLM verdict、规则 fallback 和纯规则引擎——从而确保 companion 永不沉默。适用于不希望出现静默轮次的产品。开关关闭时，离线类生活事件（`away_from_phone`、`busy`、`in_battle`、`asleep`、两个聚会、`having_sex`，以及女性角色的 `out_shopping`）也永远不会被抽到，已经在进行的一段（包括存量的分开）也不再让轮次沉默（见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)）。
 
 ### `[tasks.chat_image_prompt_compose]` — 出图 prompt 合成器（图片轮次必需）
 

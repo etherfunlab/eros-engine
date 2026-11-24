@@ -79,7 +79,7 @@ spawn post_process     tokio::spawn——跟返回響應並行：
 
 **Ghost streak 重置** 由編排器在 spawn post-process 之前處理：Reply 動作會在一個冪等 UPDATE 裡把 streak 清零；Ghost 動作則調 `AffinityRepo::record_ghost`。倉儲方法 `persist_with_event` 自身永遠不碰 streak。
 
-**离线。** 角色的离线类生活事件（`away_from_phone`、`busy`、`in_battle`、`asleep`、两个聚会、`having_sex`、女性角色的 `out_shopping`，以及她提出的分开）进行期间，不带用户动作、也不带 `image.force` 的文字轮在 PDE 之前就被 ghost（除非部署关掉了 ghosting，即 `[tasks.pde_decision]` 上 `ghosting = false`）：该行被标记为已 ghost，发出 ghost 帧，判官和 `record_ghost` 都不运行。见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
+**离线。** 角色的离线类生活事件（`away_from_phone`、`busy`、`in_battle`、`asleep`、两个聚会、`having_sex`、女性角色的 `out_shopping`，以及存量的分开）进行期间，不带用户动作、也不带 `image.force` 的文字轮在 PDE 之前就被 ghost（除非部署关掉了 ghosting，即 `[tasks.pde_decision]` 上 `ghosting = false`）：该行被标记为已 ghost，发出 ghost 帧，判官和 `record_ghost` 都不运行。见 [ghost-mechanics.zh.md](ghost-mechanics.zh.md#engine-强制的-ghost)。
 
 **PDE 动作列表。** 判断器（或规则引擎）每轮给出的 action 是以下之一：
 `reply_text` | `ghost` | `reply_image` | `reply_text_image` | `product_qa`。
@@ -180,6 +180,7 @@ crates/
 │       ├── needs.rs          # 角色的四项需求与习惯（档位 + 按时间推算）
 │       ├── pde.rs            # 規則型動作決策
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
+│       ├── relationship.rs   # 关系状态、冷战的连续规则、组合关系
 │       ├── scope.rs          # 逐请求注入范围（InsightMode / MemoryScope）
 │       └── types.rs          # ActionType / Event / DecisionInput / ConversationSignals
 ├── eros-engine-llm/
@@ -194,9 +195,9 @@ crates/
 │       ├── chat.rs           # ChatRepo
 │       ├── events.rs         # EventRepo（persona_events：进行中的事件、历史、离线时段、虚惊）
 │       ├── group.rs          # GroupRepo（群聊会话、成员关系）
-│       ├── life_choices.rs   # LifeChoiceRepo（角色的生活选择：选择行、待回答、结算、放缓窗口）
+│       ├── life_choices.rs   # LifeChoiceRepo（角色的生活选择：选择行、待回答、结算、连续起算点）
 │       ├── activity.rs       # ActivityRepo（约会：开启、结算的认领、约会的对话记录）
-│       ├── affinity.rs       # AffinityRepo（persist_with_event、record_ghost、persist_life_choice_drop_in_tx）
+│       ├── affinity.rs       # AffinityRepo（persist_with_event、record_ghost、persist_life_choice_drop_in_tx、关系状态与冷战）
 │       ├── memory.rs         # MemoryRepo（Profile / Relationship 兩層）
 │       ├── insight.rs        # InsightEventRepo（human_insights_events 审计行）
 │       ├── human_fact.rs     # HumanFactRepo（用户的事实账本：去重写入、导出 keyset）
@@ -226,10 +227,10 @@ crates/
 
 ## 子頁面
 
-- [好感度模型](affinity-model.zh.md)——6 個維度、档位写入管线、時間衰退、關係標籤
+- [好感度模型](affinity-model.zh.md)——6 個維度、档位写入管线、時間衰退、關係標籤、关系状态与冷战
 - [Ghost 機制](ghost-mechanics.zh.md)——評分公式 + 保護規則 + 實例計算
 - [群聊](group-chat.zh.md)——一位用户加至多三位角色、导演、发言者接力
-- [生活事件与需求](life-events-needs.zh.md)——角色的需求及其漂移、事件抽取、背景事件、离线类、虚惊、提出分开与浪漫选择
+- [生活事件与需求](life-events-needs.zh.md)——角色的需求及其漂移、事件抽取、背景事件、离线类、虚惊、生活选择与冷战
 - [活动：约会](activities.zh.md)——作为子会话的约会：邀约与门槛、约会回合、暂停的东西、结算、留下的记忆
 - [記憶層](memory-layers.zh.md)——profile vs relationship、Voyage、pgvector 檢索
 - [部署](deploying.zh.md)——Docker、自带 Postgres / IdP

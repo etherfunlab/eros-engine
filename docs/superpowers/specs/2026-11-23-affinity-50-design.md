@@ -79,7 +79,9 @@ accepted proposal changes nothing after the reply that answers it.
   threshold reads them *(owner's ruling)*.
 - Any other life choice moving the status *(owner's ruling)*:
   `travel_together`, `bathe_together`, `sleep_together`, together actions.
-- Voice and group prompts. They keep their tier-label lines.
+- The voice prompt and the group director. They keep their tier-label lines.
+  A group speaker's prompt is built as a 1:1 reply's and carries
+  `[relationship]` (§9.1).
 - Journal milestones or anniversaries for status changes *(my call: a
   follow-up)*.
 - Backfilling status from choices already answered. Every session starts at
@@ -244,9 +246,11 @@ cold-war check therefore read the instance kind first.
   `confess` and `partner_up` additionally wait 14 days after the session's
   latest status change and after that kind's last answer of any sort *(my
   call)*. `propose` keeps its existing re-ask behaviour after a decline and
-  waits 14 days after an ignore *(my call)*. `sleep_together`,
-  `fall_asleep_together`, `bathe_together` and `travel_together` keep their
-  current rules.
+  waits 14 days after an accept or an ignore *(my call)*. Her `break_up` has
+  no wait beyond a fresh streak *(owner's ruling)*: in a pair that does not
+  fit, one side asking to break up again and again is how it goes.
+  `sleep_together`, `fall_asleep_together`, `bathe_together` and
+  `travel_together` keep their current rules.
 - Runway, session and delivery rules are unchanged: one pending ask per
   instance, 1:1 text session of a genome instance, 24-hour window, the
   `life_choice` field on the delta, typed replies convert to `ignored`.
@@ -286,8 +290,9 @@ cold-war check therefore read the instance kind first.
   own *(my call)*. Only the status is checked: a `break_up` asked during a
   cold war that has since ended can still be answered.
 - Order within `maybe_ask`: cold-war entry or exit, then `break_up`,
-  `propose`, `confess`, `partner_up`, then today's sleep, bath and travel
-  checks *(my call)*.
+  `confess`, `partner_up`, then `propose` or her sleep ask, then today's bath
+  and travel checks *(my call)*. `propose` is never askable in a status that
+  allows `confess` or `partner_up`, so its place among them changes nothing.
 
 Stage cues, working copy (same register as the existing ones; the owner
 reviews them with the rest of the copy):
@@ -350,13 +355,16 @@ constraint stay.
   `dating`, `fwb` or `situationship`, it is refused, nothing drops, and the
   refusal is not a rejection of the user (same shape as `world_ruled_out`).
   From those three the judge decides as today; an accept sets `engaged` in
-  the turn's affinity transaction.
+  the transaction that stores the action's answer.
 - **`break_up`** (new `UserAction::BreakUp`, no fields). Before the judge:
   refused with no effect unless the status is breakable. Otherwise the judge
   decides: an accept sets `ex` and ends the cold war; a refusal keeps the
   status and starts a cold war if none is on. Nothing drops either way
   (`refusal_line` is `None`). It is answered in the `emotional` tone when
   the deployment has it on. It is not a together action and places no event.
+- A turn whose judge failed, or a deployment with the judge off, accepts
+  either action as it accepts any other, and the status moves *(owner's
+  ruling)*.
 
 Inside a date the same actions act on the inviting session's affinity row,
 where date turns already write.
@@ -390,6 +398,9 @@ The status, composed and cold-war lines are not gated by individual axes of
 `affinity_scope`: they are settled conclusions about the pair, not an axis
 steering the reply. They are omitted when there is no affinity or the scope
 is `none()` *(my call)*.
+
+A group speaker's prompt carries the same block, read from that member's 1:1
+session *(owner's ruling)*.
 
 ### 9.2 PDE judge
 

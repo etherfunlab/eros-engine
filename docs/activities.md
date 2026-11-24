@@ -316,7 +316,7 @@ The write starts from the stored state at settlement, after time decay, so a tie
 action dropped during the date stays dropped. Every raw term scales by `weight`, the cross-line
 penalty included; negative scores take `AFFINITY_NEG_FACTOR`; positive scores take the tier
 decay of the line's tier at settlement; the threshold gate, the clamp, the demo boost and the
-slowdown after a separation apply as on a turn, and there are no rule nudges. The verdict's
+cold war's halving apply as on a turn, and there are no rule nudges. The verdict's
 `warmth` and `patience` levels overwrite the stored ones, and both endpoints are derived again.
 Each stage is described in [affinity-model.md](affinity-model.md#write-pipeline).
 

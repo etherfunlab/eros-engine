@@ -443,7 +443,7 @@ chars. Violations return `400 BadRequest` as a pre-stream error.
 **Optional: action.** The body may include `action` — something the user does to
 the persona besides talking. The persona accepts it or not; a refusal costs the
 relationship one tier on the line the action touches (`give` and `gift` → bond, every
-physical or custom action → chemistry), and a refused `tip`, `bluff`, `threaten`, `trick`, `challenge`, `bet` or `propose` costs nothing, as does a `fight_together` her world rules out (see
+physical or custom action → chemistry), and a refused `tip`, `bluff`, `threaten`, `trick`, `challenge`, `bet`, `propose` or `break_up` costs nothing, as does a `fight_together` her world rules out (see
 [affinity-model.md](affinity-model.md#refused-actions)).
 
 | `type` | fields |
@@ -451,7 +451,7 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 | `give` | `item`: one of the categories below (required); `name`: optional, 1–32 chars; `quantity`: optional, 1–99, default 1 |
 | `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_for_dance`, `ask_dancing`, `photo`, `strip`, `shower_together`, `bath_together`, `sauna_together`, `toilet_together`, `smoke_together`, `fall_asleep_together`, `sex_together`, `walk_together`, `smoke_weed_together`, `jog_together`, `yoga_together`, `stargaze_together`, `ride_horse_together`, `streak_together`, `drink_together`, `hot_spring_together`, `fight_together` | none |
 | `bluff`, `threaten`, `trick`, `challenge`, `bet` | none |
-| `propose` | none |
+| `propose`, `break_up` | none |
 | `custom` | `text`: required, 1–100 chars |
 | `tip` | `amount_usd`: required, finite, `> 0` and `≤ 1_000_000_000` |
 | `gift` | `kind`: `item` \| `clothing` (required); `name`: required, 1–64 chars |
@@ -507,14 +507,16 @@ A turn is a user message of the text session or of one of its dates' sub-session
 
 Starting it ends an incident under way and leaves a background going. None takes her offline: she answers during `asleep_together` too. Accepted inside a date, it places nothing: the date's `on_a_date` is left alone and the date goes on. The event shows as `event` on [`GET …/effects`](#get-v2compsessionsession_ideffects) while it lasts. With image capability the accepted turn comes back as her picture (below), and the picture shows the event. An accepted `smoke_together`, `smoke_weed_together` or `drink_together` also counts as a `give` of one `cigarette`, `herb` or `alcohol` for the habit roll (above), the needs it moves and its lingering effect (above), and for nothing else: a refusal drops chemistry, not bond. The rules are in [life-events-needs.md](life-events-needs.md#showering-bathing-and-the-sauna-together).
 
-**Bed and a proposal.** `sex_together` and `propose` ask her to bed and to marry the user: her own `sleep_together` and `propose` asks ([life choices](#post-v2compsessionsession_idlife-choiceschoice_id)) made the other way round. Once she has accepted the user's `sex_together` in a session, or in a date of it, she never asks `sleep_together` in that session herself, and once she has accepted the user's `propose`, never `propose`; a refused one settles nothing, and an ask of hers already pending stays as it is. An accepted `sex_together` outside a date places `having_sex_together`, which ends her virginity as the draw sees it ([events](#post-v2compsessionsession_idevents)). `propose` is not a together action: it places no event and is not a picture turn (a picture the judge chose still goes out), the judge decides it with no rule before it, and a refusal drops no line. The user may ask either again; the judge decides each time.
+**Bed and a proposal.** `sex_together`, `fall_asleep_together` and `propose` ask her to bed, to fall asleep together and to marry the user: her own `sleep_together`, `fall_asleep_together` and `propose` asks ([life choices](#post-v2compsessionsession_idlife-choiceschoice_id)) made the other way round. Once she has accepted the user's `sex_together` in a session, or in a date of it, she never asks `sleep_together` in that session herself, and once she has accepted the user's `fall_asleep_together`, never `fall_asleep_together`; a refused one settles nothing, and an ask of hers already pending stays as it is. An accepted `sex_together` outside a date places `having_sex_together`, which ends her virginity as the draw sees it ([events](#post-v2compsessionsession_idevents)). The user may ask any of them again; the judge decides each time.
+
+**The relationship status.** `propose` and `break_up` move the pair's [relationship status](affinity-model.md#relationship-status). Neither is a together action: they place no event and are not picture turns (a picture the judge chose still goes out), and a refusal drops no line. Before the judge, `propose` is refused unless the status is `dating`, `fwb` or `situationship`, and `break_up` unless the status is breakable (`dating`, `partner`, `fwb`, `situationship`, `engaged`): whatever the judge answers and with or without the LLM judge, the response is `refuse` and nothing changes. Otherwise the judge decides. An accepted `propose` makes the pair `engaged`. For `break_up` the response says whether she agrees to it, 同意分手 or 不同意分手: accepted, the pair is `ex` and a cold war ends; refused, the status stays and a cold war starts unless one is on. The status moves when the answer is stored, on this session, or on a date on the session the invitation was sent in; the snapshot routes then report it. On a BYOC instance no status moves: `propose` goes to the judge from any status and moves nothing, and `break_up` is always refused.
 
 **A photo she lets you take.** An accepted `photo` on a turn whose request carries `image`, in a deployment with `[tasks.chat_image_prompt_compose]` configured, is answered as `reply_text_image`: her words, then one `image_request` built on her face reference, composed from the scene. This holds with or without the LLM judge. An accepted `strip` is answered the same way, and so is an accepted `ask_dancing` (the user asks her to dance for them; the picture is of her dancing) and any accepted together action. A refused `photo`, `strip`, `ask_dancing` or together action, or one without that image capability, is a text reply, even when the judge proposed a picture. `image.force = true` still makes the turn `reply_image`, and on a refusal the picture follows the refusal.
 
 **Emotional replies.** While the deployment has
 [`tones.emotional`](model-config.md#tones--chat-tones-chat-task-only) above 0, a turn carrying
 `french_kiss`, `tease`, `hug_from_behind`, `touch`, `strip`, `shower_together`, `bath_together`,
-`sex_together`, `streak_together`, `propose`, `threaten` or `tip` is answered in
+`sex_together`, `streak_together`, `propose`, `break_up`, `threaten` or `tip` is answered in
 the `emotional` tone, accepted or refused: the reply is written from the persona, the action and
 her response, without the chat history, the user profile or the affinity conclusions. The
 response itself is decided as above. The reply's rows carry `metadata.tone = "emotional"`.
@@ -1076,9 +1078,9 @@ occasion that is not true of the session returns `null` without generating.
 
 `occasion` in the response is `birthday`, `holiday`, `first_meet`,
 `returning`, `just_opened` or `check_in`. The same message shape carries `event` on a life
-event's message (see the events route below) and `life_choice` on her ask for
-space or a romantic choice and on her answer to the user's reply (see the
-life-choice route below).
+event's message (see the events route below) and `life_choice` on her ask of a
+life choice and on her answer to the user's reply (see the life-choice route
+below).
 
 - **Synchronous:** one generation, a few seconds. Don't block UI on it. To
   receive her words as they are generated, ask for the stream: see
@@ -1215,9 +1217,10 @@ Kinds fall into four categories. `short` and `mid` are incidents; `body` and
 A range is drawn when the event starts. That is 70 drawable kinds. Both genders
 draw both gatherings, at the same weight; that is deliberate.
 
-Twenty-one more kinds are never drawn: `taking_space` (a separation she asked for and
-the user agreed to, 12–24 h, offline), `fell_out` (the falling-out when the
-user ignores her ask for space, 1 h), `traveling_together` (a trip she
+Twenty-one more kinds are never drawn: `taking_space` (a separation of the retired
+ask for space, 12–24 h, offline) and `fell_out` (its falling-out, 1 h), which the
+engine no longer writes and which remain only in stored data,
+`traveling_together` (a trip she
 suggested and the user agreed to, 48–72 h, a `trip` background, not offline),
 `bathing_together` (a bath she suggested and the user agreed to, or a
 `bath_together` she accepted, 30 min, a `short` incident, not offline),
@@ -1229,14 +1232,14 @@ fourteen kinds of the other together actions, from `using_toilet_together` to
 `fighting_together` (each one she accepted, `short` incidents but the `mid`
 `asleep_together` and `fighting_together`, none offline; lengths in the
 [together actions](#post-compchatsession_idmessagestream) table). The engine
-writes the first four for the
+writes `traveling_together` and `bathing_together` for the
 [life-choice flow](#post-v2compsessionsession_idlife-choiceschoice_id) (the
-fourth also for the action), `on_a_date` for a [date](activities.md), and the
+latter also for the action), `on_a_date` for a [date](activities.md), and the
 rest for the [together actions](#post-compchatsession_idmessagestream);
-`showering_together` and `having_sex_together` are written for the life-choice
-flow too. They show up as the `event` of `…/effects`, those the life-choice
-flow writes also as the `event` of the life-choice response, and cannot be
-listed in `kinds`.
+`showering_together`, `having_sex_together` and `asleep_together` are written
+for the life-choice flow too. They show up as the `event` of `…/effects`, those
+the life-choice flow writes also as the `event` of the life-choice response,
+and cannot be listed in `kinds`.
 
 `sudden_desire`, `strip`, `streaking`, `having_sex`, `just_have_sex`, `masturbating` and `pregnancy_scare`, which implies sex, carry adult themes;
 a caller that serves them only to some users leaves them out with
@@ -1380,7 +1383,7 @@ While one lasts, every text turn in any session of the persona ghosts, without
 the judge and without counting towards the ghost streak, and `/open` returns
 `null`. An announced `busy`, `in_battle` or `out_shopping` still ghosts. A turn that carries a
 user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
-`lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_for_dance`, `ask_dancing`, `photo`, `strip`, `shower_together`, `bath_together`, `sauna_together`, `toilet_together`, `smoke_together`, `fall_asleep_together`, `sex_together`, `walk_together`, `smoke_weed_together`, `jog_together`, `yoga_together`, `stargaze_together`, `ride_horse_together`, `streak_together`, `drink_together`, `hot_spring_together`, `fight_together`, `propose`, `bluff`, `threaten`, `trick`, `challenge`, `bet`, `date`, `custom`) or `image.force = true` is the exception: it takes the normal
+`lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_for_dance`, `ask_dancing`, `photo`, `strip`, `shower_together`, `bath_together`, `sauna_together`, `toilet_together`, `smoke_together`, `fall_asleep_together`, `sex_together`, `walk_together`, `smoke_weed_together`, `jog_together`, `yoga_together`, `stargaze_together`, `ride_horse_together`, `streak_together`, `drink_together`, `hot_spring_together`, `fight_together`, `propose`, `break_up`, `bluff`, `threaten`, `trick`, `challenge`, `bet`, `date`, `custom`) or `image.force = true` is the exception: it takes the normal
 path and is answered, because an action is interaction in person, which needs
 no phone, and a forced image turn is always `reply_image`. The persona goes
 silent this way only where the ghost protection allows it, so with the
@@ -1468,37 +1471,56 @@ Answer one of her life choices. She puts a choice to the user in a proactive
 message (`metadata.proactive = "life_choice"`) and the session carries a
 pending choice for 24 hours; she has one such choice pending at a time across
 all her sessions with the user. The user answers here, answers in words, or
-says nothing. There are five kinds:
+says nothing. There are eight kinds:
 
 | `kind` | She asks | When |
 |---|---|---|
-| `ask_for_space` | for a break | chemistry runs two tiers past bond and her patience stays low for three judged turns |
-| `sleep_together` | the user to sleep with her | the pair is romantically compatible (below), chemistry is at tier 3 or more, and the 3 newest judged turns all have warmth and patience above 0.7 |
-| `propose` | the user to marry her | the pair is romantically compatible, chemistry and bond are both at tier 4 or more, and at least 5 of the newest 8 judged turns have warmth and patience above 0.7 |
+| `confess` | the user to be with her | the pair is romantically compatible (below), the status is `none`, `ex`, `partner` or `peer`, chemistry leads and is at tier 3 or more, and the 3 newest judged turns all have warmth above 0.7 |
+| `partner_up` | the user to become her partner | the status is `none`, `ex` or `peer`, bond leads and is at tier 3 or more, and the 3 newest judged turns all have patience above 0.7. It does not read the pair's scopes |
+| `propose` | the user to marry her | the pair is romantically compatible, the status is `dating`, `fwb` or `situationship`, chemistry and bond are both at tier 4 or more, and at least 5 of the newest 8 judged turns have warmth and patience above 0.7 |
+| `break_up` | the user to break up | a cold war is on, the status is breakable (`dating`, `partner`, `fwb`, `situationship`, `engaged`), and the 3 newest judged turns all carry the judge's lowest patience level. It does not read the pair's scopes |
+| `sleep_together` | the user to sleep with her | the pair is romantically compatible, the status is `dating`, `engaged`, `fwb` or `situationship`, or `partner` at chemistry tier 4 or more, chemistry is at tier 3 or more, and the 3 newest judged turns all have warmth and patience above 0.7 |
+| `fall_asleep_together` | the user to fall asleep side by side with her | as `sleep_together`, from the status `none`, `peer` or `ex`, or `partner` at chemistry tier 3 |
 | `travel_together` | the user to go away with her | bond is at tier 3 or more, the 3 newest judged turns all have warmth and patience above 0.7, and no background event is under way. It does not read the pair's scopes |
 | `bathe_together` | the user to take a bath with her | the pair is romantically compatible, chemistry is at tier 2 or more for a persona whose `hygienic` is `true` and at tier 3 or more when it is absent (never when it is `false`), and at least 3 of the newest 7 judged turns have warmth 0.5 or more. It does not read patience |
 
-Only judged turns after the session's newest choice episode count, whatever its kind: her
-ask, its answer and any separation it started. She asks nothing while a
-[date](activities.md) of hers is under way, and a date's own turns are never judged turns.
-`propose` wins when both `sleep_together` and `propose` qualify on one turn.
-`bathe_together` has a trigger of its own, independent of those two and of a
-trip under way. She has one ask pending at a time, so on a turn where several
-qualify the order is `sleep_together` or `propose`, then `bathe_together`, then
-`travel_together`. A `sleep_together` or
-`propose` the user accepted or ignored in a session is never asked again
-there, nor once she accepted the user's own `sex_together` (for `sleep_together`) or `propose`
-(for `propose`) there or in a date of it ([bed and a proposal](#post-compchatsession_idmessagestream));
-`travel_together` is not asked again for 14 days and `bathe_together`
-for 7; one that was declined or lapsed, and is not settled as above, is asked again after a
-fresh streak.
+`confess`, `partner_up`, `propose` and `break_up` move the pair's
+[relationship status](affinity-model.md#relationship-status), reported as
+`relationship_status` in every affinity snapshot. The leading line is the one at
+the higher tier; on equal tiers, the higher score. During a cold war she asks
+nothing but `break_up`.
+
+Only judged turns after the session's streak anchor count: her newest ask, its
+answer, and the newest change of status or cold war. She asks nothing while a
+[date](activities.md) of hers is under way, and a date's own turns are never
+judged turns. She has one ask pending at a time, so on a turn where several
+qualify the order is `break_up`, `confess`, `partner_up`, then `propose` or her
+sleep ask (`propose` first), then `bathe_together`, then `travel_together`.
+
+- `confess` and `partner_up` wait 14 days after the session's latest status
+  change and after that kind's last answer (accepted, declined or ignored).
+- `propose` waits 14 days after an accepted or ignored `propose`; one that was
+  declined or lapsed is asked again after a fresh streak.
+- `break_up` is asked again after a fresh streak.
+- A `sleep_together` or `fall_asleep_together` the user accepted or ignored in a
+  session is never asked again there, nor once she accepted the user's own
+  `sex_together` (for `sleep_together`) or `fall_asleep_together` (for
+  `fall_asleep_together`) there or in a date of it
+  ([bed and a proposal](#post-compchatsession_idmessagestream)); one that was
+  declined or lapsed is asked again after a fresh streak.
+- `travel_together` is not asked again for 14 days after an accept or an ignore,
+  and `bathe_together` for 7; one that was declined or lapsed is asked again
+  after a fresh streak.
+
 How and when she asks, and what each path costs, is in
-[life-events-needs.md](life-events-needs.md#the-ask-for-space-choice),
+[life choices](life-events-needs.md#life-choices),
+[the cold war](life-events-needs.md#the-cold-war),
 [the romantic choices](life-events-needs.md#the-romantic-choices),
 [going away together](life-events-needs.md#going-away-together) and
 [a bath together](life-events-needs.md#a-bath-together).
 
-**Romantic compatibility.** She asks `sleep_together`, `propose` or `bathe_together` only of a
+**Romantic compatibility.** She asks `confess`, `propose`, `sleep_together`,
+`fall_asleep_together` or `bathe_together` only of a
 pair the caller's scope marks as romantically compatible: at least one of
 trust, intrigue or patience is in `affinity_scope` (`"chemistry"`, `"full"`,
 `"bond_and_chemistry"`, or an axis array naming one of the three), whatever
@@ -1507,7 +1529,7 @@ the scope recorded on the session's newest assistant reply that carries both
 `memory_scope` and `affinity_scope`, skipping her own life-choice messages;
 with no such reply, or a value that does not parse, the pair is not
 compatible. A caller makes a pair eligible by sending a scope that meets this
-criterion on its turns.
+criterion on its turns. A status already reached stays when the scopes change.
 The engine neither takes nor stores the user's gender or orientation.
 
 A client learns of the choice from the `life_choice` field of
@@ -1533,58 +1555,72 @@ words, and that is the ignore path (below).
 | Field | Rules |
 |---|---|
 | `response` | required: `"accept"` or `"decline"`; anything else is a `422` |
-| `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating her reply. Her ask itself was generated with the engine's default scopes. The engine keeps nothing between calls |
+| `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating her reply. Her ask itself was generated under the scopes the pair's replies had recorded (romance-compatible when none was recorded). The engine keeps nothing between calls |
 
-1:1 text sessions only. One transaction answers the choice and pays for it.
-What an answer does depends on `kind`:
+1:1 text sessions only. One transaction answers the choice and pays for it: an
+accept makes it `accepted`, a decline `declined`. What an answer does depends on
+`kind`:
 
-| | `ask_for_space` | `sleep_together` | `propose` | `travel_together` | `bathe_together` |
-|---|---|---|---|---|---|
-| **`accept`** | status `accepted`. A `taking_space` separation starts now and lasts 6 hours per tier of the gap she asked at (gap 2, 3, 4: 12, 18, 24 hours); she is offline for all her sessions while it lasts, and an incident under way ends. Bond and chemistry each drop one tier, and for 72 hours after the separation ends positive growth in this session is halved | status `accepted`. A `having_sex_together` incident starts now and lasts 1 hour, as for the user's accepted `sex_together`; she keeps replying, an incident under way ends, a background keeps running. Nothing else changes | status `accepted`; an incident under way ends, a background keeps running; nothing else changes | status `accepted`. A `traveling_together` background starts now and lasts 48 to 72 hours; she keeps replying, and an incident under way ends. Nothing else changes | status `accepted`. A `showering_together` or `bathing_together` incident, one or the other at even odds, starts now and lasts 30 minutes; she keeps replying, and an incident under way ends. Nothing else changes |
-| **`decline`** | status `declined`. The same tier drop; no separation and no slowdown | status `declined`; chemistry drops one tier | status `declined`; bond and chemistry each drop one tier | status `declined`; nothing else changes | status `declined`; chemistry drops one tier |
-| **ignore** (the user types instead) | status `ignored`; a one-hour `fell_out` incident; no tier change | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` | status `ignored`; no cost, no `fell_out` |
-| **expiry** (24 h) | no cost | no cost | no cost | no cost | no cost |
+| `kind` | `accept` | `decline` |
+|---|---|---|
+| `confess` | the status moves: `none` or `ex` to `dating`, `partner` to `fwb`, `peer` to `situationship`; an incident under way ends | the status stays; chemistry drops one tier |
+| `partner_up` | the status becomes `partner`; an incident under way ends | the status becomes `peer`; nothing drops |
+| `propose` | the status becomes `engaged`; an incident under way ends | the status stays; bond and chemistry each drop one tier |
+| `break_up` | the status becomes `ex` and the cold war ends | the status stays and the cold war goes on, starting again if it had ended; nothing drops |
+| `sleep_together` | a `having_sex_together` incident starts now and lasts 1 hour, as for the user's accepted `sex_together`; an incident under way ends | chemistry drops one tier |
+| `fall_asleep_together` | an `asleep_together` incident starts now and lasts 1 to 4 hours, as for the user's accepted `fall_asleep_together`; she keeps replying, and an incident under way ends | chemistry drops one tier |
+| `travel_together` | a `traveling_together` background starts now and lasts 48 to 72 hours; she keeps replying, and an incident under way ends | nothing changes |
+| `bathe_together` | a `showering_together` or `bathing_together` incident, one or the other at even odds, starts now and lasts 30 minutes; she keeps replying, and an incident under way ends | chemistry drops one tier |
+
+An accept costs nothing and leaves a background running. Answered by the user
+typing instead (ignore) or left for 24 hours (expiry), every kind costs nothing
+and changes nothing.
 
 Then she answers in one proactive message, persisted like any reply and
-returned. For `ask_for_space` it is a goodbye after an accept and a hurt reply
-after a decline; for the other kinds it is her answer to the user's yes or
-no. It is generated with the scopes of this request.
+returned: her answer to the user's yes or no. It is generated with the scopes of
+this request.
 
 ```json
 {"status": "accepted",
- "message": {"message_id": "…", "content": "好，那我们先各自安静一下。", "sent_at": "2026-10-20T12:00:00Z", "occasion": "life_choice"},
- "affinity": {"bond_tier": 1, "chem_tier": 3, "bond_label": "acquaintance", "chemistry_label": "crush", "…": "…"},
- "event": {"kind": "taking_space", "category": "mid", "offline": true, "started_at": "2026-10-20T12:00:00Z", "ends_at": "2026-10-21T06:00:00Z", "message_id": null}}
+ "message": {"message_id": "…", "content": "真的吗？那我们以后就是男女朋友了。", "sent_at": "2026-11-24T12:00:00Z", "occasion": "life_choice"},
+ "affinity": {"bond_tier": 3, "chem_tier": 4, "bond_label": "close_friend", "chemistry_label": "lover", "relationship_status": "dating", "cold_war": false, "composed_relation": "close_lover", "…": "…"},
+ "event": null}
 ```
 
 `status` is `accepted` or `declined`. `affinity` is the relationship after the
-answer: dropped for an `ask_for_space` accept and for a decline of any kind but
-`travel_together`, as it stands otherwise, in the shape of
+answer, in the shape of
 [`GET /bff/v1/comp/affinity/{session_id}`](#get-bffv1compaffinitysession_id)'s
-`affinity`. `event` is the separation an `ask_for_space` accept started, the
-trip a `travel_together` accept started, the shower or bath a `bathe_together`
-accept started or the `having_sex_together` a `sleep_together` accept started,
-and `null` after any decline and for every `propose` answer. `message` is `null`
+`affinity`: dropped after a decline that costs a tier, and carrying in
+`relationship_status` and `cold_war` what a `confess`, `partner_up`, `propose`
+or `break_up` answer moved. `event` is the trip a `travel_together` accept
+started, the shower or bath a `bathe_together` accept started, the
+`having_sex_together` a `sleep_together` accept started or the `asleep_together`
+a `fall_asleep_together` accept started, and `null` after any decline and for
+every `confess`, `partner_up`, `propose` or `break_up` answer. `message` is `null`
 when her generation failed, came back blank, or a newer message of the user's
-landed first: the answer, the separation and the drop stand either way.
+landed first: the answer and everything it did stand either way.
 
 If the user does not call this route, two other things resolve the choice:
 
 - **Ignore.** The first ordinary user text message that arrives while it is
-  pending (a turn without an `action`) converts it: status `ignored`. For
-  `ask_for_space` a one-hour `fell_out` incident starts at that message, so
-  the very turn that ignored her is answered with the falling-out in her
-  context. Any other ask settles at no cost and with no `fell_out`, and the
-  turn runs as any other. No tier changes. Only a message sent after her ask
-  converts it. An action turn does not resolve it, and neither does `/open` or
-  a reaction. During a separation a message only ghosts and never converts a
-  pending ask.
+  pending (a turn without an `action`) converts it: status `ignored`, at no
+  cost and with no event, whatever the kind, and the turn runs as any other.
+  No tier changes. Only a message sent after her ask converts it. An action
+  turn does not resolve it, and neither does `/open` or a reaction.
 - **Lapse.** 24 hours after her ask the choice reads as expired everywhere:
   `life_choice` is no longer attached to the delta, this route answers `409`,
   a later message converts nothing, and it costs nothing.
 
 A resolution and an incoming message race transactionally; the first writer
 wins and this route answers the loser `409`.
+
+**A status that moved.** An action turn leaves her pending ask open, so the
+status can move while it waits (the user's own `break_up` is accepted while her
+`propose` is pending). An answer to `confess`, `partner_up`, `propose` or
+`break_up` that arrives when the status is no longer one the kind is asked from
+is refused with `409` and writes nothing; the ask lapses on its own. Only the
+status is read: a `break_up` asked in a cold war that has since ended can still
+be answered.
 
 Errors. These refusals carry the pre-stream body `{code, message, user_message}`:
 
@@ -1596,7 +1632,7 @@ Errors. These refusals carry the pre-stream body `{code, message, user_message}`
 | 404 | `session_not_found` | unknown session |
 | 404 | `life_choice_not_found` | the choice is not a choice of this session |
 | 409 | `wrong_channel` | a voice or group session, or a date's sub-session |
-| 409 | `life_choice_closed` | the choice is already resolved (by this route, or by the user's message), or lapsed |
+| 409 | `life_choice_closed` | the choice is already resolved (by this route, or by the user's message), or lapsed; the status has moved to one the kind is not asked from, with nothing written; or the choice is a stored `ask_for_space`, a retired kind that is never answered |
 
 `422` for a `response` that is not `accept` or `decline`, or another malformed
 field; `429` at the per-user in-flight cap, taken before anything is written, so
@@ -1749,7 +1785,7 @@ settled with an event, the receipt also carries `effective_deltas_computed` and
 
 `speaker_session_id` (assistant rows of a group session only, omitted otherwise) is the member session that spoke the line; resolve a departed speaker's name through session, then instance.
 
-`occasion` (assistant rows the persona wrote on her own only, omitted otherwise) says why she spoke: the row's `metadata.proactive`, one of `birthday`, `holiday`, `first_meet`, `returning`, `just_opened`, `check_in`, `event` or `life_choice` (her ask for space or a romantic choice, and what she says about the answer). A client adapted to the [life choice](#post-v2compsessionsession_idlife-choiceschoice_id) re-fetches the affinity delta when it reads `life_choice`.
+`occasion` (assistant rows the persona wrote on her own only, omitted otherwise) says why she spoke: the row's `metadata.proactive`, one of `birthday`, `holiday`, `first_meet`, `returning`, `just_opened`, `check_in`, `event`, `life_choice` (her ask of a life choice, of any kind, and what she says about the answer) or `cold_war` (she says a [cold war](life-events-needs.md#the-cold-war) just started; no choice goes with it). A client adapted to the [life choice](#post-v2compsessionsession_idlife-choiceschoice_id) re-fetches the affinity delta when it reads `life_choice`.
 
 `life_choice` (the assistant row of her ask only, omitted on every other row) is the choice that row put to the user and how it stands, so any client, on a reload or a second device, can draw the user's answer between her ask and her reply:
 
@@ -1758,7 +1794,7 @@ settled with an event, the receipt also carries `effective_deltas_computed` and
   "life_choice": { "id": "…", "kind": "propose", "status": "accepted", "resolved_at": "2026-10-30T12:00:00Z" } }
 ```
 
-`kind` is `ask_for_space`, `sleep_together`, `propose`, `travel_together` or `bathe_together`. `status` is `pending`, `accepted`, `declined`, `ignored` or `expired`; `expired` is a `pending` choice past its 24 hours, derived when the page is served and never stored. `resolved_at` is `null` while the status is `pending` or `expired`; for `accepted` and `declined` it is when the answer landed, and for `ignored` it is the `sent_at` of the user message that answered her in words. The reply rows that follow carry `occasion: "life_choice"` as usual. The affinity delta's `life_choice` field is a different object and stays pending-only.
+`kind` is `confess`, `partner_up`, `propose`, `break_up`, `sleep_together`, `fall_asleep_together`, `travel_together` or `bathe_together`, and on older rows the retired `ask_for_space`. `status` is `pending`, `accepted`, `declined`, `ignored` or `expired`; `expired` is a `pending` choice past its 24 hours, derived when the page is served and never stored. `resolved_at` is `null` while the status is `pending` or `expired`; for `accepted` and `declined` it is when the answer landed, and for `ignored` it is the `sent_at` of the user message that answered her in words. The reply rows that follow carry `occasion: "life_choice"` as usual. The affinity delta's `life_choice` field is a different object and stays pending-only.
 
 `user_message_id` names the `role='user'` row whose turn produced this row. It
 is present on assistant rows and on `system_error` notices, and omitted on the
@@ -2684,7 +2720,7 @@ echoes the quote a `user` row was sent with (see the stream route's
 session; omitted on ordinary turns and on turns whose anchor failed to resolve,
 so a cold mount can re-render the quote without keeping local state.
 `action` (user rows only, omitted otherwise) is the action the row was sent
-with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect. `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`. `occasion` (assistant rows the persona wrote on her own only, omitted otherwise) is the canonical route's field of the same name, `life_choice` included; the start bundle carries it too. `life_choice` (the assistant row of her ask only, omitted otherwise) is the canonical route's receipt of the same name, `{id, kind, status, resolved_at}`, with the same five statuses and the same `resolved_at` rule; the start bundle carries it too. `activity` (the user row of an accepted date invitation only, omitted otherwise) is the canonical route's receipt of the same name, and a date's sub-session id is served here too; the start bundle carries the receipt as well. Same auth, ownership check, and
+with, plus `response` (`"accept"` | `"refuse"`) once the turn took effect. `reaction` (assistant rows only, omitted otherwise) is `{emoji, reacted_at}`. `occasion` (assistant rows the persona wrote on her own only, omitted otherwise) is the canonical route's field of the same name, `life_choice` and `cold_war` included; the start bundle carries it too. `life_choice` (the assistant row of her ask only, omitted otherwise) is the canonical route's receipt of the same name, `{id, kind, status, resolved_at}`, with the same five statuses and the same `resolved_at` rule; the start bundle carries it too. `activity` (the user row of an accepted date invitation only, omitted otherwise) is the canonical route's receipt of the same name, and a date's sub-session id is served here too; the start bundle carries the receipt as well. Same auth, ownership check, and
 `limit ∈ [1, 50]` clamp as the canonical history route. **Intentional
 divergence:** the default `limit` is 50 (the canonical route defaults to 20),
 because the BFF exists for a cold mount that wants a full backscroll in one
@@ -2770,7 +2806,7 @@ Query parameters (both optional):
     "user_message_id": "…",
     "life_choice": {
       "id": "…",
-      "kind": "ask_for_space",
+      "kind": "confess",
       "options": ["accept", "decline"],
       "asked_at": "…",
       "expires_at": "…",
@@ -2785,9 +2821,10 @@ Query parameters (both optional):
 or only time-decay), or when the latest event predates affinity migration
 `0014`. `event_type` ∈ `message | gift | proactive | ghost`; a ghost turn
 reports all-zero `effective_deltas`. The tier drop of a life choice is an
-affinity event of its own type, `life_choice`, which this route never returns,
-like `time_decay`: the new state comes back in the resolution response, and
-from the absolute route below on any other device. A settled date's `activity`
+affinity event of its own type, `life_choice`, and a change of the relationship
+status or cold war one of type `relationship`; this route returns neither, like
+`time_decay`: the new state comes back in the resolution response, and from the
+absolute route below on any other device. A settled date's `activity`
 event is never returned either: its result comes back from
 [the end route](#post-v2compsessionsession_idactivitiesactivity_idend).
 
@@ -2815,7 +2852,7 @@ judged once, when it is settled.
   events and on rows written before migration `0056`.
 - `life_choice` — the session's pending choice, composed at serve time and
   attached to `event` whenever one is unanswered and not past its 24 hours;
-  absent otherwise. `kind` is `ask_for_space`, `sleep_together`, `propose`, `travel_together` or `bathe_together`.
+  absent otherwise. `kind` is `confess`, `partner_up`, `propose`, `break_up`, `sleep_together`, `fall_asleep_together`, `travel_together` or `bathe_together`.
   `options` lists the answers the
   [life-choice route](#post-v2compsessionsession_idlife-choiceschoice_id)
   takes; `message_id` is the chat message that asked it (absent once that row
@@ -2840,6 +2877,8 @@ else's).
     "bond": 0.4213, "chemistry": 0.1802,
     "bond_tier": 3, "chem_tier": 2,
     "bond_label": "close_friend", "chemistry_label": "flirtation",
+    "relationship_status": "partner", "cold_war": false,
+    "composed_relation": "more_than_friends",
     "ghost_streak": 0, "total_ghosts": 2,
     "updated_at": "2026-08-17T14:02:11Z"
   }
@@ -2859,6 +2898,18 @@ date's sub-session never has one: its relationship is read at the parent's id.
   will drift.
 - `bond_label` ∈ `acquaintance | friend | close_friend | confidant | soulmate`
 - `chemistry_label` ∈ `spark | flirtation | crush | lover | beloved`
+- `relationship_status` ∈ `none | dating | partner | peer | fwb | situationship | engaged | ex`:
+  what the pair has agreed to be, moved only by `confess`, `partner_up`,
+  `propose` and `break_up` ([affinity-model.md](affinity-model.md#relationship-status)).
+  Always `none` on a BYOC relationship.
+- `cold_war` — whether a cold war is on
+  ([the cold war](life-events-needs.md#the-cold-war)).
+- `composed_relation` — the key of what the two tiers add up to (`good_friend`,
+  `more_than_friends`, … , one per bond tier × chemistry tier), or `null` at
+  tier 1 on both lines. It is the cell of the real tiers: the pair's
+  compatibility is not applied, though her prompt reads an incompatible pair's
+  name from the chemistry-1 column
+  ([the composed relation](affinity-model.md#the-composed-relation)).
 
 `apply_time_decay()` + `refresh_endpoints()` run before the response is
 serialised, and that is the reason to call this rather than read
