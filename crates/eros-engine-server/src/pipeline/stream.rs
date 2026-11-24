@@ -5344,8 +5344,10 @@ pub(crate) fn run_stream_with(
         // design.md §4.1).
         let traits = crate::prompt::persona_traits(&input.persona);
         let together_refused = pde::together_ruled_out(&input.event, traits.machine);
-        // A fight a modern persona's world does not have (spec 2026-11-23-
-        // hot-spring-fight-challenge-bet-design.md §4): refused, and free.
+        // A together action her world does not have, a fight in a modern
+        // one or a cycle in a fantasy one (spec 2026-11-23-hot-spring-fight-
+        // challenge-bet-design.md §4, 2026-11-24-focused-tone-four-together-
+        // actions-and-user-gender-design.md §6): refused, and free.
         let world_refused = pde::world_ruled_out(&input.event, traits.setting);
         // A date she cannot go on (spec 2026-11-12-activity-sub-session-
         // design.md §4.3): she is offline, or a `mid` one is asked below bond
@@ -11476,6 +11478,19 @@ data: [DONE]\n\n";
         events: &[EventSeed],
         image: bool,
     ) -> (Vec<ProtocolFrame>, String, Uuid) {
+        run_together_turn_in(pool, action, response, compatible, events, image, None).await
+    }
+
+    /// [`run_together_turn`] with the genome's `art_metadata` set when given.
+    async fn run_together_turn_in(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        response: Option<&str>,
+        compatible: bool,
+        events: &[EventSeed],
+        image: bool,
+        art: Option<serde_json::Value>,
+    ) -> (Vec<ProtocolFrame>, String, Uuid) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -11516,7 +11531,15 @@ data: [DONE]\n\n";
             .await;
 
         let user_id = Uuid::new_v4();
-        let (_genome_id, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        let (genome_id, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        if let Some(art) = art {
+            sqlx::query("UPDATE engine.persona_genomes SET art_metadata = $2 WHERE id = $1")
+                .bind(genome_id)
+                .bind(art)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
@@ -11776,6 +11799,48 @@ data: [DONE]\n\n";
         assert!(events_of_kind(&pool, "showering_together").await.is_empty());
         let (context, _) = turn_affinity_row(&pool, umid).await;
         assert_eq!(context["tier_drop"], "chemistry", "{context}");
+    }
+
+    /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
+    /// design.md §6: a cycle is refused before the judge in a fantasy
+    /// persona's world: with no judge the rule engine would accept it. It
+    /// shows no picture, places nothing and drops nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_fantasy_persona_never_cycles_together(pool: PgPool) {
+        let (frames, _, umid) = run_together_turn_in(
+            &pool,
+            eros_engine_core::types::UserAction::CycleTogether,
+            None,
+            true,
+            &[],
+            true,
+            Some(serde_json::json!({"setting": "fantasy"})),
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert_eq!(meta_action_type(&frames), FrameActionType::Reply);
+        assert_eq!(image_requests(&frames), 0);
+        assert!(events_of_kind(&pool, "cycling_together").await.is_empty());
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    /// The same cycle in a modern persona's world is accepted and placed.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_modern_persona_cycles_together(pool: PgPool) {
+        let (frames, _, umid) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::CycleTogether,
+            None,
+            true,
+            &[],
+            false,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let placed = events_of_kind(&pool, "cycling_together").await;
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert_eq!(placed[0].0, format!("action:{umid}:cycling_together"));
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -20929,6 +20994,42 @@ data: [DONE]\n\n";
             cases.extend([
                 (a.clone(), Accept, ReplyText, true, None),
                 (a.clone(), Accept, ReplyTextImage, true, None),
+                (a, Refuse, ReplyText, true, None),
+            ]);
+        }
+        for (a, response, ty, available, want) in cases {
+            let mut input = fixture_decision_input();
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a.clone());
+            }
+            let mut plan = pde::decide(&input);
+            plan.action_response = Some(response);
+            plan.action_type = ty;
+            assert_eq!(
+                picture_action(&input.event, &plan, available),
+                want,
+                "{a:?} {response:?} {ty:?} {available}"
+            );
+        }
+    }
+
+    /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
+    /// design.md §6: each is a picture turn when accepted.
+    #[test]
+    fn workout_swim_cycle_and_hike_are_picture_turns() {
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
+        use eros_engine_core::types::UserAction::{
+            CycleTogether, HikeTogether, SwimTogether, WorkoutTogether,
+        };
+        let mut cases = Vec::new();
+        for a in [WorkoutTogether, SwimTogether, CycleTogether, HikeTogether] {
+            assert!(is_picture_action(&a), "{a:?}");
+            cases.extend([
+                (a.clone(), Accept, ReplyText, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyImage, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyText, false, None),
+                (a.clone(), Refuse, ReplyTextImage, true, Some(ReplyText)),
                 (a, Refuse, ReplyText, true, None),
             ]);
         }

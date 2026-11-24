@@ -52,7 +52,9 @@ const MAX_EVENT_KEY_CHARS: usize = 128;
 /// A kind of life event. `taking_space`, `fell_out`, `traveling_together`,
 /// `bathing_together`, `on_a_date`, `showering_together`, `sauna_together`
 /// the twelve kinds from `using_toilet_together` to `drinking_together`,
-/// `hot_spring_together` and `fighting_together` are placed by the engine, never drawn: they appear in responses only, and
+/// `hot_spring_together`, `fighting_together`, `working_out_together`,
+/// `swimming_together`, `cycling_together` and `hiking_together` are placed by
+/// the engine, never drawn: they appear in responses only, and
 /// a `kinds` filter that lists one is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -148,6 +150,10 @@ pub enum EventKindDto {
     DrinkingTogether,
     HotSpringTogether,
     FightingTogether,
+    WorkingOutTogether,
+    SwimmingTogether,
+    CyclingTogether,
+    HikingTogether,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -260,6 +266,10 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::DrinkingTogether => EventKind::DrinkingTogether,
             EventKindDto::HotSpringTogether => EventKind::HotSpringTogether,
             EventKindDto::FightingTogether => EventKind::FightingTogether,
+            EventKindDto::WorkingOutTogether => EventKind::WorkingOutTogether,
+            EventKindDto::SwimmingTogether => EventKind::SwimmingTogether,
+            EventKindDto::CyclingTogether => EventKind::CyclingTogether,
+            EventKindDto::HikingTogether => EventKind::HikingTogether,
         }
     }
 }
@@ -358,6 +368,10 @@ impl From<EventKind> for EventKindDto {
             EventKind::DrinkingTogether => EventKindDto::DrinkingTogether,
             EventKind::HotSpringTogether => EventKindDto::HotSpringTogether,
             EventKind::FightingTogether => EventKindDto::FightingTogether,
+            EventKind::WorkingOutTogether => EventKindDto::WorkingOutTogether,
+            EventKind::SwimmingTogether => EventKindDto::SwimmingTogether,
+            EventKind::CyclingTogether => EventKindDto::CyclingTogether,
+            EventKind::HikingTogether => EventKindDto::HikingTogether,
         }
     }
 }
@@ -2628,6 +2642,29 @@ mod tests {
         for (kind, wire) in [
             (EventKind::HotSpringTogether, "hot_spring_together"),
             (EventKind::FightingTogether, "fighting_together"),
+        ] {
+            let dto = EventKindDto::from(kind);
+            assert_eq!(serde_json::to_value(dto).unwrap(), json!(wire));
+            assert_eq!(EventKind::from(dto), kind);
+            assert!(
+                serde_json::from_value::<DrawEventRequest>(
+                    json!({"event_key": "k", "kinds": [wire]})
+                )
+                .is_err(),
+                "{wire}"
+            );
+        }
+    }
+
+    /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
+    /// design.md §6.
+    #[test]
+    fn working_out_swimming_cycling_and_hiking_together_are_placed_kinds_on_the_wire() {
+        for (kind, wire) in [
+            (EventKind::WorkingOutTogether, "working_out_together"),
+            (EventKind::SwimmingTogether, "swimming_together"),
+            (EventKind::CyclingTogether, "cycling_together"),
+            (EventKind::HikingTogether, "hiking_together"),
         ] {
             let dto = EventKindDto::from(kind);
             assert_eq!(serde_json::to_value(dto).unwrap(), json!(wire));

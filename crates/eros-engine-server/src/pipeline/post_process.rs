@@ -1021,7 +1021,8 @@ fn eval_skip_reason(
 /// The line a refused action drops this turn (spec 2026-10-05 §6.3); `None`
 /// on every other turn, on a refused tip, which drops nothing (spec
 /// 2026-10-11 §6), and on an action the persona's `setting` rules out (spec
-/// 2026-11-23-hot-spring-fight-challenge-bet-design.md §4).
+/// 2026-11-23-hot-spring-fight-challenge-bet-design.md §4; spec
+/// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §6).
 fn tier_drop_for(
     event: &Event,
     plan: &ActionPlan,
@@ -2857,6 +2858,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
+    /// design.md §6: a cycle a fantasy persona's world rules out costs
+    /// nothing; any other refusal of a together action still drops chemistry.
+    #[test]
+    fn a_cycle_the_world_rules_out_drops_nothing() {
+        use eros_engine_core::affinity::AffinityLine;
+        use eros_engine_core::types::{ActionResponse, UserAction};
+        let event = |a: UserAction| Event::UserMessage {
+            content: String::new(),
+            message_id: Uuid::nil(),
+            prompt_traits: vec![],
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            quote: None,
+            action: Some(a),
+            outfit: None,
+        };
+        let refused = ActionPlan {
+            action_type: ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: Vec::new(),
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: Some(ActionResponse::Refuse),
+        };
+        let cycle = event(UserAction::CycleTogether);
+        assert_eq!(tier_drop_for(&cycle, &refused, Setting::Fantasy), None);
+        assert_eq!(
+            tier_drop_for(&cycle, &refused, Setting::Modern),
+            Some(AffinityLine::Chemistry)
+        );
+        let hike = event(UserAction::HikeTogether);
+        assert_eq!(
+            tier_drop_for(&hike, &refused, Setting::Fantasy),
+            Some(AffinityLine::Chemistry)
+        );
     }
 
     #[test]

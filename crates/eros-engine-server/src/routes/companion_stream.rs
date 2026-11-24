@@ -187,6 +187,10 @@ pub enum UserActionKind {
     BreakUp,
     HotSpringTogether,
     FightTogether,
+    WorkoutTogether,
+    SwimTogether,
+    CycleTogether,
+    HikeTogether,
     Challenge,
     Bet,
     Custom,
@@ -360,15 +364,19 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// a `give` of one cigarette, herb or alcohol. `hot_spring_together` starts
 /// `hot_spring_together` (one hour) and `fight_together` starts
 /// `fighting_together` (one to two hours); a `fight_together` to a persona
-/// whose `setting` is not `fantasy` is refused and costs nothing. `propose`
-/// asks her to marry the user and starts no event: it is refused unless the
-/// pair is `dating`, `fwb` or `situationship`, and accepted, the pair is
-/// `engaged`. `break_up` ends the relationship and starts no event: it is
-/// refused unless the pair's status is breakable (`dating`, `partner`, `fwb`,
-/// `situationship`, `engaged`); accepted, the pair is `ex`, and refused, a
-/// cold war starts. On a BYOC instance no status moves: `propose` is hers to
-/// answer and `break_up` is always refused. On a date both act on the
-/// inviting session's relationship. `challenge` and `bet`
+/// whose `setting` is not `fantasy` is refused and costs nothing.
+/// `workout_together` → `working_out_together`, `swim_together` →
+/// `swimming_together` and `cycle_together` → `cycling_together` (one hour
+/// each); `hike_together` → `hiking_together` (two to three hours). A
+/// `cycle_together` to a persona whose `setting` is `fantasy` is refused and
+/// costs nothing. `propose` asks her to marry the user and starts no event: it
+/// is refused unless the pair is `dating`, `fwb` or `situationship`, and
+/// accepted, the pair is `engaged`. `break_up` ends the relationship and
+/// starts no event: it is refused unless the pair's status is breakable
+/// (`dating`, `partner`, `fwb`, `situationship`, `engaged`); accepted, the
+/// pair is `ex`, and refused, a cold war starts. On a BYOC instance no status
+/// moves: `propose` is hers to answer and `break_up` is always refused. On a
+/// date both act on the inviting session's relationship. `challenge` and `bet`
 /// ask whether she takes the user up on it; no winner is decided and a
 /// refusal costs nothing.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
@@ -485,6 +493,10 @@ impl UserActionDto {
             UserActionKind::BreakUp => UserAction::BreakUp,
             UserActionKind::HotSpringTogether => UserAction::HotSpringTogether,
             UserActionKind::FightTogether => UserAction::FightTogether,
+            UserActionKind::WorkoutTogether => UserAction::WorkoutTogether,
+            UserActionKind::SwimTogether => UserAction::SwimTogether,
+            UserActionKind::CycleTogether => UserAction::CycleTogether,
+            UserActionKind::HikeTogether => UserAction::HikeTogether,
             UserActionKind::Challenge => UserAction::Challenge,
             UserActionKind::Bet => UserAction::Bet,
             UserActionKind::Custom => UserAction::Custom {
@@ -4993,6 +5005,44 @@ mod validate_payload_tests {
                 UserAction::Challenge,
             ),
             ("bet", UserActionKind::Bet, UserAction::Bet),
+        ] {
+            let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
+                .unwrap_or_else(|e| panic!("{wire}: {e}"));
+            assert_eq!(dto.to_core().unwrap(), want, "{wire}");
+            let view = UserActionView::from_metadata_action(
+                &serde_json::json!({"type": wire, "response": "refuse"}),
+            )
+            .unwrap_or_else(|| panic!("history parses a stored {wire}"));
+            assert_eq!(view.response, Some(ActionResponseDto::Refuse));
+            assert_eq!(view.action.kind, kind);
+        }
+    }
+
+    /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
+    /// design.md §6.
+    #[test]
+    fn workout_swim_cycle_and_hike_map_one_to_one() {
+        for (wire, kind, want) in [
+            (
+                "workout_together",
+                UserActionKind::WorkoutTogether,
+                UserAction::WorkoutTogether,
+            ),
+            (
+                "swim_together",
+                UserActionKind::SwimTogether,
+                UserAction::SwimTogether,
+            ),
+            (
+                "cycle_together",
+                UserActionKind::CycleTogether,
+                UserAction::CycleTogether,
+            ),
+            (
+                "hike_together",
+                UserActionKind::HikeTogether,
+                UserAction::HikeTogether,
+            ),
         ] {
             let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
                 .unwrap_or_else(|e| panic!("{wire}: {e}"));

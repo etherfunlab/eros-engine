@@ -839,6 +839,10 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::BreakUp => "向你提出分手".into(),
         UserAction::HotSpringTogether => "想和你一起泡温泉".into(),
         UserAction::FightTogether => "想和你一起去战斗".into(),
+        UserAction::WorkoutTogether => "想和你一起健身".into(),
+        UserAction::SwimTogether => "想和你一起游泳".into(),
+        UserAction::CycleTogether => "想和你一起骑单车".into(),
+        UserAction::HikeTogether => "想和你一起爬山".into(),
         UserAction::Challenge => "向你发起挑战".into(),
         UserAction::Bet => "想和你打个赌".into(),
         UserAction::Custom { text } => text.clone(),
@@ -1170,6 +1174,10 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         DrinkingTogether => "和对方一起喝酒",
         HotSpringTogether => "和对方一起泡温泉",
         FightingTogether => "和对方并肩作战",
+        WorkingOutTogether => "和对方一起健身",
+        SwimmingTogether => "和对方一起游泳",
+        CyclingTogether => "和对方一起骑单车",
+        HikingTogether => "和对方一起爬山",
     }
 }
 
@@ -6920,6 +6928,34 @@ mod tests {
         assert_eq!(
             action_outcome(&UserAction::Challenge, ActionResponse::Refuse),
             "对方向你发起挑战，你没应战。"
+        );
+    }
+
+    /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
+    /// design.md §6.
+    #[test]
+    fn workout_swim_cycle_and_hike_read_as_the_spec_says() {
+        use eros_engine_core::events::EventKind;
+        for (a, marker, label) in [
+            (
+                UserAction::WorkoutTogether,
+                "想和你一起健身",
+                "和对方一起健身",
+            ),
+            (UserAction::SwimTogether, "想和你一起游泳", "和对方一起游泳"),
+            (
+                UserAction::CycleTogether,
+                "想和你一起骑单车",
+                "和对方一起骑单车",
+            ),
+            (UserAction::HikeTogether, "想和你一起爬山", "和对方一起爬山"),
+        ] {
+            assert!(action_marker(&a).contains(marker), "{a:?}");
+            assert_eq!(event_label(a.together_kind().unwrap()), label, "{a:?}");
+        }
+        assert_eq!(
+            current_state(Some(EventKind::ShortTrip), Some(EventKind::HikingTogether)).as_deref(),
+            Some("短途旅游；和对方一起爬山")
         );
     }
 

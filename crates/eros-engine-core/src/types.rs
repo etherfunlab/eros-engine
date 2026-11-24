@@ -191,6 +191,14 @@ pub enum UserAction {
     /// The user asks her to fight beside them; a together action that only a
     /// `fantasy` persona can have (spec 2026-11-23 §4).
     FightTogether,
+    /// The user asks her to work out, swim, cycle or hike with them (spec
+    /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-
+    /// design.md §6): each behaves as `jog_together` does. `cycle_together`
+    /// is refused, and costs nothing, to a `fantasy` persona.
+    WorkoutTogether,
+    SwimTogether,
+    CycleTogether,
+    HikeTogether,
     /// The user challenges her, or proposes a bet: social actions whose
     /// answer says whether she takes it up; no winner is decided, and a
     /// refusal drops nothing (spec 2026-11-23 §4).
@@ -307,6 +315,10 @@ impl UserAction {
             UserAction::RideHorseTogether => Some(EventKind::HorseRidingTogether),
             UserAction::StreakTogether => Some(EventKind::StreakingTogether),
             UserAction::DrinkTogether => Some(EventKind::DrinkingTogether),
+            UserAction::WorkoutTogether => Some(EventKind::WorkingOutTogether),
+            UserAction::SwimTogether => Some(EventKind::SwimmingTogether),
+            UserAction::CycleTogether => Some(EventKind::CyclingTogether),
+            UserAction::HikeTogether => Some(EventKind::HikingTogether),
             _ => None,
         }
     }
@@ -827,6 +839,43 @@ mod tests {
             assert_eq!(a.together_kind(), Some(kind), "{a:?}");
             assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
             assert!(!a.speaks_emotionally(), "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
+    /// design.md §6.
+    #[test]
+    fn workout_swim_cycle_and_hike_together_name_their_events() {
+        for (a, wire, kind) in [
+            (
+                UserAction::WorkoutTogether,
+                "workout_together",
+                EventKind::WorkingOutTogether,
+            ),
+            (
+                UserAction::SwimTogether,
+                "swim_together",
+                EventKind::SwimmingTogether,
+            ),
+            (
+                UserAction::CycleTogether,
+                "cycle_together",
+                EventKind::CyclingTogether,
+            ),
+            (
+                UserAction::HikeTogether,
+                "hike_together",
+                EventKind::HikingTogether,
+            ),
+        ] {
+            let v = serde_json::json!({ "type": wire });
+            assert_eq!(serde_json::to_value(&a).unwrap(), v);
+            assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+            assert_eq!(a.together_kind(), Some(kind), "{a:?}");
+            assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
+            assert!(!a.speaks_emotionally(), "{a:?}");
+            assert_eq!(a.consumed(), None, "{a:?}");
+            assert_eq!(a.status_ask(), None, "{a:?}");
         }
     }
 

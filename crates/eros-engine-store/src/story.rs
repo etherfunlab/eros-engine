@@ -1623,6 +1623,53 @@ mod tests {
         );
     }
 
+    /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
+    /// design.md §6: working out, swimming, cycling and hiking together reach
+    /// her story as jogging together does.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_take_working_out_swimming_cycling_and_hiking_together(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let kinds = [
+            EventKind::WorkingOutTogether,
+            EventKind::SwimmingTogether,
+            EventKind::CyclingTogether,
+            EventKind::HikingTogether,
+        ];
+        for (i, k) in kinds.iter().enumerate() {
+            let from = now - chrono::Duration::hours(2 * (i as i64 + 1));
+            seed_event(
+                &pool,
+                inst,
+                Some(s),
+                k.as_str(),
+                k.as_str(),
+                from,
+                from + chrono::Duration::hours(1),
+                None,
+            )
+            .await;
+        }
+        let got = repo
+            .life_events(inst, now - chrono::Duration::days(7), now, 30)
+            .await
+            .unwrap();
+        let mut got: Vec<&str> = got.iter().map(|e| e.event.kind.as_str()).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                "cycling_together",
+                "hiking_together",
+                "swimming_together",
+                "working_out_together",
+            ]
+        );
+    }
+
     /// A date is its own sub-session's affair: it never reaches her story,
     /// whether over or under way.
     #[sqlx::test(migrations = "./migrations")]
