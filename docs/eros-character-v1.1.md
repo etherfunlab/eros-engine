@@ -55,7 +55,7 @@ value of the wrong shape reads as absent.
 |---|---|---|
 | `gender` | string | `male` or `female`; any other word is rendered as written. |
 | `age` | integer, or a string holding one | Her age. |
-| `species` | string | `human`, `alien`, `beastkin`, `elf`, `deity`, `cyborg`, `robot`, `android`, `zombie`, or any other word. Absent means human. `robot` and `android` are machines: the prompt calls her no AI assistant rather than no AI, and life events never give her a period or a visit to the toilet ([life-events-needs.md](life-events-needs.md#gates)), nor does she accept the user's `toilet_together`. |
+| `species` | string | `human`, `alien`, `beastkin`, `elf`, `deity`, `cyborg`, `robot`, `android`, `zombie`, or any other word. Absent means human. `robot` and `android` are machines: the prompt calls her no AI assistant rather than no AI, and life events never give her a period or a visit to the toilet ([life-events-needs.md](life-events-needs.md#gates)), nor does she accept the user's `toilet_together`. Any other word but `human` gives her no period unless `period` is `true`. |
 | `planet` | string | Free text. `earth` or absent renders no planet. |
 | `hometown` | string | Free text. |
 | `timezone` | string | IANA zone of her clock. Absent: the request's `user_timezone`, else `Asia/Singapore`. |
@@ -71,6 +71,7 @@ value of the wrong shape reads as absent.
 | `moody` | boolean | Whether her moods run high: `true` makes an emotional reply three times as likely, `false` a third as likely. Read only by the chat tone draw ([model-config.md](model-config.md#tones--chat-tones-chat-task-only)); it reaches no prompt. |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | boolean | Whether she smokes, drinks, uses weed, drinks coffee, loves good food: how she takes a `give` of each (and the user's ask to smoke, smoke weed or drink with her), how fast her craving for what she's hooked on builds, and what it names. `smoking`, `alcoholic` and `drug` set to `true` also let life events draw her smoking, drinking and smoking weed. See [life-events-needs.md](life-events-needs.md#persona-settings). |
 | `health` | string | `weak`, `normal` or `strong`. Read by life events. |
+| `period` | boolean | Whether she has a period. Absent: a female human has one, a female of any other species none. `true` or `false` decides for a female who is not a machine; a machine, and a persona whose `gender` is not `female`, never has one. Read by life events, by the user's sex and water actions during her period, and by her asks ([her cycle](life-events-needs.md#her-cycle)). |
 | `prefer_trip` | boolean | Read by life events. |
 | `prefer_events` | array of strings | Read by life events. |
 | `homesick` | boolean | Read by life events. |
@@ -81,7 +82,7 @@ value of the wrong shape reads as absent.
 | `outdoorsy` | string | `outdoor`, `neutral` or `indoor`: whether she leans outdoors or stays in. Absent or any other value reads as `neutral`. Read by life events. |
 | `setting` | string | `modern` or `fantasy`: the world she lives in, which decides the life events that fit her. Absent or any other value reads as `modern`. Read by life events, and by the user's `fight_together`, which only a `fantasy` persona accepts, and `cycle_together`, which only a `modern` one accepts. |
 
-The last ten are accepted on a BYOC instance, where only two have an effect:
+The last eleven are accepted on a BYOC instance, where only two have an effect:
 `setting`, on the user's `fight_together` and `cycle_together`, and `employed`,
 on the `focused` tone off work. BYOC does not serve life events yet.
 

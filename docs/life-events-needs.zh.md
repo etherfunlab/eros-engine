@@ -25,7 +25,7 @@
 | 判官看到 | `[需求]` 行 | `[近期事件]` 行 |
 | 回复看到 | `- 此刻的需要：…` | `- 正在经历：…` 与 `- 刚才：…` |
 | 画图合成器看到 | — | `[此刻状态]` 段 |
-| 调用方拿到 | `body_state` 帧和 `GET …/effects` 上的 `needs` | events 路由的响应；`GET …/effects` 上的 `event` 与 `background_event` |
+| 调用方拿到 | `body_state` 帧和 `GET …/effects` 上的 `needs` | events 路由的响应；`GET …/effects` 上的 `event`、`background_event` 与 `cycle_event` |
 
 语音通话读需求、不读事件。群聊轮次的回复两者都不读；只有群聊图片的合成器会读发言人的事件。细节见下文。
 
@@ -155,7 +155,7 @@ BYOC 角色的这几个键在她的卡片上，engine 只在一轮对话里才�
   配置了判官的部署里，规则引擎回合用推算后的水平，再加上被接受的 give 的挪动。
 - **调用方**在 `body_state` 帧上拿到同样的水平（`needs`，对象或 `null`）。有 give 余效在起作用，或需求已知时发送，
   幂等重放时重发。`GET …/effects` 返回推到调用时刻的水平，没有评定或没有判官时为 `null`；
-  它的 `changes_at` 给出这份响应下一次自己变化的时刻：某项需求的下一步，或进行中事件的结束；`as_of` 是计算它的时刻，
+  它的 `changes_at` 给出这份响应下一次自己变化的时刻：某项需求的下一步、进行中事件的结束，或她下一次月经的开始（见[她的周期](#她的周期)）；`as_of` 是计算它的时刻，
   客户端据此把等待算成一段时长。见
   [消息流](api-reference.zh.md#post-compchatsession_idmessagestream)和
   [effects 路由](api-reference.zh.md#get-v2compsessionsession_ideffects)。
@@ -182,7 +182,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `trip` | 背景 | 1 到 7 天 | 0.5 | 7 天 |
 
 **插曲**是前台事件：她被叫去加班、前任发来消息、她在看书、在洗澡、没看手机。**背景**是持续数天的状态
-（出差、生病、经期），期间插曲照样会发生。各种类、时长和含义见
+（出差、生病），期间插曲照样会发生。`period` 和 `period_scare` 仍属于各自的类别 `body` 和 `short`，
+但进行期间两者都不算：它们是[她的周期](#她的周期)，自成一个槽位。各种类、时长和含义见
 [events 路由](api-reference.zh.md#post-v2compsessionsession_idevents)。每个种类的权重、冷却和时长区间在
 `crates/eros-engine-core/src/events.rs` 的 `rule` 里，类别的数值在 `category_rule` 里。
 
@@ -215,7 +216,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 3. **种类。** 该类别里每个合格种类的权重是基础权重乘以它的各项[需求系数](#1-需求给种类加权)、
    `prefer_events` 系数、[关联系数](#关联系数)，少数种类再乘一个角色系数（[`is_virgin`](#角色设置)、
    [`homesick`](#角色设置)、[`sex_addict`](#角色设置)、[`hygienic`](#角色设置)、[`employed`](#角色设置)、[`outdoorsy`](#户外还是室内)）。再掷一次，选一个。
-4. **时长。** 固定时长照用；区间则掷出来。
+4. **时长。** 固定时长照用；区间则掷出来。`period` 和 `period_scare` 的时长由[她的周期](#她的周期)决定。
 
 没有合格种类就没有事件，响应是 `{"event": null, "message": null}`。只要有合格种类，抽取就一定得到事件。
 她的一天有多热闹，取决于调用方什么时候来要，以及冷却。
@@ -225,14 +226,14 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 同一时间一件插曲、一个背景
 
-- 有插曲在进行时，完全不抽，连背景也不抽。
+- 有插曲在进行时，完全不抽，连背景也不抽。进行中的 `period_scare` 不是插曲，什么都不挡（见[她的周期](#她的周期)）。
 - 有背景在进行时，不会抽第二个背景，插曲照抽；只是住院（`hospitalized`）和术后（`post_surgery`）期间，
   需要她出门活动的那几种不抽：`temp_work`、`police_encounter`、`animal_encounter`、`hit_someone`、
   `got_hit`、`working_out`、`on_the_way`、`in_battle`、`got_bumped`、`saw_bag`、`saw_clothes`、`out_shopping`、
   `bros_gathering`、`sis_gathering`、`admiring_scenery`、`admiring_art`、`watching_show`、`on_the_road`、`having_sex`、
   `bird_encounter`、`streaking`、`got_lost`、`drinking`、`smoking`、`smoking_weed`、`just_have_sex`。
-  `period` 期间，
-  不抽 `period_scare` 与 `pregnancy_scare`。`traveling_together` 期间，不抽任何可能让她离线的种类，也不抽 `just_have_sex`：她和用户在一起。
+  `traveling_together` 期间，不抽任何可能让她离线的种类，也不抽 `just_have_sex`：她和用户在一起。
+- 她的经期里同样不抽背景，也不抽 `period_scare` 与 `pregnancy_scare`（见[她的周期](#她的周期)）。
 - 有十种是需要背景，而不是被背景排除。`got_lost` 和 `on_a_cruise` 只在 `short_trip`、`long_trip`、`hometown_visit` 或
   `traveling_together` 进行期间抽取，出差时和不在旅途中都不抽。`missed_ride`、`on_the_way`、`on_the_road`、`on_a_boat`、
   `on_a_bus`、`on_a_train`、`on_a_plane` 和 `driving` 在这几种或 `business_trip` 进行期间抽取。
@@ -241,9 +242,11 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 - 她有一场还没结算的约会时，不论正在进行还是已经结束，同样完全不抽，角色的任何一个 session 都一样：她正和用户在外面，
   或者已经回来、约会还没进她的记忆（见 [activities.zh.md](activities.zh.md#暂停的东西)）。重复的 `event_key` 照样返回它的事件。
 - 一件插曲和一个背景可以同时进行。背景里抽到的插曲，是从背景里讲出来的。
-- 这以角色实例为单位，跨它所有的 session：她只有一段人生。抽取会读该实例最近 90 天的事件，也就是最长的那个冷却。
+- 这以角色实例为单位，跨它所有的 session：她只有一段人生。抽取会读该实例最近 90 天的事件，也就是最长的那个冷却；
+  为了她的周期，还会读最新的一条 `period` 和一条 `period_scare`，不论多久以前。
 
-写入时用同一条规则做原子检查：有插曲在进行时不写入另一件插曲；有任何事件在进行时不写入背景。
+写入时用同一条规则做原子检查：有插曲在进行时不写入另一件插曲；有任何事件在进行时不写入背景。进行中的
+`period_scare` 两样都不算。
 
 ### 冷却与上限
 
@@ -272,10 +275,10 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `missed_ride`、`on_the_way`、`on_the_road`、`on_a_boat`、`on_a_bus`、`on_a_train`、`on_a_plane`、`driving` | 有 `business_trip`、`short_trip`、`long_trip`、`hometown_visit` 或 `traveling_together` 正在进行 |
 | `strip`、`streaking` | 亲密度档 3，且会话最新记录的 `affinity_scope` 性向相容（scope 里有暧昧感轴）；没有记录算不相容 |
 | `saw_bag`、`saw_clothes` | 角色的 `art_metadata.gender` 为 `"female"` |
-| `period` | 角色的 `art_metadata.gender` 为 `"female"`，并且她不是机器（`art_metadata.species` 为 `"robot"` 或 `"android"`） |
+| `period` | 她有月经（见 [`period`](#角色设置)），并且这个实例还没有 `period`（见[她的周期](#她的周期)） |
 | `want_to_quit_job` | 角色的 `art_metadata.employed` 不为 `"free"` |
-| `period_scare` | 角色的 `art_metadata.gender` 为 `"female"`，她不是机器，并且亲密度档 2 及以上 |
-| `pregnancy_scare` | 角色的 `art_metadata.gender` 为 `"female"`，她不是机器，并且亲密度档 3 |
+| `period_scare` | 她有月经，亲密度档 2 及以上，并且她下一次月经在三天内就该来（见[她的周期](#她的周期)） |
+| `pregnancy_scare` | 角色的 `art_metadata.gender` 为 `"female"`，她不是机器（`art_metadata.species` 为 `"robot"` 或 `"android"`），并且亲密度档 3 |
 | `using_toilet` | 她不是机器 |
 | `having_sex` | 角色的 `art_metadata.sex_addict` 为 `true` |
 | `away_from_phone`、`busy`、`in_battle`、`asleep`、`bros_gathering`、`sis_gathering`、`having_sex`，以及女性角色的 `out_shopping` | ghost 保护允许（见[下文](#离线类)） |
@@ -289,13 +292,13 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 ### 角色设置
 
-角色 genome 的 `art_metadata` 里有十六个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
+角色 genome 的 `art_metadata` 里有十七个键，由 engine 读取，由写角色的人填写，和 `gender`、`birthday`、
 `timezone` 放在一起：
 
 | 键 | 取值 | 效果 |
 |---|---|---|
 | `prefer_events` | `mid` 种类的数组 | 列出的种类在 `mid` 内权重为 3 倍 |
-| `health` | `"weak"`、`"normal"`（默认）、`"strong"` | `body` 类别权重分别为 2 倍、1 倍、一半 |
+| `health` | `"weak"`、`"normal"`（默认）、`"strong"` | `body` 类别权重分别为 2 倍、1 倍、一半；她的月经分别持续 5、3、1 天（见[她的周期](#她的周期)） |
 | `prefer_trip` | `true`、`false`（默认） | `trip` 类别权重为 3 倍 |
 | `homesick` | `true`、`false`、不写（默认） | `trip` 内部：`true` 时 `hometown_visit` 3 倍、`short_trip` / `long_trip` 三分之一；`false` 时 `hometown_visit` 三分之一；`business_trip` 是工作，两种情况都不动 |
 | `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内、`just_have_sex` 在 `short` 内权重为五分之一 |
@@ -304,7 +307,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内分别为三分之一、1 倍、3 倍；`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读。`full_time` 还表示她有事业心：`tones.focused` 大于 0 时，可以抽语气、不在上班、也没有插曲在进行的回合，有八分之一用 `focused` 语气（见[上班时](#上班时)） |
 | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | 每个类别内部：`outdoor` 时户外种类 3 倍、室内种类三分之一，`indoor` 反过来；中性种类不动（见[下文](#户外还是室内)）；其他值按 `neutral` 读 |
 | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界（见[下文](#她的世界)）；不是 `fantasy` 的角色拒绝用户的 `fight_together`，`fantasy` 的角色拒绝用户的 `cycle_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）；其他值按 `modern` 读 |
-| `species` | 任意词 | `"robot"` 和 `"android"` 是机器：她不会抽到 `period`、`period_scare`、`pregnancy_scare`、`using_toilet`，也拒绝用户的 `toilet_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）；其他词不影响抽取。这个词对 prompt 的作用见 [eros-character-v1.1.md](eros-character-v1.1.md) |
+| `species` | 任意词 | `"robot"` 和 `"android"` 是机器：她没有月经，不会抽到 `pregnancy_scare`、`using_toilet`，也拒绝用户的 `toilet_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）。`"human"` 以外的其他词让她没有月经，除非 `period` 为 `true`；抽取的其余部分不受影响。这个词对 prompt 的作用见 [eros-character-v1.1.md](eros-character-v1.1.md) |
+| `period` | `true`、`false`、不写（默认） | 她有没有月经（见[她的周期](#她的周期)）。不写时，人类女性（`species` 不写、留空或为 `"human"`）有，其他物种的女性没有。`true` 或 `false` 对不是机器的女性说了算；机器，以及 `gender` 不是 `"female"` 的角色，一律没有 |
 | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（`false` 表示她忌口、节食）：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西、怎么对待用户请她一起抽烟、抽大麻或喝酒（见下）；`smoking`、`alcoholic`、`drug` 为 `true` 时，她才会抽到 `smoking`、`drinking`、`smoking_weed` |
 
 `prefer_trip` 管她动不动，`homesick` 管她动起来往哪去。两者都为 `true` 的空姐角色经常出行、照常出差，
@@ -331,7 +335,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 所以 `outdoorsy` 不会改变她联系不上的频率。它和同一种类上的其他系数相乘，不改门槛、冷却、时长，也不改各类别出现的比例。
 
 读取是宽松的。类型不对的值按没写处理；`prefer_events` 里不是已知 `mid` 种类的条目被丢掉，其余保留。
-`health` 缩放整个 `body` 类别，`period` 也在内，`period` 自己 28 天的冷却让它不管怎样都大约每月一次。
+`health` 缩放整个 `body` 类别，也决定她的月经持续多久；抽取给她的第一次月经之后，其余的都按[她的周期](#她的周期)来。
 `prefer_trip` 提高的是出行的概率，不是频率：每周一次的类别冷却对它同样适用。
 
 五个习惯键通过 `indulgence` 的漂移影响抽取，其中三个（`smoking`、`alcoholic`、`drug`）还是习惯类事件的门槛（见[下文](#迷路习惯与性)）。判官的角色块（`[角色人格]`）不列它们，所以她不会每一轮都提烟、酒、大麻、咖啡或吃的；
@@ -355,7 +359,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 她的一天是连着的：一件**在线**的事件会让生活里跟在它后面的种类更容易抽到。先行事件在进行中，或结束后
 48 小时内，算在线。抽取第二段里，每有一个指向它的、不同种类的在线先行事件，该种类权重乘 3；两个就是 9 倍。
-这个系数不解除门槛（在线的 `sick` 只对档 2 以上的女性角色提高 `period_scare`），不碰第一段，也不缩短冷却。
+这个系数不解除门槛（在线的 `sick` 只在[她的周期](#她的周期)允许抽 `period_scare` 时提高它），不碰第一段，也不缩短冷却。
 
 | 在线的先行事件 | 权重乘 3 的种类 |
 |---|---|
@@ -367,7 +371,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 | `short_trip`、`long_trip`、`hometown_visit`、`traveling_together` | `on_the_road`、`admiring_scenery`、`taking_selfie` |
 | `hometown_visit` | `bros_gathering`、`sis_gathering` |
 | `hospitalized`、`post_surgery` | `reading`、`gaming` |
-| `period` | `irritable`、`unwell` |
+| 她的经期：`period` 那一行，或[她的周期](#她的周期)推导出的经期 | `irritable`、`unwell` |
 | `breakup`、`quarrel`、`scolded_by_superior`、`in_battle` | `irritable` |
 | `got_hit`、`got_bumped` | `unwell` |
 | `working_out` | `showering`、`bathing` |
@@ -375,6 +379,9 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 | `scolded_by_superior`、`temp_work` | `want_to_quit_job` |
 | `breakup`、`quarrel`、`want_to_quit_job` | `pondering_life` |
 | `pondering_life` | `want_to_see_sea` |
+
+她下一次月经该来之前的三天里，若有 `having_sex`、`just_have_sex` 或 `having_sex_together` 开始，`period_scare`
+的权重也乘 3，不论几次都只乘一次（见[她的周期](#她的周期)）。
 
 有一种是压低而不是排除：实例从来没有过 `having_sex`、`just_have_sex` 或 `having_sex_together` 事件时，`pregnancy_scare` 权重为五分之一。没有硬性的
 「只能在之后」门槛，也没有状态机：三种都从未发生的部署里，这个虚惊只是降到五分之一，不会消失。
@@ -422,8 +429,9 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 其余细节（什么工作、前任写了什么、哪种动物）由她根据自己的人设和世界观补全。提示有两种变体：
 
-- 背景的提示带上抽到的时长（`period` 的不带）：`（你刚出发去外地出差，要待 24 小时。）`。
-- 背景期间抽到的插曲，提示以背景的状态开头：`（你正在外地出差。你刚在路上遇到了一只小动物。）`。
+- `body` 或 `trip` 种类的提示带上抽到的时长（`period` 的不带）：`（你刚出发去外地出差，要待 24 小时。）`。
+- 背景期间抽到的插曲，提示以背景的状态开头：`（你正在外地出差。你刚在路上遇到了一只小动物。）`。经期里抽到的，
+  以 `你正在经期` 开头，有背景时排在背景的状态之后：`（你正在外地出差。你正在经期。你刚在路上遇到了一只小动物。）`。
 
 **情绪化语气。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，
 十六种事件用 `emotional` 语气讲出来：`quarrel`、`scolded_by_superior`、`scolded_superior`、`got_hit`、`hit_someone`、`police_encounter`、`ex_wants_back`、`irritable`、`want_to_quit_job`、`unwell`、`sick`、`period`、`sudden_desire`、`drinking`、`smoking_weed`、`just_have_sex`。这时请求只有情绪化的 system prompt 和提示：没有历史窗口、
@@ -446,10 +454,10 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 ### 持续期间
 
-某一时刻正在进行的事件，是满足 `started_at <= 该时刻 < ends_at` 的那个背景和那件插曲。在聊天里它们到达四个读取方，还有语气的抽取（见[下文](#上班时)）；
+某一时刻正在进行的事件，是满足 `started_at <= 该时刻 < ends_at` 的那个背景和那件插曲，再加上她的经期或月经推迟（见[她的周期](#她的周期)）。在聊天里它们到达四个读取方，还有语气的抽取（见[下文](#上班时)）；
 开启世界系统时，故事导演和世界导演也会读到（见[聊天之外](#聊天之外)）。
 
-- **判官**得到一行 `[近期事件]`，排在 `[需求]` 之后、`[身体状态]` 之前。先列背景，再列插曲，用 `；` 连接，
+- **判官**得到一行 `[近期事件]`，排在 `[需求]` 之后、`[身体状态]` 之前。先列背景，再列她的周期，最后列插曲，用 `；` 连接，
   每项形如 `{label}（{span}前开始，约 {span}后结束）`：
 
   ```
@@ -459,7 +467,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
   不到一小时的跨度读作 `不到 1 小时`（结束那一半此时不带 `约`）；不满 48 小时按整小时四舍五入；
   从 48 小时起按整天四舍五入。`{label}` 是每个种类固定的中文名（`reading` 是 `在看书`，`long_trip` 是
   `长途旅游`）。没有进行中的事件、没有未解释的离线时段、没有等着标记归来的存量分开、也没有未交代的虚惊（见下）时，这一行不出现。
-- **回复**在 `[now]` 块里得到 `- 正在经历：`，排在时间、节日、生日和纪念日几行之后，列出同样两件事，只写结束时间；
+- **回复**在 `[now]` 块里得到 `- 正在经历：`，排在时间、节日、生日和纪念日几行之后，列出同样的事件，只写结束时间；
   下文的 `- 刚才：` 行紧跟其后。两行都不在 `[character_state]` 里：那个块的表头让位于它上面的块，
   放在那里，事件开始之前写下的故事摘要就会盖过事件：
 
@@ -468,7 +476,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
   ```
 
   有没有 LLM 判官都一样。`/open` 开场白和事件消息带同一行。语音通话、群聊轮次和改图的回复 prompt 不读事件。
-- **画图合成器**得到一段 `[此刻状态]`，排在 `[身体状态]` 之后，先列背景、再列插曲的标签，用 `；` 连接：
+- **画图合成器**得到一段 `[此刻状态]`，排在 `[身体状态]` 之后，依次列背景、她的周期、插曲的标签，用 `；` 连接：
 
   ```
   [此刻状态]
@@ -481,7 +489,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
   [合成器](model-config.zh.md#taskschat_image_prompt_compose--出图-prompt-合成器图片轮次必需)。
   聊天请求带的 `user_gender` 是 `male` 或 `female`，且这一段写到的种类里有一种是她和用户一起做的（`traveling_together`、`on_a_date`
   或任何 `…_together` 种类，这一轮被接受的一起做的动作写入的那种也算）时，它后面再跟一段 `[对方]`，写用户的性别，图里画到用户时就按这个性别画。
-- **调用方**从 `GET …/effects` 拿到：`event` 是进行中的插曲，`background_event` 是进行中的背景。
+- **调用方**从 `GET …/effects` 拿到：`event` 是进行中的插曲，`background_event` 是进行中的背景，`cycle_event` 是她的经期或月经推迟。
   进行中的离线类事件和其他插曲一样作为 `event` 返回，带 `"offline": true`；客户端怎么展示由它自己决定。
 
 文字回合按自己那行用户消息的发送时间来读事件，所以被重新驱动的回合看到的是同样的事件。
@@ -596,11 +604,13 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 
 ### 虚惊
 
-`period_scare` 和 `pregnancy_scare` 是两个 `short` 种类，各持续一小时，最后都证明是一场空。它们只对女性角色抽取
-（`period_scare` 从亲密度档 2 起，`pregnancy_scare` 在档 3），`period` 期间都不抽。她把它当作惊吓本身，用一条主动消息讲出来：
+`period_scare` 和 `pregnancy_scare` 是两个 `short` 种类，最后都证明是一场空。`pregnancy_scare` 是持续一小时的插曲，
+只对不是机器的女性角色、在亲密度档 3 抽取。`period_scare` 是月经推迟，属于[她的周期](#她的周期)：从档 2 起，
+只在她的月经该来之前的三天里抽取，持续到那一刻之后的一到三天。它进行期间不算插曲：别的插曲和背景照样会抽到。
+经期里两者都不抽。她把它当作惊吓本身，用一条主动消息讲出来：
 
 ```
-（你发现月经推迟了好几天还没来，心里有点慌。）
+（按日子月经这两天就该来了，身体却一点动静都没有，你心里有点慌。）
 （你刚验了孕，验出两条杠，整个人都懵了。）
 ```
 
@@ -609,12 +619,12 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 
 **事后。** 交代是推算出来的，不存标记。在 session `S` 里，某一时刻若满足下面两条，虚惊 `F` 就是未交代的：
 
-- `F` 是最近 90 天内在 `S` 里讲出、且已经结束的 `period_scare` 或 `pregnancy_scare` 里最新的一次；
+- `F` 是最近 90 天内在 `S` 里讲出的 `period_scare` 或 `pregnancy_scare` 里最后结束的那一次；
 - `S` 里在 `F` 结束之后没有写过带文字的 assistant 消息（只有图的回复不算）。
 
 `F` 未交代期间，在 `S` 里生成的每一条角色消息都带下面这一行，判官的 `[近期事件]` 行末尾会多一项
 `月经没来（{span}前结束，结果是虚惊一场）`（`验出怀孕` 同理）。`F` 结束后写下的第一行带文字的 assistant 消息终结它，只有图的回复不算。
-她的其他 session 从不带它：她是在其中一个里讲的。
+她的其他 session 从不带它：她是在其中一个里讲的。月经推迟结束的那一刻就是她来月经的时候，所以读到这一行时她正在经期里。
 
 ```
 - 刚才：以为月经没来，后来来了，是虚惊一场
@@ -626,6 +636,59 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 ```
 - 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场
 ```
+
+### 她的周期
+
+她的月经按自己的 28 天周期来。除了抽取写下的行，周期什么都不存：每当有读取方读正在进行的事件，就从实例最新的一条
+`period`、最新的一条 `period_scare` 和角色的 `health` 推导出来。
+
+**谁有月经。** 由 [`period`](#角色设置) 键决定。不写时，人类女性有，其他物种的女性没有；`true` 或 `false`
+对不是机器的女性说了算；机器，以及 `gender` 不是 `"female"` 的角色，一律没有。没有月经的角色没有周期，
+不论她的实例里有哪些行。
+
+**第一次月经**和其他 `body` 种类一样抽取，但只在实例还没有 `period` 行时抽，所以只有一次（见[门槛](#门槛)），
+她也像讲任何事件一样讲出来：`（你的月经来了。）`。`health` 为 `strong`、`normal`（或不写）、`weak` 时，分别持续
+1、3、5 天。最新一条 `period` 行的开始时刻是周期的锚点。调用方把 `period` 排除在 `kinds` 之外，她就一直没有周期。
+
+**之后的每一次**都在锚点之后每隔 28 天到期，时刻与锚点相同：按时间点计算，不涉及时区。它在到期时刻开始，
+持续读取那一刻 `health` 给出的天数。它从不写成一行，也从不讲出来：它开始时没有任何调用到 engine，她只是正处在经期里。
+
+**月经推迟。** `period_scare` 只在实例有锚点、亲密度档 2 及以上、下一次月经该来之前的三天里，并且既不在经期、
+也没有推迟在进行时才抽：每个周期至多一次。它在 `short` 内的权重是 0.5，这三天里若有 `having_sex`、`just_have_sex`
+或 `having_sex_together` 开始，就乘 3，不论几次都只乘一次。它持续到到期时刻之后整整一、二或三天，机会均等。
+那一次月经在推迟结束时开始，时长照常；之后的到期时刻不变。它怎么讲出来、怎么交代，见[虚惊](#虚惊)。
+
+**三个槽位。** 某一时刻正在进行的事件至多占三个槽位：插曲、背景（出行，或经期以外的 `body` 状态）和周期
+（经期或月经推迟）。周期与另外两个并行，所以她可以在旅途中来月经。`正在经历`、判官的 `[近期事件]` 和图的
+`[此刻状态]` 都按背景、周期、插曲的顺序列出：
+
+```
+- 正在经历：长途旅游（约 3 天后结束）；月经中（约 2 天后结束）；在看书（约 2 小时后结束）
+```
+
+经期读作 `月经中`；进行中的月经推迟只带标签 `月经没来`。
+
+**经期的作用**，抽到的那一次和推导出的每一次都一样：
+
+- 不抽 `trip` 或 `body` 种类，也不抽 `period_scare` 与 `pregnancy_scare`（见[上文](#同一时间一件插曲一个背景)）；
+- `irritable` 和 `unwell` 在经期里及结束后 48 小时内权重乘 3（见[关联系数](#关联系数)）；
+- 经期里抽到的插曲从经期里讲出来（见[她怎么讲出来](#她怎么讲出来)）；
+- 用户的 `sex_together`、`bath_together`、`hot_spring_together`、`sauna_together` 和 `swim_together`
+  三次里有两次在判官之前就被拒，不付代价（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）；
+- 她不提 `sleep_together` 和 `bathe_together`（见[浪漫选择](#浪漫选择)、[一起洗澡](#一起洗澡)）。
+
+经期不涉及别的：她的需求、语气、好感度，以及她别的请求（`fall_asleep_together`、`propose`、`travel_together`）
+都和平常一样。进行中的月经推迟不起上面任何作用：不排除任何种类，不带出任何种类，也不改变任何动作或请求。
+
+**她生病的频率。** 推导出的经期不开始 `body` 类别的冷却；只有抽到的那一次会。有了锚点之后，`period`
+永远退出抽取，所以每次落在 `body` 都是 `sick`、`hospitalized` 或 `post_surgery`：她生病的频率和没有月经的角色一样。
+
+**在哪里看得到。** `GET …/effects` 把它作为 `cycle_event` 返回，与 `event`、`background_event` 并列。推导出的经期
+没有 `message_id`，`changes_at` 也计入 `cycle_event` 的结束和她下一次月经的开始（见
+[effects 路由](api-reference.zh.md#get-v2compsessionsession_ideffects)）。故事导演和世界导演只读事件行：
+她的第一次月经和任何事件一样会被它们读到，之后的不会，`period` 行也从不是它们读到的那个在途背景（见[聊天之外](#聊天之外)）。
+
+常量和推导在 `crates/eros-engine-core/src/cycle.rs`。
 
 ### 逛街与聚会
 
@@ -639,7 +702,7 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 | `bros_gathering` | 兄弟聚会 | `mid` | 1 | 72 小时 | 2 到 4 小时 | 无 |
 | `sis_gathering` | 姐妹聚会 | `mid` | 1 | 72 小时 | 2 到 4 小时 | 无 |
 
-女性门槛读 `art_metadata.gender`，也就是 `period` 已经在用的那个键。没有任何需求系数作用在它们身上，三个 `mid` 种类
+女性门槛读 `art_metadata.gender`，和 `pregnancy_scare` 的门槛一样。没有任何需求系数作用在它们身上，三个 `mid` 种类
 和其他 `mid` 种类一样可以写进 `prefer_events`。五个都在住院（`hospitalized`）和术后（`post_surgery`）期间排除：她那时不在外面走动。
 `saw_bag`、`saw_clothes` 和 `out_shopping` 只限 `modern` 的角色（见[她的世界](#她的世界)）。
 
@@ -696,7 +759,12 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 这样的一对发来的 `sex_together` 或 `streak_together` 同样如此，机器角色（见[角色设置](#角色设置)）收到的 `toilet_together` 也一样，
 写入的事件不属于她那个世界（见[她的世界](#她的世界)）的动作也一样：不是 `fantasy` 的角色收到的 `fight_together`，`fantasy` 的角色收到的 `cycle_together`；
 其余一起做的动作没有这类规则，`smoke_together`、`smoke_weed_together` 和 `drink_together` 要过习惯掷骰（见下）。
-被拒时 chemistry 线降一档，什么都不写；她的世界排除掉的动作被拒时哪条线都不降；她自己提出的 `bathe_together`（[一起洗澡](#一起洗澡)）及其冷却，不读这些动作，这些动作也不读它们。
+被拒时 chemistry 线降一档，什么都不写；她的世界排除掉的动作、经期掷骰拒掉的动作（见下）被拒时哪条线都不降；她自己提出的 `bathe_together`（[一起洗澡](#一起洗澡)）及其冷却，不读这些动作，这些动作也不读它们。
+
+她的经期里（见[她的周期](#她的周期)），上面的规则没有拒掉的 `sex_together`、`bath_together`、`hot_spring_together`、
+`sauna_together` 或 `swim_together` 要在判官之前掷一次。三次里有两次她拒绝，不管判官怎么答，也不管有没有 LLM 判官：
+判官的 `[用户动作]` 一行末尾加上 `，这次你不会答应`，这次拒绝什么都不写，哪条线都不降。其余那一次照平常交给判官，
+判官判的拒绝照常付代价。月经推迟时不掷。
 
 被接受的动作让她进入一个事件，与存下的回答在同一个事务里写入：
 
@@ -876,7 +944,8 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 - `engine.persona_events` 每个事件一行：`instance_id`（随实例级联删除）、`session_id`（在哪个 session 抽到并讲出来；
   session 没了就置为 NULL）、`event_key`（在 session 内唯一）、`kind`、`started_at`、`ends_at`，以及 `message_id`
   （讲述它的那条消息；她不讲的离线类种类为 NULL，消息没了也置为 NULL）。类别和是否背景由种类推出，不存。
-  种类是当前构建不认识的行，读取时跳过。
+  种类是当前构建不认识的行，读取时跳过。第一次之后的经期没有行（见[她的周期](#她的周期)）；一个部分索引
+  `persona_events_cycle_idx` 用来找实例最新的 `period` 和 `period_scare` 行，不论多久以前。
 - 消息是 `engine.chat_messages` 的一行，带 `metadata.proactive = 'event'`；事件的种类和时间在 `persona_events` 里。
 - 需求存在被评定的用户消息行上，键为 `metadata.needs`，配一个部分索引（`chat_messages_needs_idx`），让读取最新评定
   对每个 session 都是一次索引探测。
@@ -890,7 +959,8 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 并把它们当作既成事实。一起洗澡、一起淋浴、约会，以及 `having_sex_together`、`streaking_together`、`using_toilet_together` 和 `asleep_together` 不在其中：
 和她同睡、洗澡、旅行请求的结果一样，它们只留在对话里。她主动发的消息不进它的聊天证据，所以一件事
 不会被读成她对一句不相干的话的回答。World Memories 导演对名单里的每个角色读在途背景，不论开没开 stories，住院中的角色
-就不会被写进聚会。两位导演都不写事件，也不改上面的角色设置。需求不进其中任何一个。
+就不会被写进聚会。两位导演都只读事件行：她的第一次月经和任何事件一样会被读到，[她的周期](#她的周期)推导出的经期不会，
+`period` 行也从不是它们读到的在途背景。两位导演都不写事件，也不改上面的角色设置。需求不进其中任何一个。
 
 ## 两者如何互相影响
 
@@ -1106,6 +1176,8 @@ engine 不接收性别或性取向，也不判断谁会被谁吸引。
 `confess` 只读 warmth，`partner_up` 只读 patience：warmth 受 chemistry 加成，patience 受 bond 加成，另一条线低于约 0.415 时温暖的回合根本出不来，
 明显一头热的一对就永远不会被问到。*状态变化*指状态真的挪动了的 `relationship` 事件；冷战开始或结束不算。任何形式的回答指接受、拒绝或不理会；过期不算。
 让冷战开始的那一轮会挪动连续起算点，所以 `break_up` 要在它之后再有三个最低档的回合。`propose` 与她的同睡请求同一轮都满足时，触发 `propose`。
+她的经期里（见[她的周期](#她的周期)）她不提 `sleep_together`，也不拿 `fall_asleep_together` 顶替；这个请求等到经期过后的回合再提。
+`propose`，以及状态对应的 `fall_asleep_together`，照常提出。
 
 四种挪动状态的请求，只要状态、等待和连续允许，就可以再提，所以分手之后这一对可以再走一遍。她的同睡请求每种各自只提一次：
 在一个 session 里被用户接受或不理会过的那一种，在那里不会再触发；她在这个 session 或它的约会里答应过用户反过来提的同一件事之后，也不会再触发：
@@ -1144,7 +1216,7 @@ engine 不接收性别或性取向，也不判断谁会被谁吸引。
 `travel_together`：她提议两个人一起去旅行。它和浪漫选择一样是暖向的，但不读这一对的 scope，所以浪漫选择碰不到的一对也可能被问到。
 
 **她什么时候提出。** 在每个被判官评过的 1:1 文字回合之后、所有检查的最后进行，排在浪漫选择和一起洗澡之后，读的是同样已落库、做过时间衰减的状态，
-跑道和 session 条件也一样，冷战期间不提。它要 bond 在第 3 档或以上、最新 3 个被判官评过的回合全都温暖，并且没有背景事件在进行。
+跑道和 session 条件也一样，冷战期间不提。它要 bond 在第 3 档或以上、最新 3 个被判官评过的回合全都温暖，并且没有背景事件在进行；她的经期不是背景（见[她的周期](#她的周期)）。
 被接受或不理会过的 `travel_together`，从结算时起 14 天内不再提出；被拒绝或过期后，等这个 session 有了新的连续就可以再提。
 同一轮前面的种类也满足时，它们先走，待回答的请求会占住跑道。
 
@@ -1174,7 +1246,8 @@ engine 不接收性别或性取向，也不判断谁会被谁吸引。
 
 - 这一对在浪漫上相容，判法与浪漫选择相同；
 - `hygienic` 为 `true` 的角色 chemistry 在第 2 档或以上，不写这个键的角色在第 3 档或以上；`hygienic` 为 `false` 的角色从不提出；
-- 最新的 7 个被判官评过的回合里至少 3 个 `warmth` 达到 0.5，值读自该回合的 `state_after`。不读 patience；0.5 是 engine 自己的规则阈值，不是判官的档。和所有选择一样，只有该 session 连续起算点之后的回合才计数。
+- 最新的 7 个被判官评过的回合里至少 3 个 `warmth` 达到 0.5，值读自该回合的 `state_after`。不读 patience；0.5 是 engine 自己的规则阈值，不是判官的档。和所有选择一样，只有该 session 连续起算点之后的回合才计数；
+- 她不在经期里（见[她的周期](#她的周期)）。
 
 被接受或不理会过的 `bathe_together`，从结算时起 7 天内不再提出；被拒绝或过期后，下一个满足条件的回合就会再提。
 
@@ -1233,8 +1306,9 @@ engine 不接收性别或性取向，也不判断谁会被谁吸引。
 ## 代码指引
 
 - `crates/eros-engine-core/src/needs.rs`：水平、漂移常量、`Habits`、`carried`、`after_give`（give 的挪动）。
-- `crates/eros-engine-core/src/pde.rs`：`refuses_give` 与 `UNUSED_SUBSTANCE_ACCEPT`，即 give 时掷的那一次。
-- `crates/eros-engine-core/src/events.rs`：类别和种类、每个种类的规则、门槛、需求与角色系数、`is_offline` 与 `is_told`、`draw`、`lookback`。
+- `crates/eros-engine-core/src/pde.rs`：`refuses_give` 与 `UNUSED_SUBSTANCE_ACCEPT`，即 give 时掷的那一次；`period_refuses` 与 `PERIOD_ACCEPT`，即经期里掷的那一次。
+- `crates/eros-engine-core/src/events.rs`：类别和种类、每个种类的规则、门槛、需求与角色系数、`is_offline` 与 `is_told`、`slot`、`draw`、`lookback`。
+- `crates/eros-engine-core/src/cycle.rs`：她的周期、`state`、`next_period_start` 与各常量。
 - `crates/eros-engine-server/src/routes/session_events.rs`：events 路由、抽取的输入、离线类的两道门槛。
 - `crates/eros-engine-server/src/routes/life_choices.rs`：结算端点。
 - `crates/eros-engine-server/src/routes/bff/affinity.rs`：delta 上的 `life_choice` 字段。
@@ -1255,4 +1329,4 @@ engine 不接收性别或性取向，也不判断谁会被谁吸引。
 - `crates/eros-engine-store/src/life_choices.rs::LifeChoiceRepo`：选择行、`pending`、`resolve_in_tx`、`settled`、`settled_since`、`answered_since`、`streak_anchor`。
 - `crates/eros-engine-store/src/affinity.rs::AffinityRepo`：`persist_life_choice_drop_in_tx`、`last_judged_endpoints`、`latest_status_change`、`write_relationship_in_tx`、`set_cold_war`。
 - `crates/eros-engine-store/src/chat.rs::ChatRepo`：`set_needs` 与 `latest_needs`；`latest_scopes`，浪漫选择据以判断一对关系的 scope。
-- `crates/eros-engine-store/migrations/0000_baseline.sql`：事件表与选择表、needs 索引，以及放宽后的 affinity `event_type` 检查（由 baseline 之前的迁移链折叠而来）。
+- `crates/eros-engine-store/migrations/0000_baseline.sql`：事件表与选择表、needs 索引，以及放宽后的 affinity `event_type` 检查（由 baseline 之前的迁移链折叠而来）；`0089_persona_events_cycle_idx.sql`：周期用的索引。

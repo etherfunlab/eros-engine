@@ -169,6 +169,7 @@ PDE が決めたゴーストターンは `persist_with_event` に到達しない
 - **拒否されたチップ：** `tip` はラインを下げない。返信はジャッジの判定に従い、ターンは通常どおり採点される。
 - **ソーシャルアクション：** 拒否された `bluff`・`threaten`・`trick` は見抜いたことを意味し、拒否された `challenge`・`bet` は受けて立たなかったことを意味する。どれもやはりラインを下げない。ターンは通常どおり採点される。
 - **脱衣：** `affinity_scope` が恋愛的に相容れないペアからの `strip` は、ジャッジの判定にかかわらず拒否となり、拒否された身体的アクションと同じく Chemistry を一段下げる。そのようなペアからの `shower_together`・`bath_together`・`sex_together`・`streak_together` も同様であり、機械のペルソナへの `toilet_together` も拒否となる。`setting` が `fantasy` でないペルソナへの `fight_together` と、`setting` が `fantasy` のペルソナへの `cycle_together` も同じく拒否となるが、ラインは下げない。ほかの一緒にするアクションにはこの規則がない。習慣のロールで断られた `smoke_together`・`smoke_weed_together`・`drink_together` も Chemistry を一段下げ、Bond は下げない。
+- **生理期：** 生理期のあいだ、上の規則で拒否されなかった `sex_together`・`bath_together`・`hot_spring_together`・`sauna_together`・`swim_together` は、3 回に 2 回、ジャッジの前にロールで拒否となり([her cycle](life-events-needs.md#her-cycle) を参照)、ラインは下げない。残りの 1 回は通常どおりジャッジが決める。
 - **プロポーズと別れ話：** 断られた `propose` や `break_up` はラインを下げず、ターンは通常どおり採点される。関係ステータスが `dating`・`fwb`・`situationship` 以外のときの `propose` と、別れられないステータスのときの `break_up` は、ジャッジの前に同じく拒否となる。回答されたものは[関係ステータス](#6-関係ステータス)を動かす。
 - **ギフト：** 受け取られると、キャラクターの持ち物かワードローブにも加わる。断られると何も加わらず、断られた `give` と同じく Bond が一段下がる。
 - **デート：** 断られた `date` の誘いはラインを下げず、ターンは通常どおり採点される。受け入れられた誘いは採点されない。その誘いがデートを開き、デートは精算時に一度だけ評価される([下記](#デート)を参照)。

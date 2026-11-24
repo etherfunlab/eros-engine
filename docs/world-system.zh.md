@@ -194,7 +194,7 @@ Stories 需要**全部条件**同时成立——且按构造骑在 World Memorie
 | 亲密度快照 | 最新会话的六轴 + bond + chemistry + 两条线的档位名——仅供参考——以及它的[关系状态](affinity-model.zh.md#关系状态)和冷战标记，这两项是引擎记录的事实 |
 | 聊天证据 | 该 (owner, instance) 最近 `context_days`（默认 7 天）内的「用户→回复」配对，按轮数上限截断；角色主动发的消息（事件消息、生活选择的消息、问候）不算证据，[约会](activities.zh.md)里的回合也不算 |
 | 生活事件（30 条） | 同一窗口内开始的、以及此刻仍在进行的 `persona_events`：标签、类别、相对时间（`3 天前开始，持续 2 小时`），讲述过的附上她讲述时的原文。`taking_space` / `fell_out` 只取未归档会话里的；讲述原文在已归档会话里的不给原文；虚惊要结束后才给，并带上结果；`bathing_together`、`showering_together`、`having_sex_together`、`streaking_together`、`using_toilet_together`、`asleep_together` 和 `on_a_date` 一律不给，它们只留在对话里 |
-| 在途背景 | 上述生活事件里此刻仍在进行的那个背景，单独再列一次 |
+| 在途背景 | 上述生活事件里此刻仍在进行的那个背景（出行或生病，从不是 `period`），单独再列一次 |
 | 关系选择（10 条） | 这对关系未归档会话里、窗口内种类为 `confess`、`partner_up`、`propose`、`break_up` 的 `life_choices`，以及存量的 `ask_for_space`：她的原话和结果（同意，存量的分开再带上分开多久；拒绝；忽略；一直没回；还在等） |
 
 | 输出 | 去向 |
@@ -240,7 +240,7 @@ Voyage 调用。该层一旦启用，注入**默认开启**；`WORLD_STORIES_PRO
 World Stories（角色个人生活）  →  World Memories（角色↔角色关系图谱）  →  World Town（舞台）
 ```
 
-另外，不论 owner 开没开 stories，导演回合时有背景生活事件在进行（出差、生病、住院）的角色，
+另外，不论 owner 开没开 stories，导演回合时有背景生活事件在进行（出差、生病、住院；她的经期不算）的角色，
 条目里会带 `current_background`，如 `住院（1 天前开始，约 3 天后结束）`，并加一条固定规则，
 要求剧本与之一致。名单里没有任何角色在途背景时，两者都不出现。
 

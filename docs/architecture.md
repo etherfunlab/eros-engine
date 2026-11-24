@@ -187,6 +187,7 @@ crates/
 ├── eros-engine-core/
 │   └── src/
 │       ├── affinity.rs       # 6-dim vector + grade pipeline + time decay + labels
+│       ├── cycle.rs          # her 28-day cycle, derived from her event rows
 │       ├── effects.rs        # lingering effects of an accepted give (curves + active_effects)
 │       ├── events.rs         # life event categories, kinds and the two-stage draw
 │       ├── ghost.rs          # score formula + 4-tier protection
@@ -196,6 +197,7 @@ crates/
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
 │       ├── relationship.rs   # relationship status, cold-war streaks, composed relation
 │       ├── scope.rs          # per-request injection scope (InsightMode / MemoryScope)
+│       ├── tone.rs           # the chat tone a turn draws (default / emotional / focused)
 │       └── types.rs          # ActionType / Event / DecisionInput / ConversationSignals
 ├── eros-engine-llm/
 │   └── src/

@@ -32,7 +32,7 @@ about how the pieces work and how they fit together.
 | Judge sees | the `[需求]` line | the `[近期事件]` line |
 | Reply sees | `- 此刻的需要：…` | `- 正在经历：…` and `- 刚才：…` |
 | Picture composer sees | — | the `[此刻状态]` section |
-| Caller gets | `needs` on the `body_state` frame and on `GET …/effects` | the events route response; `event` and `background_event` on `GET …/effects` |
+| Caller gets | `needs` on the `body_state` frame and on `GET …/effects` | the events route response; `event`, `background_event` and `cycle_event` on `GET …/effects` |
 
 Voice calls read needs and no events. Group turns read neither in the reply; only a group picture's composer reads the speaker's events. Details follow.
 
@@ -200,7 +200,8 @@ again shows the judge the same line.
   sent when a give's effect is at work or needs are known, and re-sent on an idempotent
   replay. `GET …/effects` returns them carried to the moment of the call, or `null` with no
   rating or no judge, and its `changes_at` says when the response next changes on its own: a
-  need's next step or the end of an event under way; `as_of` is the instant it was computed
+  need's next step, the end of an event under way or the start of her next period
+  ([her cycle](#her-cycle)); `as_of` is the instant it was computed
   for, so a client can count the wait as a duration. See
   [the message stream](api-reference.md#post-compchatsession_idmessagestream) and
   [the effects route](api-reference.md#get-v2compsessionsession_ideffects).
@@ -232,7 +233,9 @@ shape:
 
 An **incident** is a foreground event: she is called in to work, an ex texts, she is reading,
 in the shower, not looking at her phone. A **background** is a state that lasts days (a trip,
-an illness, her period) and incidents still happen inside it. The kinds, their durations and
+an illness) and incidents still happen inside it. `period` and `period_scare` keep their
+categories, `body` and `short`, but while they last they are neither: they are
+[her cycle](#her-cycle), which has a slot of its own. The kinds, their durations and
 what each means are in
 [the events route](api-reference.md#post-v2compsessionsession_idevents). Per-kind weights,
 cooldowns and ranges are in `rule`, and the category values in `category_rule`, in
@@ -288,7 +291,8 @@ the length).
    [`sex_addict`](#persona-settings), [`hygienic`](#persona-settings),
    [`employed`](#persona-settings), [`outdoorsy`](#outdoors-or-in)). A second roll picks
    one.
-4. **Duration.** A fixed length is taken as is; a range is rolled.
+4. **Duration.** A fixed length is taken as is; a range is rolled. `period` and `period_scare`
+   take theirs from [her cycle](#her-cycle).
 
 No eligible kind means no event: the response is `{"event": null, "message": null}`. Whenever
 some kind is eligible, the draw yields an event. How eventful her day is follows from when the
@@ -301,16 +305,18 @@ eligible kind drops out of the first stage and the others share its weight.
 
 ### One incident and one background at a time
 
-- While an incident is under way no draw happens at all, not even for a background.
+- While an incident is under way no draw happens at all, not even for a background. A
+  `period_scare` under way is not an incident and stops nothing ([her cycle](#her-cycle)).
 - While a background is under way, no second background is drawn. Incidents still are, except
   that during `hospitalized` and `post_surgery` the ones that need her out and about are not:
   `temp_work`, `police_encounter`, `animal_encounter`, `hit_someone`, `got_hit`,
   `working_out`, `on_the_way`, `in_battle`, `got_bumped`, `saw_bag`, `saw_clothes`,
   `out_shopping`, `bros_gathering`, `sis_gathering`, `admiring_scenery`, `admiring_art`,
   `watching_show`, `on_the_road`, `having_sex`, `bird_encounter`, `streaking`, `got_lost`,
-  `drinking`, `smoking`, `smoking_weed`, `just_have_sex`. During `period`,
-  `period_scare` and `pregnancy_scare` are not drawn. During `traveling_together` no kind that
-  can take her offline is drawn, nor `just_have_sex`: she is with the user.
+  `drinking`, `smoking`, `smoking_weed`, `just_have_sex`. During `traveling_together` no kind
+  that can take her offline is drawn, nor `just_have_sex`: she is with the user.
+- During her period no background is drawn either, nor `period_scare` or `pregnancy_scare`
+  ([her cycle](#her-cycle)).
 - Ten kinds need a background rather than being ruled out by one. `got_lost` and `on_a_cruise`
   are drawn only while a `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` is
   under way, never on a `business_trip` or outside a trip. `missed_ride`, `on_the_way`,
@@ -326,10 +332,12 @@ eligible kind drops out of the first stage and the others share its weight.
   ([activities.md](activities.md#what-pauses)). A repeat of an `event_key` still returns its
   event.
 - This is per persona instance across all its sessions: she has one life. A draw reads the
-  instance's events of the last 90 days, the longest cooldown there is.
+  instance's events of the last 90 days, the longest cooldown there is, and for her cycle the
+  newest `period` and `period_scare` rows, however old.
 
 The write enforces the same rule atomically: an incident is not written while another incident
-is under way, and a background is not written while any event is.
+is under way, and a background is not written while any event is. A `period_scare` under way
+counts as neither.
 
 ### Cooldowns and caps
 
@@ -364,10 +372,10 @@ weight and never lifts a gate.
 | `missed_ride`, `on_the_way`, `on_the_road`, `on_a_boat`, `on_a_bus`, `on_a_train`, `on_a_plane`, `driving` | a `business_trip`, `short_trip`, `long_trip`, `hometown_visit` or `traveling_together` under way |
 | `strip`, `streaking` | intimacy rung 3, and the session's newest recorded `affinity_scope` is romance-compatible (a chemistry axis in scope); none recorded is not compatible |
 | `saw_bag`, `saw_clothes` | the persona's `art_metadata.gender` is `"female"` |
-| `period` | the persona's `art_metadata.gender` is `"female"`, and she is not a machine (`art_metadata.species` `"robot"` or `"android"`) |
+| `period` | she has a period ([`period`](#persona-settings)), and the instance has no `period` yet ([her cycle](#her-cycle)) |
 | `want_to_quit_job` | the persona's `art_metadata.employed` is not `"free"` |
-| `period_scare` | the persona's `art_metadata.gender` is `"female"`, she is not a machine, and intimacy rung 2 or higher |
-| `pregnancy_scare` | the persona's `art_metadata.gender` is `"female"`, she is not a machine, and intimacy rung 3 |
+| `period_scare` | she has a period, intimacy rung 2 or higher, and her next period is due within three days ([her cycle](#her-cycle)) |
+| `pregnancy_scare` | the persona's `art_metadata.gender` is `"female"`, she is not a machine (`art_metadata.species` `"robot"` or `"android"`), and intimacy rung 3 |
 | `using_toilet` | she is not a machine |
 | `having_sex` | the persona's `art_metadata.sex_addict` is `true` |
 | `away_from_phone`, `busy`, `in_battle`, `asleep`, `bros_gathering`, `sis_gathering`, `having_sex`, and `out_shopping` for a female persona | the ghost protections allow it (see [below](#offline-kinds)) |
@@ -383,13 +391,13 @@ The rung (1 to 3) is read from the session's affinity, time-decayed as in a chat
 
 ### Persona settings
 
-Sixteen keys in the persona genome's `art_metadata`, read by the engine and written by whoever
+Seventeen keys in the persona genome's `art_metadata`, read by the engine and written by whoever
 authors the persona, sit beside `gender`, `birthday` and `timezone`:
 
 | key | value | effect |
 |---|---|---|
 | `prefer_events` | array of `mid` kinds | each listed kind weighs 3 times as much within `mid` |
-| `health` | `"weak"`, `"normal"` (default), `"strong"` | the `body` category weighs 2 times, 1 time, half as much |
+| `health` | `"weak"`, `"normal"` (default), `"strong"` | the `body` category weighs 2 times, 1 time, half as much; her period lasts 5, 3, 1 days ([her cycle](#her-cycle)) |
 | `prefer_trip` | `true`, `false` (default) | the `trip` category weighs 3 times as much |
 | `homesick` | `true`, `false`, absent (default) | within `trip`: `true` weighs `hometown_visit` 3 times and `short_trip` / `long_trip` a third; `false` weighs `hometown_visit` a third; `business_trip` is work and untouched either way |
 | `is_virgin` | `true`, `false` (default) | while she is a virgin, `having_sex` weighs a fifth within `mid` and `just_have_sex` a fifth within `short` |
@@ -398,7 +406,8 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` weigh a third, 1 time, 3 times within their categories; a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time`. `full_time` also makes her career-minded: with `tones.focused` above 0, a turn that may draw a tone, off work and with no incident under way, is `focused` 1 time in 8 ([at work](#at-work)) |
 | `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | within each category, `outdoor` weighs the outdoor kinds 3 times and the indoor kinds a third, `indoor` the reverse; neutral kinds are untouched ([below](#outdoors-or-in)); any other value reads as `neutral` |
 | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in ([below](#her-world)); a persona that is not `fantasy` refuses the user's `fight_together`, and a `fantasy` one the user's `cycle_together` ([together actions](#showering-bathing-and-the-sauna-together)); any other value reads as `modern` |
-| `species` | any word | `"robot"` and `"android"` are machines: she never draws `period`, `period_scare`, `pregnancy_scare` or `using_toilet`, and refuses the user's `toilet_together` ([together actions](#showering-bathing-and-the-sauna-together)); every other word leaves the draw alone. What the word does to the prompt is in [eros-character-v1.1.md](eros-character-v1.1.md) |
+| `species` | any word | `"robot"` and `"android"` are machines: she has no period, never draws `pregnancy_scare` or `using_toilet`, and refuses the user's `toilet_together` ([together actions](#showering-bathing-and-the-sauna-together)). Any other word but `"human"` gives her no period unless `period` is `true`, and leaves the rest of the draw alone. What the word does to the prompt is in [eros-character-v1.1.md](eros-character-v1.1.md) |
+| `period` | `true`, `false`, absent (default) | whether she has a period ([her cycle](#her-cycle)). Absent: a female human (`species` absent, blank or `"human"`) has one, a female of any other species none. `true` or `false` decides for a female who is not a machine; a machine, and a persona whose `gender` is not `"female"`, never has one |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee, loves good food (`false`: she keeps off rich food): how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing, or the user's ask to smoke, smoke weed or drink with her (below); `smoking`, `alcoholic` and `drug` set to `true` also let her draw `smoking`, `drinking` and `smoking_weed` |
 
 `prefer_trip` says whether she moves at all; `homesick` says where she goes when she does. A
@@ -433,9 +442,9 @@ no gate, cooldown or length, nor how often each category comes up.
 
 Reads are lenient. A value of the wrong type reads as absent; in `prefer_events`, an entry that
 is not a known `mid` kind is dropped and the rest are kept. `health` scales the whole `body`
-category, `period` included, and `period`'s own 28-day cooldown keeps it near monthly either
-way. `prefer_trip` raises the odds of a trip, not its frequency: the weekly category cooldown
-holds.
+category and sets how long her period lasts; after her first period, the one the draw gives
+her, the rest come on [her cycle](#her-cycle). `prefer_trip` raises the odds of a trip, not
+its frequency: the weekly category cooldown holds.
 
 The five habit keys reach the draw through the drift of `indulgence`, and three of them
 (`smoking`, `alcoholic`, `drug`) also gate the habit kinds
@@ -471,8 +480,8 @@ Her day hangs together: an event that is **live** makes the kinds that follow it
 likelier. A prior is live while it is under way, or for 48 hours after it ended. In the
 second stage of the draw, a kind weighs 3 times as much for every distinct live prior that
 leads to it; two live priors make it 9 times. The factor never lifts a gate (a live `sick`
-makes `period_scare` likelier only for a female persona at rung 2 or above), never touches
-the first stage, and does not shorten a cooldown.
+makes `period_scare` likelier only where [her cycle](#her-cycle) lets it be drawn), never
+touches the first stage, and does not shorten a cooldown.
 
 | live prior | kinds weighed 3 times |
 |---|---|
@@ -484,7 +493,7 @@ the first stage, and does not shorten a cooldown.
 | `short_trip`, `long_trip`, `hometown_visit`, `traveling_together` | `on_the_road`, `admiring_scenery`, `taking_selfie` |
 | `hometown_visit` | `bros_gathering`, `sis_gathering` |
 | `hospitalized`, `post_surgery` | `reading`, `gaming` |
-| `period` | `irritable`, `unwell` |
+| her period, the `period` row or one [her cycle](#her-cycle) derives | `irritable`, `unwell` |
 | `breakup`, `quarrel`, `scolded_by_superior`, `in_battle` | `irritable` |
 | `got_hit`, `got_bumped` | `unwell` |
 | `working_out` | `showering`, `bathing` |
@@ -492,6 +501,10 @@ the first stage, and does not shorten a cooldown.
 | `scolded_by_superior`, `temp_work` | `want_to_quit_job` |
 | `breakup`, `quarrel`, `want_to_quit_job` | `pondering_life` |
 | `pondering_life` | `want_to_see_sea` |
+
+`period_scare` also weighs 3 times, once however many, when a `having_sex`, `just_have_sex` or
+`having_sex_together` started in the three days before her period is due
+([her cycle](#her-cycle)).
 
 One kind is weighed down rather than ruled out while what leads to it has never happened:
 `pregnancy_scare` weighs a fifth while the instance has no `having_sex`, `just_have_sex` or
@@ -553,10 +566,12 @@ of the request. The cue is never persisted. It states a fact and carries no inst
 She fills in the rest (what work, what the ex wrote, which animal) from her persona and her
 world. Two cue variants:
 
-- A background's cue carries its drawn length (`period`'s does not):
+- A `body` or `trip` kind's cue carries its drawn length (`period`'s does not):
   `（你刚出发去外地出差，要待 24 小时。）`.
 - An incident drawn during a background opens with the background's state:
-  `（你正在外地出差。你刚在路上遇到了一只小动物。）`.
+  `（你正在外地出差。你刚在路上遇到了一只小动物。）`. During her period it opens with
+  `你正在经期`, after the background's state when there is one:
+  `（你正在外地出差。你正在经期。你刚在路上遇到了一只小动物。）`.
 
 **In the emotional tone.** While the deployment has
 [`tones.emotional`](model-config.md#tones--chat-tones-chat-task-only) above 0, sixteen kinds
@@ -588,12 +603,13 @@ Then:
 ### While it lasts
 
 The events under way at a moment are the background and the incident whose
-`started_at <= moment < ends_at`. They reach four readers in the chat, and the tone draw
+`started_at <= moment < ends_at`, and her period or a late period ([her cycle](#her-cycle)).
+They reach four readers in the chat, and the tone draw
 ([below](#at-work)); with the world system
 on, the story and world directors read them too ([Beyond the chat](#beyond-the-chat)).
 
 - **The judge** gets one `[近期事件]` line, after `[需求]` and before `[身体状态]`. It lists the
-  background, then the incident, joined by `；`, each as
+  background, her cycle, then the incident, joined by `；`, each as
   `{label}（{span}前开始，约 {span}后结束）`:
 
   ```
@@ -606,7 +622,7 @@ on, the story and world directors read them too ([Beyond the chat](#beyond-the-c
   when nothing is under way, no offline stretch is unexplained, no stored separation awaits its
   return mark and no false alarm is unresolved (below).
 - **The reply** gets `- 正在经历：` under `[now]`, after the time, holiday, birthday and anniversary lines,
-  listing the same two events with only the end. The `- 刚才：` line below follows it. Both sit
+  listing the same events with only the end. The `- 刚才：` line below follows it. Both sit
   outside `[character_state]`, whose header defers to the blocks above it, so a story digest
   written before an event started does not override the event:
 
@@ -617,7 +633,7 @@ on, the story and world directors read them too ([Beyond the chat](#beyond-the-c
   This works with or without the LLM judge. `/open` greetings and event messages carry the same
   line. The reply prompts of voice calls, group turns and image edits read no events.
 - **The image composer** gets one `[此刻状态]` section, after `[身体状态]`, with the labels of the
-  background and then the incident, joined by `；`:
+  background, her cycle and then the incident, joined by `；`:
 
   ```
   [此刻状态]
@@ -635,9 +651,10 @@ on, the story and world directors read them too ([Beyond the chat](#beyond-the-c
   names is one she shares with the user (`traveling_together`, `on_a_date` or any `…_together`
   kind, the one an accepted together action places this turn included), a `[对方]` section after
   it gives the user's gender, so a picture that shows the user draws them as it.
-- **The caller** gets them from `GET …/effects`: `event` is the incident under way, and
-  `background_event` the background. An offline kind under way is reported as `event`
-  like any incident, with `"offline": true`; how a client shows it is its call.
+- **The caller** gets them from `GET …/effects`: `event` is the incident under way,
+  `background_event` the background, and `cycle_event` her period or a late period. An offline
+  kind under way is reported as `event` like any incident, with `"offline": true`; how a client
+  shows it is its call.
 
 A text turn reads the events as of its own user row's send time, so a turn that is driven
 again sees the same ones.
@@ -779,13 +796,16 @@ has two wordings of its own
 
 ### False alarms
 
-`period_scare` and `pregnancy_scare` are two `short` kinds, an hour long, that turn out to be
-nothing. They are gated on a female persona (`period_scare` from intimacy rung 2,
-`pregnancy_scare` at rung 3), and neither is drawn during `period`. She tells each as the
-scare itself, in one proactive message:
+`period_scare` and `pregnancy_scare` are two `short` kinds that turn out to be nothing.
+`pregnancy_scare` is an hour-long incident, drawn for a female persona who is not a machine, at
+intimacy rung 3. `period_scare` is a late period and part of [her cycle](#her-cycle): drawn from
+rung 2, only in the three days before her period is due, it lasts until one to three days after
+that moment. While it lasts it is no incident: other incidents and backgrounds are drawn
+during it. Neither is drawn during her period. She tells each as the scare itself, in one
+proactive message:
 
 ```
-（你发现月经推迟了好几天还没来，心里有点慌。）
+（按日子月经这两天就该来了，身体却一点动静都没有，你心里有点慌。）
 （你刚验了孕，验出两条杠，整个人都懵了。）
 ```
 
@@ -796,15 +816,16 @@ offline and answers as usual.
 **Afterwards.** The resolution is derived, not flagged. In a session `S`, a false alarm `F`
 is unresolved at a moment when:
 
-- `F` is the newest `period_scare` or `pregnancy_scare` told in `S` that has ended, within the
-  last 90 days;
+- `F` is the `period_scare` or `pregnancy_scare` told in `S` that ended last, within the last
+  90 days;
 - `S` holds no assistant row with text written since `F` ended (an image-only reply does not
   count).
 
 While `F` is unresolved, every persona message generated in `S` carries the line below, and
 the judge's `[近期事件]` line ends with `月经没来（{span}前结束，结果是虚惊一场）` (or the
 same with `验出怀孕`). The first assistant row with text written after `F` ended closes it. Her other
-sessions never carry it: she told it in one.
+sessions never carry it: she told it in one. A late period ends the moment her period starts,
+so its aftermath is read while she is on her period.
 
 ```
 - 刚才：以为月经没来，后来来了，是虚惊一场
@@ -818,6 +839,78 @@ items in the same order:
 - 刚才：睡着了，对方那时发来的消息你现在才看到；以为月经没来，后来来了，是虚惊一场
 ```
 
+### Her cycle
+
+Her period comes on a 28-day cycle of her own. Nothing of it is stored beyond the rows the draw
+writes: whenever something reads what is under way, the cycle is derived from the instance's
+newest `period` row, its newest `period_scare` row and the persona's `health`.
+
+**Who has one.** The [`period`](#persona-settings) key decides. Absent, a female human has a
+period and a female of any other species does not; `true` or `false` decides for a female who
+is not a machine; a machine, and a persona whose `gender` is not `"female"`, never has one. A
+persona with no period has no cycle, whatever rows her instance holds.
+
+**The first period** is drawn like any `body` kind, but only while the instance has no `period`
+row, so once ([gates](#gates)), and she tells it as any event: `（你的月经来了。）`. It lasts 1, 3
+or 5 days for `health` `strong`, `normal` (or absent), `weak`. The start of the newest `period`
+row is the cycle's anchor. A caller that keeps `period` out of `kinds` keeps her without a cycle.
+
+**Every later period** is due every 28 days after the anchor, at the anchor's time of day: the
+arithmetic is on instants and no time zone takes part. It starts on its due moment and lasts
+the days `health` gives at the moment it is read. It is never written as a row and never told:
+nothing calls the engine when it starts, and she is simply in it.
+
+**A late period.** `period_scare` is drawn only when the instance has an anchor, at intimacy
+rung 2 or more, in the three days before her next period is due, and while neither her period
+nor a scare is under way: at most once a cycle. Its weight in `short` is 0.5, tripled once
+(however many) when a `having_sex`, `just_have_sex` or `having_sex_together` started in those
+three days. It lasts until one, two or three whole days after the due moment, at even odds. That
+period starts when the scare ends and lasts as any other; the due moments after it do not move.
+How the scare is told and resolved is in [false alarms](#false-alarms).
+
+**Three slots.** What is under way at a moment fills at most three slots: the incident, the
+background (a trip, or a `body` state other than her period) and the cycle (her period or a late
+period). The cycle runs beside the other two, so she can have her period on a trip.
+`正在经历`, the judge's `[近期事件]` and the picture's `[此刻状态]` list them as background,
+cycle, incident:
+
+```
+- 正在经历：长途旅游（约 3 天后结束）；月经中（约 2 天后结束）；在看书（约 2 小时后结束）
+```
+
+Her period reads `月经中`; a late period under way is its label alone, `月经没来`.
+
+**What her period does**, the drawn one and every derived one alike:
+
+- no `trip` or `body` kind is drawn, nor `period_scare` or `pregnancy_scare`
+  ([above](#one-incident-and-one-background-at-a-time));
+- `irritable` and `unwell` weigh 3 times while it lasts and for 48 hours after
+  ([follow-on factors](#follow-on-factors));
+- an incident drawn during it is told from inside it ([how she tells it](#how-she-tells-it));
+- the user's `sex_together`, `bath_together`, `hot_spring_together`, `sauna_together` and
+  `swim_together` are refused two times in three before the judge, at no cost
+  ([together actions](#showering-bathing-and-the-sauna-together));
+- she does not ask `sleep_together` or `bathe_together`
+  ([the romantic choices](#the-romantic-choices), [a bath together](#a-bath-together)).
+
+Her period touches nothing else: her needs, her tone, the affinity and her other asks
+(`fall_asleep_together`, `propose`, `travel_together`) are as on any day. A late period under
+way rules nothing out, leads to nothing and changes no action or ask.
+
+**Her illness rate.** A derived period does not start the `body` category's cooldown; only the
+drawn one does. Once she has an anchor, `period` is out of the draw for good, so every `body`
+pick is `sick`, `hospitalized` or `post_surgery`: she falls ill as often as a persona with no
+period.
+
+**Where it shows.** `GET …/effects` carries it as `cycle_event`, beside `event` and
+`background_event`. A derived period has no `message_id`, and `changes_at` counts the end of
+`cycle_event` and the start of her next period
+([the effects route](api-reference.md#get-v2compsessionsession_ideffects)). The story and world
+directors read event rows only: they hear of her first period like any event and of no later
+one, and a `period` row is never the background they read ([beyond the chat](#beyond-the-chat)).
+
+The constants and the derivation are in `crates/eros-engine-core/src/cycle.rs`.
+
 ### Shopping and gatherings
 
 Five kinds give her an afternoon of her own and, for a close relationship, something to want:
@@ -830,7 +923,7 @@ Five kinds give her an afternoon of her own and, for a close relationship, somet
 | `bros_gathering` | 兄弟聚会 | `mid` | 1 | 72 h | 2 to 4 h | none |
 | `sis_gathering` | 姐妹聚会 | `mid` | 1 | 72 h | 2 to 4 h | none |
 
-The female gate reads `art_metadata.gender`, the key `period` already uses. No needs factor
+The female gate reads `art_metadata.gender`, as `pregnancy_scare`'s does. No needs factor
 touches them, and the three `mid` kinds join `prefer_events`' vocabulary like any `mid` kind.
 All five are ruled out during `hospitalized` and `post_surgery`: she is not out and about.
 `saw_bag`, `saw_clothes` and `out_shopping` fit a `modern` persona only ([her world](#her-world)).
@@ -909,9 +1002,16 @@ for a persona that is not `fantasy`, a `cycle_together` for one that is. She ref
 the judge answers, with or without the LLM judge. The other together actions
 have no such rule; `smoke_together`, `smoke_weed_together` and `drink_together` take the habit
 roll (below). A refusal places nothing and drops the chemistry line a tier, but an action her
-world rules out drops no line; her own
+world rules out, or one her period refuses (below), drops no line; her own
 `bathe_together` ask ([a bath together](#a-bath-together)) and its cooldown neither read these
 actions nor are read by them.
+
+During her period ([her cycle](#her-cycle)), a `sex_together`, `bath_together`,
+`hot_spring_together`, `sauna_together` or `swim_together` that the rules above have not
+refused is rolled before the judge. Two times in three she refuses, whatever the judge answers
+and with or without the LLM judge: the judge's `[用户动作]` line ends with `，这次你不会答应`,
+and the refusal places nothing and drops no line. The other third goes to the judge as on any
+day, and a refusal it decides costs as usual. A late period rolls nothing.
 
 An accepted one puts her in an event, written in the same transaction as the stored answer:
 
@@ -1133,7 +1233,9 @@ offline kind or a date is under way.
   (unique within the session), `kind`, `started_at`, `ends_at` and `message_id` (the message
   that tells it; NULL for an offline kind she does not announce, and set to NULL if the message goes). Category and
   background-ness derive from the kind and are not stored. A row whose kind the build does not
-  know is skipped on read.
+  know is skipped on read. Her periods after the first have no row
+  ([her cycle](#her-cycle)); a partial index, `persona_events_cycle_idx`, finds an instance's
+  newest `period` and `period_scare` rows however old they are.
 - The message is a row of `engine.chat_messages` with `metadata.proactive = 'event'`; the
   event's kind and times live in `persona_events`.
 - Needs live on the rated user row, as `metadata.needs`, with a partial index
@@ -1153,7 +1255,9 @@ their outcome. It takes them as settled fact. A bath together, a shower together
 left out: like the outcome of her sleep, bath and trip asks, they live in the conversation only. The messages she sends on her own are not part of its chat evidence, so
 an event is never read as her answer to an unrelated line. The World Memories director reads a
 background under way for every persona in the roster, stories or not, so a persona in hospital
-is not scripted into a party. Neither director writes events or changes the persona settings
+is not scripted into a party. Both read event rows only: they hear of her first period, as of
+any event, and of none [her cycle](#her-cycle) derives, and a `period` row is never the
+background under way they read. Neither director writes events or changes the persona settings
 above. Needs reach neither.
 
 ## How the two interact
@@ -1453,7 +1557,10 @@ clearly one-sided pair would never be asked. A *status change* is a `relationshi
 status moved; a cold war starting or ending is not one. An answer of any kind is an accept, a
 decline or an ignore; a lapse is not. The turn that starts a cold war moves the streak anchor, so
 `break_up` needs three more turns at the lowest level after it. When `propose` and her sleep ask
-both qualify on one turn, `propose` fires.
+both qualify on one turn, `propose` fires. While her period is under way
+([her cycle](#her-cycle)) she does not ask `sleep_together`, nor `fall_asleep_together` in its
+place; the ask waits for a turn after her period. `propose`, and `fall_asleep_together` where
+the status calls for it, are asked as on any day.
 
 The four status kinds can be asked again whenever their status, wait and streak allow, so after a
 break-up the pair can go round again. Her sleep ask is once only, each kind on its own: a kind the
@@ -1513,7 +1620,8 @@ romantic choices, but it does not read the pair's scopes, so a pair they never r
 **When she asks.** The check runs last, after the romantic ones and the bath's, after every
 judged 1:1 text turn, over the same committed, time-decayed state and the same clear runway and
 right session, and never while a cold war is on. It needs bond tier 3 or more and the 3 newest
-judged turns warm, and no background may be under way. An accepted or ignored `travel_together`
+judged turns warm, and no background may be under way; her period is no background
+([her cycle](#her-cycle)). An accepted or ignored `travel_together`
 holds the next ask back for 14 days from its answer; after a decline or a lapse she asks again
 once the session has a fresh streak. When an earlier kind qualifies on the same turn it goes
 first, and its pending ask closes the runway.
@@ -1557,7 +1665,8 @@ right session, and never while a cold war is on. It needs all of:
   is absent; a persona whose `hygienic` is `false` never asks;
 - at least 3 of the newest 7 judged turns with `warmth` 0.5 or more, read from the turn's
   `state_after`. Patience is not read, and 0.5 is a rule threshold the engine owns, not a judge
-  band. As for every choice, only judged turns after the session's streak anchor count.
+  band. As for every choice, only judged turns after the session's streak anchor count;
+- her period not under way ([her cycle](#her-cycle)).
 
 An accepted or ignored `bathe_together` holds the next ask back for 7 days from its answer;
 after a decline or a lapse she asks again on the next turn that qualifies.
@@ -1637,9 +1746,11 @@ choice's session with the two wordings in
 - `crates/eros-engine-core/src/needs.rs`: the levels, the drift constants, `Habits`, `carried`,
   `after_give` (the give's move).
 - `crates/eros-engine-core/src/pde.rs`: `refuses_give` and `UNUSED_SUBSTANCE_ACCEPT`, the give
-  roll.
+  roll; `period_refuses` and `PERIOD_ACCEPT`, the roll during her period.
 - `crates/eros-engine-core/src/events.rs`: categories and kinds, per-kind rules, gates, the
-  needs and persona factors, `is_offline` and `is_told`, `draw`, `lookback`.
+  needs and persona factors, `is_offline` and `is_told`, `slot`, `draw`, `lookback`.
+- `crates/eros-engine-core/src/cycle.rs`: her cycle, `state`, `next_period_start` and the
+  constants.
 - `crates/eros-engine-server/src/routes/session_events.rs`: the events route, the draw's
   inputs, the offline gates.
 - `crates/eros-engine-server/src/routes/life_choices.rs`: the resolution endpoint.
@@ -1680,4 +1791,4 @@ choice's session with the two wordings in
   the scopes the romantic choices judge a pair by.
 - `crates/eros-engine-store/migrations/0000_baseline.sql`: the events and choices
   tables, the needs index, and the widened affinity `event_type` check (folded
-  from the pre-baseline chain).
+  from the pre-baseline chain); `0089_persona_events_cycle_idx.sql`: the cycle's index.

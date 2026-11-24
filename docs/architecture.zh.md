@@ -173,6 +173,7 @@ crates/
 ├── eros-engine-core/
 │   └── src/
 │       ├── affinity.rs       # 6 維向量 + 档位写入管线 + 時間衰退 + 標籤
+│       ├── cycle.rs          # 她的 28 天周期，由她的事件行推导
 │       ├── effects.rs        # 被接受的 give 的余效（曲线 + active_effects）
 │       ├── events.rs         # 生活事件的分类、种类与两段抽取
 │       ├── ghost.rs          # 評分公式 + 4 層保護
@@ -182,6 +183,7 @@ crates/
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
 │       ├── relationship.rs   # 关系状态、冷战的连续规则、组合关系
 │       ├── scope.rs          # 逐请求注入范围（InsightMode / MemoryScope）
+│       ├── tone.rs           # 一轮聊天抽到的语气（default / emotional / focused）
 │       └── types.rs          # ActionType / Event / DecisionInput / ConversationSignals
 ├── eros-engine-llm/
 │   └── src/
