@@ -4599,7 +4599,7 @@ mod tests {
         let bond_only = AffinityScope::bond();
         // (3, 5) reads as (3, 1).
         assert!(relationship_ground(Some(&lines(0.40, 0.95)), bond_only, &p)
-            .ends_with("你是用户的亲近好友"));
+            .ends_with("你是用户的死党"));
         // (1, 5) reads as (1, 1): no composed line, and a bond-only scope has
         // no patience axis, so the quadrant fallback's gate fails too.
         let quadrant = relationship_ground(Some(&lines(0.0, 0.95)), bond_only, &p);
