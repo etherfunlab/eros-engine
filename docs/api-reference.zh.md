@@ -388,7 +388,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 ≤ 16 个 key，key 满足 `[A-Za-z0-9_.-]{1,64}`，value 必须是 string
 且 ≤ 512 字符。违反作为 pre-stream 错误返回 `400 BadRequest`。
 
-**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 和 `gift` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip`、`bluff`、`threaten`、`trick`、`challenge`、`bet`、`propose`、`break_up` 不降档，她的世界不允许的一起做的动作被拒也不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
+**可选：动作。** 请求体可以带 `action`，表示用户在说话之外对角色做的事。角色可能接受，也可能不接受；不接受时，这段关系在动作对应的那条线上降一档（`give` 和 `gift` 动 bond，身体动作和自定义动作动 chemistry），被拒的 `tip`、`bluff`、`threaten`、`trick`、`challenge`、`bet`、`propose`、`break_up` 不降档，她的世界不允许的、或因她的经期被拒的一起做的动作也不降档（见 [affinity-model.zh.md](affinity-model.zh.md)）。
 
 | `type` | 字段 |
 |---|---|
@@ -427,7 +427,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **脱衣服。** `strip` 是用户脱她的衣服，只有性向相容的一对才可能被接受：这一轮的 `affinity_scope` 含暧昧感轴，`memory_scope` 是什么都不影响。其余的 `strip` 在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官，并像任何被拒的身体动作一样让 chemistry 线降一档。被接受的 `strip` 让她这一轮没穿衣服：穿着写成衣服被对方脱掉了，有指定 `outfit` 时写成「{outfit}」被对方脱掉了，进回复也进图。有出图能力时它像拍照一样回她的图（见下）。
 
-**一起做的动作。** `shower_together`、`bath_together`、`sauna_together` 是请她和用户一起淋浴、泡澡、蒸桑拿；另有十八种请她和用户一起做别的事（见下表）。由判官决定，被拒时 chemistry 线降一档，和任何被拒的身体动作一样。性向不相容的一对发来的 `shower_together`、`bath_together`、`sex_together` 或 `streak_together`，和 `strip` 一样，以及机器角色（`art_metadata.species` 为 `"robot"` 或 `"android"`）收到的 `toilet_together`，在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官。写入的事件不属于角色那个世界的一起做的动作也一样：`art_metadata.setting` 不是 `"fantasy"`（不写按 `"modern"`）的角色收到的 `fight_together`，以及 setting 是 `"fantasy"` 的角色收到的 `cycle_together`；这样的拒绝哪条线都不降。其余的没有这类规则。被接受的动作让她进入一个事件，与她存下的回答在同一个事务里写入，以用户那条消息为键，所以重新驱动的回合只写一次：
+**一起做的动作。** `shower_together`、`bath_together`、`sauna_together` 是请她和用户一起淋浴、泡澡、蒸桑拿；另有十八种请她和用户一起做别的事（见下表）。由判官决定，被拒时 chemistry 线降一档，和任何被拒的身体动作一样。性向不相容的一对发来的 `shower_together`、`bath_together`、`sex_together` 或 `streak_together`，和 `strip` 一样，以及机器角色（`art_metadata.species` 为 `"robot"` 或 `"android"`）收到的 `toilet_together`，在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官。写入的事件不属于角色那个世界的一起做的动作也一样：`art_metadata.setting` 不是 `"fantasy"`（不写按 `"modern"`）的角色收到的 `fight_together`，以及 setting 是 `"fantasy"` 的角色收到的 `cycle_together`；这样的拒绝哪条线都不降。其余的没有这类规则。她的经期里（见[她的周期](life-events-needs.zh.md#她的周期)），上述规则没有拒掉的 `sex_together`、`bath_together`、`hot_spring_together`、`sauna_together` 或 `swim_together` 要在判官之前掷一次：三次里有两次被拒，不管判官怎么答，也不管有没有 LLM 判官，这样的拒绝哪条线都不降；其余那一次照平常由判官决定。被接受的动作让她进入一个事件，与她存下的回答在同一个事务里写入，以用户那条消息为键，所以重新驱动的回合只写一次：
 
 | 动作 | 事件 | 持续 |
 |---|---|---|
@@ -920,6 +920,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `outfit` | 选填：她穿什么，与聊天回合相同——通常是她衣橱里的一项，不做核对；去掉首尾空白后 1–64 个字符，空白等于不带，超长返回 `422`。她的话会跟着这身衣服，图也会。`strip` 时她刚把它脱了：刚把「{outfit}」脱了，不带时是刚把衣服脱了。不带：prompt 里没有穿着，composer 按场景给她穿 |
 
 种类分四个类别（`category`）。`short` 与 `mid` 是插曲；`body` 与 `trip` 是持续数天的背景，背景进行期间插曲照样会发生。
+`period` 与 `period_scare` 进行期间两者都不算：它们是她的周期，与两者并行（见[她的周期](life-events-needs.zh.md#她的周期)）。
 
 | `category` | `kind` | 持续 | 她怎么了 |
 |---|---|---|---|
@@ -930,7 +931,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `short` | `showering` | 30 分钟 | 洗澡中 |
 | `short` | `bathing` | 1 小时 | 泡澡中 |
 | `short` | `on_the_way` | 30 分钟 | 赶路中（只在旅行中，出差也算） |
-| `short` | `period_scare` | 1 小时 | 月经没来——虚惊一场 |
+| `short` | `period_scare` | 持续到月经该来之后 1–3 天 | 月经没来——虚惊一场；只在月经该来之前的三天里抽取 |
 | `short` | `pregnancy_scare` | 1 小时 | 验出怀孕——虚惊一场 |
 | `short` | `got_bumped` | 30 分钟 | 走路时被人或车擦撞到 |
 | `short` | `quarrel` | 1 小时 | 跟人吵架了 |
@@ -986,7 +987,7 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 | `mid` | `on_a_plane` | 2–4 小时 | 在飞机上（只在旅行中，出差也算；只限现代） |
 | `mid` | `driving` | 1–3 小时 | 在开车（只在旅行中，出差也算；只限现代） |
 | `body` | `sick` | 1–3 天 | 生病中 |
-| `body` | `period` | 3–7 天 | 月经中 |
+| `body` | `period` | 1、3 或 5 天 | 月经中：她的第一次月经，只抽一次；时长按 `health`（`strong`、`normal`、`weak`），之后每 28 天来一次，不经抽取 |
 | `body` | `hospitalized` | 2–5 天 | 住院 |
 | `body` | `post_surgery` | 3–7 天 | 刚做完手术 |
 | `trip` | `business_trip` | 24 小时 | 出差 |
@@ -1008,14 +1009,14 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 抽取规则：
 
 - **两段抽取。** engine 先按权重抽类别，再在类别内按权重抽种类。往一个类别里加种类，不会改变其他类别的占比。
-- **一次一件插曲，一个背景。** 角色的任何一个 session 里有插曲在进行时，不再抽取。背景进行期间只抽插曲；
+- **一次一件插曲，一个背景。** 角色的任何一个 session 里有插曲在进行时，不再抽取；进行中的 `period_scare` 不是插曲，什么都不挡。背景进行期间只抽插曲；
   住院和术后期间，不抽需要她出门活动的那二十六种（`temp_work`、`police_encounter`、`animal_encounter`、
   `hit_someone`、`got_hit`、`working_out`、`on_the_way`、`in_battle`、`got_bumped`、`saw_bag`、`saw_clothes`、
   `out_shopping`、`bros_gathering`、`sis_gathering`、`admiring_scenery`、`admiring_art`、`watching_show`、
   `on_the_road`、`having_sex`、`bird_encounter`、`streaking`、`got_lost`、`drinking`、`smoking`、`smoking_weed`、
   `just_have_sex`）；
-  `period` 期间，`period_scare` 与 `pregnancy_scare` 都不抽；`traveling_together` 期间，不抽任何可能让她离线的种类，
-  也不抽 `just_have_sex`：她和用户在一起。`got_lost` 和 `on_a_cruise` 只在 `short_trip`、`long_trip`、`hometown_visit` 或
+  `traveling_together` 期间，不抽任何可能让她离线的种类，
+  也不抽 `just_have_sex`：她和用户在一起。她的经期里不抽背景，也不抽 `period_scare` 与 `pregnancy_scare`。`got_lost` 和 `on_a_cruise` 只在 `short_trip`、`long_trip`、`hometown_visit` 或
   `traveling_together` 进行期间抽取；`missed_ride`、`on_the_way`、`on_the_road`、`on_a_boat`、`on_a_bus`、`on_a_train`、
   `on_a_plane` 和 `driving` 在这几种或 `business_trip` 进行期间抽取。`on_the_road` 只属于 `fantasy` 的角色，除 `on_a_boat`
   外的五种交通工具只属于 `modern` 的角色。
@@ -1031,16 +1032,22 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
 - **亲近度门槛。** `ex_message`、`breakup` 与 `ex_wants_back` 不会向不太熟的人抽出（intimacy 档 2 及以上）；
   `sudden_desire` 与 `just_have_sex` 只在最亲近的档（3）；`strip` 与 `streaking` 在档 3、且会话最新记录的 `affinity_scope` 性向相容时才抽（没有记录就不抽）。
   `having_sex` 只对 `art_metadata.sex_addict` 为 `true` 的角色抽取，`masturbating` 只对这样的角色在档 3 抽取。
-  `drinking`、`smoking`、`smoking_weed` 分别只对 `alcoholic`、`smoking`、`drug` 为 `true` 的角色抽取。`period` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
-  `period_scare`（档 2 及以上）与 `pregnancy_scare`（档 3）同样只对这样的角色抽取，`saw_bag` 和 `saw_clothes` 也是；
-  从档 2 起，她会说自己想要看中的东西，有 `tip_personality` 的角色用那份人格的口吻说。`period`、两种惊吓和 `using_toilet` 都不对机器（`art_metadata.species` 为 `"robot"`
+  `drinking`、`smoking`、`smoking_weed` 分别只对 `alcoholic`、`smoking`、`drug` 为 `true` 的角色抽取。`pregnancy_scare`（档 3）、
+  `saw_bag` 和 `saw_clothes` 只对 `art_metadata.gender` 为 `"female"` 的角色抽取；
+  从档 2 起，她会说自己想要看中的东西，有 `tip_personality` 的角色用那份人格的口吻说。`pregnancy_scare` 和 `using_toilet` 都不对机器（`art_metadata.species` 为 `"robot"`
   或 `"android"`）抽取。离线类种类遵循两道 ghost 门槛（见下）。
+- **她的周期。** `period` 与 `period_scare` 只对有月经的角色抽取：人类女性有，除非 `art_metadata.period` 为 `false`；
+  其他物种的女性只在它为 `true` 时有；机器和不是女性的角色一律没有。`period` 只抽一次，在实例还没有它时抽，
+  它的开始时刻是 28 天周期的锚点：之后的月经在它之后每隔 28 天开始，按 `health` 持续 1、3 或 5 天，读取时推导出来，
+  从不写入，也从不讲出来。`period_scare`（档 2 及以上）是月经推迟：只在下一次月经该来之前的三天里抽取，这几天里有过性事就三倍可能，
+  持续到到期时刻之后的一到三天，那一次月经在它结束时开始。规则见 [life-events-needs.zh.md](life-events-needs.zh.md#她的周期)。
 - **角色设置**，写在 genome 的 `art_metadata` 里，影响抽取：
 
   | 键 | 取值 | 效果 |
   |---|---|---|
   | `prefer_events` | `mid` 种类的数组 | 列出的种类在 `mid` 内被抽到的概率是原来的三倍 |
-  | `health` | `"weak"`、`"normal"`（默认）、`"strong"` | body 类被抽到的概率分别是原来的两倍 / 一倍 / 一半 |
+  | `health` | `"weak"`、`"normal"`（默认）、`"strong"` | body 类被抽到的概率分别是原来的两倍 / 一倍 / 一半；她的月经分别持续 5 / 3 / 1 天 |
+  | `period` | `true` / `false` / 不写 | 她有没有月经（见上）：不写时，人类女性有，其他物种的女性没有；机器和不是女性的角色一律没有 |
   | `prefer_trip` | `true` / `false`（默认） | trip 类被抽到的概率是原来的三倍；仍然每周最多一次 |
   | `homesick` | `true` / `false` / 不写 | 出行往哪去：`true` 偏向 `hometown_visit`、压低游玩的两种；`false` 压低 `hometown_visit`；`business_trip` 不动 |
   | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex`、`just_have_sex` 或 `having_sex_together` 事件之前，`having_sex` 与 `just_have_sex` 的概率是五分之一；之后这个键不再起作用 |
@@ -1104,6 +1111,7 @@ composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），�
 
 **虚惊一场。** `period_scare` 与 `pregnancy_scare` 讲出来的就是这场惊吓本身，用角色自己的口吻。
 它持续期间，判官和回复的上下文里都没有任何一处说它是假的。虚惊进行期间，events 和 effects 路由照样返回它的 `kind`（`period_scare`、`pregnancy_scare`），怎么显示由客户端决定；直接显示种类名等于提前告诉用户这是一场虚惊。
+`period_scare` 持续数天，不算插曲：它进行期间别的插曲照样会抽到，`…/effects` 把它作为 `cycle_event` 返回，而不是 `event`。
 结束之后，她在讲出它的那个会话里的下一条消息——
 回复、`/open` 开场白或事件消息——会说这是虚惊一场。她在那里写过一条带文字的消息之后，这件事就了结了；只有图的回复不算。她的其他会话不会带上它。
 
@@ -1115,7 +1123,7 @@ composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），�
 - **与开场白的关系：** 事件消息算作会话里有人说过话，所以同一个当地日期里，事件消息之后不会再有生日或节日开场白。
   事件消息落库时，正在生成的开场白让路，返回 `null`。
 - **持续期间：** 判官的上下文带一行 `[近期事件]`，回复的 `[now]` 块带一行 `- 正在经历：…`，
-  各自列出正在进行的背景和插曲；`/open` 开场白同样带 `- 正在经历：…` 这一行。`GET …/effects` 两者都会列出。
+  各自列出正在进行的背景、她的经期或月经推迟，以及插曲；`/open` 开场白同样带 `- 正在经历：…` 这一行。`GET …/effects` 都会列出。
   一段离线类事件结束之后（在被它 ghost 过消息的会话里），或一场虚惊结束之后（在讲出它的那个会话里），`[近期事件]` 行多出一项，回复多出一行 `- 刚才：…`，直到她在那里写过一次为止（一条带文字的消息；
   见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
 - **错误：** `event_key` 格式不对返回 `400`，`code: "invalid_payload"`；未知的 `kind`，或 `taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together`、`sauna_together` 或其余一起做的动作写入的种类，返回 `422`。会话检查与 `/open` 相同
@@ -1127,15 +1135,16 @@ composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），�
 
 ### `GET /v2/comp/session/{session_id}/effects`
 
-角色因被接受的 give 而带着的余效、她的需求和正在经历的事件，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受消耗品的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合的 `body_state` 帧里还没有它：帧描述刚写成的那句回复，路由描述角色此刻的样子。`needs` 是角色带到此刻的需求（形状与 `body_state` 帧里的一致），没有判定或没有配置 LLM 判官时为 `null`。`event` 是此刻正在进行的插曲，`background_event` 是此刻正在进行的背景（形状都与 events 路由一致），没有时各为 `null`。正在进行的离线类事件和其他插曲一样，作为 `event` 返回，带 `"offline": true`。
+角色因被接受的 give 而带着的余效、她的需求和正在经历的事件，即此刻发一句文字消息时会带上的状态：供打开会话的页面和收不到帧的异步调用方使用。接受消耗品的那一回合刚结束，这个路由就已列出它的第 1 步，而那一回合的 `body_state` 帧里还没有它：帧描述刚写成的那句回复，路由描述角色此刻的样子。`needs` 是角色带到此刻的需求（形状与 `body_state` 帧里的一致），没有判定或没有配置 LLM 判官时为 `null`。`event` 是此刻正在进行的插曲，`background_event` 是此刻正在进行的背景，即出行或生病（形状都与 events 路由一致），没有时各为 `null`。正在进行的离线类事件和其他插曲一样，作为 `event` 返回，带 `"offline": true`。`cycle_event` 是此刻正在进行的经期或月经推迟（`period_scare`），形状相同，带 `"offline": false`，没有时为 `null`；周期推导出的经期 `"message_id": null`。她的经期从不作为 `background_event` 返回（见[她的周期](life-events-needs.zh.md#她的周期)）。
 
-`changes_at` 是在没有新回合、没有新事件的前提下，这份响应最早会变的时刻：取某项需求下一次向静息档移动的时刻，以及 `event`、`background_event` 的 `ends_at`，三者中最早的一个。不会自己变化时为 `null`。余效只随回合推进，不计入。`as_of` 是服务器计算这份响应的时刻，也就是推算需求和 `changes_at` 所用的那个时刻。缓存这份响应的客户端在每个回合之后、每次事件抽取之后，以及自收到响应起经过 `changes_at - as_of` 这段时长之后重新读取：按时长而不是按绝对时刻，设备时钟快慢就无所谓了。
+`changes_at` 是在没有新回合、没有新事件的前提下，这份响应最早会变的时刻：取某项需求下一次向静息档移动的时刻、`event`、`background_event` 或 `cycle_event` 的 `ends_at`，以及她下一次月经开始的时刻，其中最早的一个。不会自己变化时为 `null`。余效只随回合推进，不计入。`as_of` 是服务器计算这份响应的时刻，也就是推算需求和 `changes_at` 所用的那个时刻。缓存这份响应的客户端在每个回合之后、每次事件抽取之后，以及自收到响应起经过 `changes_at - as_of` 这段时长之后重新读取：按时长而不是按绝对时刻，设备时钟快慢就无所谓了。
 
 ```json
 {"effects": [{"item": "alcohol", "name": "威士忌", "quantity": 3, "level": 2, "phase": "rising", "step": 2, "steps": 3}],
  "needs": {"social": "high", "emotional": "mid", "outing": "high", "indulgence": "mid"},
  "event": null,
  "background_event": {"kind": "short_trip", "category": "trip", "offline": false, "started_at": "2026-10-15T08:00:00Z", "ends_at": "2026-10-17T08:00:00Z", "message_id": "…"},
+ "cycle_event": {"kind": "period", "category": "body", "offline": false, "started_at": "2026-10-16T09:00:00Z", "ends_at": "2026-10-19T09:00:00Z", "message_id": null},
  "as_of": "2026-10-16T13:00:00Z",
  "changes_at": "2026-10-16T14:00:00Z"}
 ```
@@ -1156,10 +1165,10 @@ composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），�
 | `partner_up` | 提出和用户结成伙伴 | 状态是 `none`、`ex` 或 `peer`，bond 领先且在第 3 档或以上，且最新的 3 个被判官评过的回合 patience 都高于 0.7。不读这一对的 scope |
 | `propose` | 向用户求婚 | 这一对在浪漫上相容，状态是 `dating`、`fwb` 或 `situationship`，chemistry 和 bond 都在第 4 档或以上，且最新的 8 个被判官评过的回合里至少 5 个 warmth 和 patience 都高于 0.7 |
 | `break_up` | 提出分手 | 正在冷战，状态可分手（`dating`、`partner`、`fwb`、`situationship`、`engaged`），且最新的 3 个被判官评过的回合都在判官的最低耐心档。不读这一对的 scope |
-| `sleep_together` | 问用户愿不愿意和她上床 | 这一对在浪漫上相容，状态是 `dating`、`engaged`、`fwb` 或 `situationship`，或 chemistry 在第 4 档或以上的 `partner`，chemistry 在第 3 档或以上，且最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7 |
-| `fall_asleep_together` | 问用户愿不愿意和她躺在一起睡觉 | 同 `sleep_together`，状态是 `none`、`peer` 或 `ex`，或 chemistry 在第 3 档的 `partner` |
-| `travel_together` | 提议一起去旅行 | bond 在第 3 档或以上，最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7，且没有背景事件在进行。不读这一对的 scope |
-| `bathe_together` | 问用户愿不愿意和她一起洗澡 | 这一对在浪漫上相容；chemistry 在第 2 档或以上（`hygienic` 为 `true` 的角色）或第 3 档或以上（不写 `hygienic` 的角色），`hygienic` 为 `false` 时从不提出；且最新的 7 个被判官评过的回合里至少 3 个 warmth 达到 0.5。不读 patience |
+| `sleep_together` | 问用户愿不愿意和她上床 | 这一对在浪漫上相容，状态是 `dating`、`engaged`、`fwb` 或 `situationship`，或 chemistry 在第 4 档或以上的 `partner`，chemistry 在第 3 档或以上，最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7，且她不在经期里 |
+| `fall_asleep_together` | 问用户愿不愿意和她躺在一起睡觉 | 同 `sleep_together`，状态是 `none`、`peer` 或 `ex`，或 chemistry 在第 3 档的 `partner`，经期里也照样提出 |
+| `travel_together` | 提议一起去旅行 | bond 在第 3 档或以上，最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7，且没有背景事件在进行（她的经期不算）。不读这一对的 scope |
+| `bathe_together` | 问用户愿不愿意和她一起洗澡 | 这一对在浪漫上相容；chemistry 在第 2 档或以上（`hygienic` 为 `true` 的角色）或第 3 档或以上（不写 `hygienic` 的角色），`hygienic` 为 `false` 时从不提出；最新的 7 个被判官评过的回合里至少 3 个 warmth 达到 0.5，且她不在经期里。不读 patience |
 
 `confess`、`partner_up`、`propose` 和 `break_up` 挪动这一对的[关系状态](affinity-model.zh.md#关系状态)，每个好感度快照都以 `relationship_status` 报告它。
 领先的线是档位较高的那条；档位相同时看分数。冷战期间她除了 `break_up` 什么都不提。

@@ -11,7 +11,7 @@
 No migration. Every field on the wire is additive (four action types, four event kinds, one optional request field `user_gender`, one new `metadata.tone` value and one new key in the composer's audit `inputs`), but one behaviour changes: a `fantasy` persona stops drawing five kinds. One new setting, `tones.focused`, is off when absent.
 **Design:** [`2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md`](../superpowers/specs/2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md)
 
-The other note for this release is [Affinity 5.0, the relationship status and the cold war](v2-9-0-affinity-5-0.md).
+The other notes for this release are [Affinity 5.0, the relationship status and the cold war](v2-9-0-affinity-5-0.md) and [her period on a 28-day cycle](v2-9-0-period-cycle.md).
 
 The rules are in [her world](../life-events-needs.md#her-world), [together actions](../life-events-needs.md#showering-bathing-and-the-sauna-together), [at work](../life-events-needs.md#at-work), [tones](../model-config.md#tones--chat-tones-chat-task-only), [the composer](../model-config.md#taskschat_image_prompt_compose--image-prompt-composer-required-for-image-turns) and [the send route](../api-reference.md#post-compchatsession_idmessagestream).
 

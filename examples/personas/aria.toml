@@ -24,7 +24,8 @@ timezone = "America/Chicago"
 age = 27
 # Optional. human | alien | beastkin | elf | deity | cyborg | robot | android |
 # zombie, or any other word, rendered as written. Absent ⇒ human. robot and
-# android are machines: no period or toilet events.
+# android are machines: no period or toilet events. Any other species but
+# human has no period unless period = true.
 # species = "elf"
 # Optional, free text. "earth" or absent renders no planet.
 # planet = "earth"
@@ -34,7 +35,7 @@ hometown = "Duluth, Minnesota"
 # persona sees it coming six days ahead and speaks first on the day when the
 # session is opened.
 birthday = "11-03"
-# Optional. weak | normal | strong. How often illness and other body events come up. Absent ⇒ normal.
+# Optional. weak | normal | strong. How often illness and other body events come up, and how long her period lasts. Absent ⇒ normal.
 # health = "weak"
 # Optional. true makes trips three times as likely among her life events. Absent ⇒ false.
 # prefer_trip = true

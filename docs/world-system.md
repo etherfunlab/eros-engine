@@ -229,7 +229,7 @@ takes no roster slot from an instance that has a genome.
 | Affinity snapshot | latest session's six axes + bond + chemistry + both tier labels — advisory only — plus its [relationship status](affinity-model.md#relationship-status) and cold-war flag, which are engine-recorded fact |
 | Chat evidence | user→reply pairs of this (owner, instance), last `context_days` (default 7), capped by turn count; messages the persona sent on her own (event and life-choice messages, greetings) are not evidence, nor are the turns of a [date](activities.md) |
 | Life events (30) | `persona_events` of the instance started in the same window, plus any under way: label, category, relative time (`3 天前开始，持续 2 小时`), and the message she told it in, if any. `taking_space` / `fell_out` only from unarchived sessions; the narration of an event told in an archived session is left out; a false alarm only once it has ended, with its outcome; never a `bathing_together`, a `showering_together`, a `having_sex_together`, a `streaking_together`, a `using_toilet_together`, an `asleep_together` or an `on_a_date`, which live in the conversation only |
-| Background under way | the one of those life events that is a background under way, repeated on its own |
+| Background under way | the one of those life events that is a background under way, a trip or an illness and never a `period`, repeated on its own |
 | Relationship choices (10) | `life_choices` of kinds `confess`, `partner_up`, `propose` and `break_up`, and stored `ask_for_space` ones, of the pair's unarchived sessions in the window: her ask and its outcome (accepted, with a stored separation's length; declined; ignored; unanswered; still waiting) |
 
 | Output | Where it goes |
@@ -287,7 +287,7 @@ World Stories (per-instance life)  →  World Memories (persona↔persona graph)
 
 Separately, and for every owner whether or not it runs stories, a persona with
 a background life event under way at round time (a trip, an illness, a
-hospital stay) carries `current_background`, e.g.
+hospital stay; never her period) carries `current_background`, e.g.
 `住院（1 天前开始，约 3 天后结束）`, with a fixed rule that the scripts stay
 consistent with it. With no background under way anywhere in the roster the
 payload carries neither.

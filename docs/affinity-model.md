@@ -282,6 +282,10 @@ roll can refuse whatever the judge says
   `fight_together` to a persona whose `setting` is not `fantasy`, and a `cycle_together` to one
   whose `setting` is, are refused the same way and drop no line. The other together actions have no such rule. A `smoke_together`, `smoke_weed_together` or
   `drink_together` the roll refuses drops Chemistry too, not Bond.
+- **Her period:** during her period a `sex_together`, `bath_together`, `hot_spring_together`,
+  `sauna_together` or `swim_together` that the rules above did not refuse is refused before the
+  judge two times in three by a roll ([her cycle](life-events-needs.md#her-cycle)), and drops no
+  line; the other third is judged as usual.
 - **Proposal and break-up:** a refused `propose` or `break_up` drops no line; the turn is
   graded like any other. Before the judge, a `propose` from a status other than `dating`,
   `fwb` or `situationship`, and a `break_up` from a status that is not breakable, are refused
