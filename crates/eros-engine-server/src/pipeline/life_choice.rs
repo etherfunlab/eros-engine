@@ -157,7 +157,7 @@ async fn separated(
     now: DateTime<Utc>,
 ) -> Result<bool, sqlx::Error> {
     Ok(EventRepo { pool }
-        .current(instance_id, at_message, now)
+        .current(instance_id, at_message, now, None)
         .await?
         .foreground
         .is_some_and(|e| e.kind == EventKind::TakingSpace))
@@ -792,8 +792,10 @@ async fn try_travel(
     {
         return Ok(());
     }
+    // Her period is no background and holds back no travel ask (spec
+    // 2026-11-24-period-cycle-design.md §9).
     let background = (EventRepo { pool: &state.pool })
-        .current(instance_id, None, now)
+        .current(instance_id, None, now, None)
         .await?
         .background;
     if background.is_some() || !runway_clear(state, session_id, instance_id, now).await? {

@@ -594,7 +594,9 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
         action_response: None,
     };
     let repo = eros_engine_store::events::EventRepo { pool: &state.pool };
-    let current = repo.current(g.instance_id, None, g.now.now).await?;
+    let current = repo
+        .current(g.instance_id, None, g.now.now, traits.cycle_health())
+        .await?;
     // Only a stretch that took this persona offline left something unsaid.
     let offline = repo
         .unexplained_offline(
@@ -719,8 +721,15 @@ async fn store(
         };
         // The events at the instant the reply prompt read them; the event
         // itself is not stored yet, so the kind it starts counts as live.
-        let current_state =
-            state_for_picture(&state.pool, g.instance_id, None, g.now.now, Some(*kind)).await;
+        let current_state = state_for_picture(
+            &state.pool,
+            g.instance_id,
+            None,
+            g.now.now,
+            Some(*kind),
+            crate::prompt::persona_traits(&g.persona).cycle_health(),
+        )
+        .await;
         let img = build_delegated_image_prompt_for(
             state,
             &g.persona,

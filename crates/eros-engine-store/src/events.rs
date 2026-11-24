@@ -3,7 +3,8 @@
 //! 2026-10-15-life-events-v2-design.md §6).
 
 use chrono::{DateTime, Utc};
-use eros_engine_core::events::{self, EventKind, PastEvent};
+use eros_engine_core::cycle::{self, CycleRows};
+use eros_engine_core::events::{self, EventKind, Health, PastEvent, Slot};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -33,12 +34,47 @@ impl EventRecord {
     }
 }
 
-/// The events under way at a moment, and that moment.
+/// Her period or a late-period scare under way (spec 2026-11-24-period-cycle-
+/// design.md §7). A derived period has no row, so no `message_id`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CycleEvent {
+    pub kind: EventKind,
+    pub started_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub message_id: Option<Uuid>,
+}
+
+/// The events under way at a moment, and that moment: one per slot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CurrentEvents {
     pub foreground: Option<EventRecord>,
     pub background: Option<EventRecord>,
+    pub cycle: Option<CycleEvent>,
+    /// The rows `cycle` was derived from: for the draw and for
+    /// `next_period_start`.
+    pub cycle_rows: CycleRows,
     pub at: DateTime<Utc>,
+}
+
+impl CurrentEvents {
+    /// Nothing under way at `at`.
+    pub fn none(at: DateTime<Utc>) -> Self {
+        Self {
+            foreground: None,
+            background: None,
+            cycle: None,
+            cycle_rows: CycleRows::default(),
+            at,
+        }
+    }
+}
+
+/// The kinds of `slot`, as the strings a query binds.
+fn kind_strs(slot: Slot) -> Vec<&'static str> {
+    events::kinds_in(slot)
+        .into_iter()
+        .map(EventKind::as_str)
+        .collect()
 }
 
 /// An event to write.
@@ -112,8 +148,10 @@ impl EventRepo<'_> {
     /// Write an event and, when it has one, the message that tells it, in
     /// one transaction (spec §6.4). Nothing is written — `None` — while the
     /// instance has a foreground event under way at `started_at`, or, for a
-    /// background, any event; nor while any session of the instance waits for
-    /// an answer to an ask; nor on a repeated `event_key` in the session.
+    /// background, any event; a `period_scare` under way counts as neither
+    /// (spec 2026-11-24-period-cycle-design.md §6). Nor while any session of
+    /// the instance waits for an answer to an ask; nor on a repeated
+    /// `event_key` in the session.
     /// The guards are read under the instance's lock, so a writer in flight
     /// (an accept, a conversion, an ask) is waited for, not missed. The
     /// message's `sent_at` is the event's `started_at`.
@@ -154,11 +192,14 @@ impl EventRepo<'_> {
             .into_iter()
             .map(|k| k.as_str().to_string())
             .collect();
-        // A row of a kind this build does not know reads as no event (see
-        // `record`), so it does not block a write either.
-        let known: Vec<String> = EventKind::ALL
+        // The kinds whose row under way blocks a write. A row of a kind this
+        // build does not know reads as no event (see `record`), so it does not
+        // block one either; nor does a `period_scare`, which occupies no
+        // foreground (spec 2026-11-24-period-cycle-design.md §6).
+        let blocking: Vec<String> = EventKind::ALL
             .into_iter()
             .chain(EventKind::SPECIAL)
+            .filter(|&k| k != EventKind::PeriodScare)
             .map(|k| k.as_str().to_string())
             .collect();
         let row: Option<EventColumns> = sqlx::query_as(
@@ -186,7 +227,7 @@ impl EventRepo<'_> {
         .bind(lookback_hours())
         .bind(e.kind.is_background())
         .bind(&background)
-        .bind(&known)
+        .bind(&blocking)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(event) = row.and_then(record) else {
@@ -219,28 +260,25 @@ impl EventRepo<'_> {
     }
 
     /// End every foreground of the instance under way at `at` there; a
-    /// background keeps running. Takes the instance lock, held to the
-    /// caller's commit; nothing here commits.
+    /// background or a cycle row (spec 2026-11-24-period-cycle-design.md §7)
+    /// keeps running. Takes the instance lock, held to the caller's commit;
+    /// nothing here commits.
     pub async fn end_foreground_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         instance_id: Uuid,
         at: DateTime<Utc>,
     ) -> Result<(), sqlx::Error> {
         lock_instance(tx, instance_id).await?;
-        let background: Vec<String> = events::background_kinds()
-            .into_iter()
-            .map(|k| k.as_str().to_string())
-            .collect();
         // `started_at < $2`: a row starting at the moment itself is not capped
         // (its `ends_at` would equal its `started_at`, which the table forbids).
         sqlx::query(
             "UPDATE engine.persona_events SET ends_at = $2 \
               WHERE instance_id = $1 AND started_at < $2 AND ends_at > $2 \
-                AND NOT (kind = ANY($3))",
+                AND kind = ANY($3)",
         )
         .bind(instance_id)
         .bind(at)
-        .bind(&background)
+        .bind(kind_strs(Slot::Foreground))
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -362,17 +400,27 @@ impl EventRepo<'_> {
         .await
     }
 
-    /// The foreground and the background under way at `at_message`'s
-    /// `sent_at`, or at `now` without one: started at or before that moment,
-    /// ending after it.
+    /// The events under way at `at_message`'s `sent_at`, or at `now` without
+    /// one: the foreground and the background, started at or before that
+    /// moment and ending after it, and, for a persona with a period
+    /// (`period` is `PersonaTraits::cycle_health`), the cycle state there
+    /// (spec 2026-11-24-period-cycle-design.md §5, §7). The cycle reads the
+    /// newest `period` and the newest `period_scare` row started by the
+    /// moment, however old; a row of either kind under way lands in neither
+    /// of the other two slots. With `period` `None` the cycle rows are not
+    /// read. One statement.
     pub async fn current(
         &self,
         instance_id: Uuid,
         at_message: Option<Uuid>,
         now: DateTime<Utc>,
+        period: Option<Health>,
     ) -> Result<CurrentEvents, sqlx::Error> {
+        // The moment, whether the row is a cycle row (rather than one under
+        // way), then the event's columns.
         type Row = (
             DateTime<Utc>,
+            Option<bool>,
             Option<Uuid>,
             Option<String>,
             Option<Uuid>,
@@ -380,28 +428,47 @@ impl EventRepo<'_> {
             Option<DateTime<Utc>>,
             Option<Uuid>,
         );
-        // The LEFT JOIN keeps the moment's row when nothing is under way.
+        // The LEFT JOIN keeps the moment's row when nothing is read. The two
+        // cycle kinds are literals so `persona_events_cycle_idx` serves their
+        // reads under a generic plan.
         let rows: Vec<Row> = sqlx::query_as(
             "WITH t AS (SELECT COALESCE( \
                      (SELECT a.sent_at FROM engine.chat_messages a WHERE a.id = $2), $3) AS at) \
-             SELECT t.at, p.id, p.kind, p.session_id, p.started_at, p.ends_at, p.message_id \
-               FROM t LEFT JOIN engine.persona_events p \
-                 ON p.instance_id = $1 AND p.started_at <= t.at AND p.ends_at > t.at \
-                AND p.started_at > t.at - make_interval(hours => $4) \
+             SELECT t.at, p.cycle, p.id, p.kind, p.session_id, p.started_at, p.ends_at, \
+                    p.message_id \
+               FROM t LEFT JOIN LATERAL ( \
+                    SELECT false AS cycle, u.id, u.kind, u.session_id, u.started_at, \
+                           u.ends_at, u.message_id \
+                      FROM engine.persona_events u \
+                     WHERE u.instance_id = $1 AND u.started_at <= t.at AND u.ends_at > t.at \
+                       AND u.started_at > t.at - make_interval(hours => $4) \
+                    UNION ALL \
+                    (SELECT true, c.id, c.kind, c.session_id, c.started_at, c.ends_at, \
+                            c.message_id \
+                       FROM engine.persona_events c \
+                      WHERE $5 AND c.instance_id = $1 AND c.kind = 'period' \
+                        AND c.started_at <= t.at \
+                      ORDER BY c.started_at DESC, c.id DESC LIMIT 1) \
+                    UNION ALL \
+                    (SELECT true, c.id, c.kind, c.session_id, c.started_at, c.ends_at, \
+                            c.message_id \
+                       FROM engine.persona_events c \
+                      WHERE $5 AND c.instance_id = $1 AND c.kind = 'period_scare' \
+                        AND c.started_at <= t.at \
+                      ORDER BY c.started_at DESC, c.id DESC LIMIT 1) \
+               ) p ON true \
               ORDER BY p.started_at DESC, p.id DESC",
         )
         .bind(instance_id)
         .bind(at_message)
         .bind(now)
         .bind(lookback_hours())
+        .bind(period.is_some())
         .fetch_all(self.pool)
         .await?;
-        let mut out = CurrentEvents {
-            foreground: None,
-            background: None,
-            at: rows.first().map(|r| r.0).unwrap_or(now),
-        };
-        for (_, id, kind, session_id, started_at, ends_at, message_id) in rows {
+        let mut out = CurrentEvents::none(rows.first().map(|r| r.0).unwrap_or(now));
+        let (mut anchor, mut scare) = (None, None);
+        for (_, cycle_row, id, kind, session_id, started_at, ends_at, message_id) in rows {
             let (Some(id), Some(kind), Some(started_at), Some(ends_at)) =
                 (id, kind, started_at, ends_at)
             else {
@@ -410,14 +477,39 @@ impl EventRepo<'_> {
             let Some(e) = record((id, kind, session_id, started_at, ends_at, message_id)) else {
                 continue;
             };
-            let slot = if e.kind.is_background() {
-                &mut out.background
-            } else {
-                &mut out.foreground
+            if cycle_row == Some(true) {
+                match e.kind {
+                    EventKind::Period => anchor = Some(e),
+                    EventKind::PeriodScare => scare = Some(e),
+                    _ => {}
+                }
+                continue;
+            }
+            let slot = match e.kind.slot() {
+                Slot::Foreground => &mut out.foreground,
+                Slot::Background => &mut out.background,
+                Slot::Cycle => continue,
             };
             if slot.is_none() {
                 *slot = Some(e);
             }
+        }
+        if let Some(health) = period {
+            out.cycle_rows = CycleRows {
+                period: anchor.as_ref().map(EventRecord::past),
+                scare: scare.as_ref().map(EventRecord::past),
+            };
+            out.cycle = cycle::state(&out.cycle_rows, health, out.at).map(|s| CycleEvent {
+                kind: s.kind,
+                started_at: s.started_at,
+                ends_at: s.ends_at,
+                // The row's when the state is the anchor or the scare.
+                message_id: [&anchor, &scare]
+                    .into_iter()
+                    .flatten()
+                    .find(|r| r.kind == s.kind && r.started_at == s.started_at)
+                    .and_then(|r| r.message_id),
+            });
         }
         Ok(out)
     }
@@ -425,16 +517,15 @@ impl EventRepo<'_> {
     /// For each of `instance_ids`, the background under way at `at`
     /// (`started_at <= at < ends_at`, within `lookback()`), newest start
     /// first. Instances with none are absent. One query (spec 2026-10-23-
-    /// life-events-world-wiring-design.md §4).
+    /// life-events-world-wiring-design.md §4). A `period` row is no
+    /// background here (spec 2026-11-24-period-cycle-design.md §7, "Not the
+    /// world system").
     pub async fn backgrounds_at(
         &self,
         instance_ids: &[Uuid],
         at: DateTime<Utc>,
     ) -> Result<std::collections::HashMap<Uuid, EventRecord>, sqlx::Error> {
-        let background: Vec<String> = events::background_kinds()
-            .into_iter()
-            .map(|k| k.as_str().to_string())
-            .collect();
+        let background = kind_strs(Slot::Background);
         // instance_id, then the event's columns.
         type Row = (
             Uuid,
@@ -1054,7 +1145,7 @@ mod tests {
         let before = row(&pool, s, "user", "2026-10-01T09:59:00Z", false).await;
         let during = row(&pool, s, "user", "2026-10-01T11:00:00Z", false).await;
         let after = row(&pool, s, "user", "2026-10-01T14:00:00Z", false).await;
-        let at = |anchor| repo.current(i, Some(anchor), Utc::now());
+        let at = |anchor| repo.current(i, Some(anchor), Utc::now(), None);
 
         let c = at(before).await.unwrap();
         assert_eq!(
@@ -1074,7 +1165,7 @@ mod tests {
         );
         // Without an anchor, `now` is the moment.
         let c = repo
-            .current(i, None, t("2026-10-01T12:00:00Z"))
+            .current(i, None, t("2026-10-01T12:00:00Z"), None)
             .await
             .unwrap();
         assert_eq!(
@@ -1082,7 +1173,7 @@ mod tests {
             (Some(work), Some(trip), t("2026-10-01T12:00:00Z"))
         );
         let c = repo
-            .current(i, None, t("2026-10-02T09:00:00Z"))
+            .current(i, None, t("2026-10-02T09:00:00Z"), None)
             .await
             .unwrap();
         assert_eq!((c.foreground, c.background), (None, None));
@@ -1174,7 +1265,7 @@ mod tests {
         .await
         .unwrap();
         let now = EventRepo { pool: &pool }
-            .current(i, None, t("2026-10-01T09:00:00Z"))
+            .current(i, None, t("2026-10-01T09:00:00Z"), None)
             .await
             .unwrap();
         assert!(now.foreground.is_none() && now.background.is_none());
@@ -1891,7 +1982,7 @@ mod tests {
         assert_eq!(other, elsewhere.ends_at, "another instance is untouched");
 
         let c = repo
-            .current(i, None, t("2026-10-01T12:00:00Z"))
+            .current(i, None, t("2026-10-01T12:00:00Z"), None)
             .await
             .unwrap();
         assert_eq!(
@@ -2065,7 +2156,7 @@ mod tests {
             "only the separation; the draw's message went with it"
         );
         let c = EventRepo { pool: &pool }
-            .current(i, None, t("2026-10-01T11:00:00Z"))
+            .current(i, None, t("2026-10-01T11:00:00Z"), None)
             .await
             .unwrap();
         assert_eq!(c.foreground.map(|e| e.id), Some(space.id));
@@ -2356,5 +2447,312 @@ mod tests {
             "only a has a background under way among a, b, d"
         );
         assert_eq!(got[&a].kind, Hospitalized);
+    }
+
+    /// The moment the cycle tests read at.
+    fn cycle_at() -> DateTime<Utc> {
+        t("2026-03-01T12:00:00Z")
+    }
+
+    fn hours(n: i64) -> chrono::Duration {
+        chrono::Duration::hours(n)
+    }
+
+    fn days(n: i64) -> chrono::Duration {
+        chrono::Duration::days(n)
+    }
+
+    fn span<'a>(
+        instance_id: Uuid,
+        session_id: Uuid,
+        key: &'a str,
+        kind: EventKind,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> NewEvent<'a> {
+        NewEvent {
+            instance_id,
+            session_id,
+            event_key: key,
+            kind,
+            started_at: from,
+            ends_at: to,
+        }
+    }
+
+    /// A row written directly, past every guard; `message_id` is the message
+    /// that told it.
+    async fn seed(pool: &PgPool, e: NewEvent<'_>, message_id: Option<Uuid>) {
+        sqlx::query(
+            "INSERT INTO engine.persona_events \
+               (instance_id, session_id, event_key, kind, started_at, ends_at, message_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(e.instance_id)
+        .bind(e.session_id)
+        .bind(e.event_key)
+        .bind(e.kind.as_str())
+        .bind(e.started_at)
+        .bind(e.ends_at)
+        .bind(message_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A three-day `period` row 28 days and an hour before `cycle_at()`, so
+    /// its first due moment is an hour before it.
+    fn old_anchor(instance_id: Uuid, session_id: Uuid) -> NewEvent<'static> {
+        let at = cycle_at();
+        span(
+            instance_id,
+            session_id,
+            "anchor",
+            Period,
+            at - days(28) - hours(1),
+            at - days(25) - hours(1),
+        )
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §5, §7.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn current_reads_the_cycle(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let at = cycle_at();
+        seed(&pool, old_anchor(i, s), None).await;
+        let repo = EventRepo { pool: &pool };
+
+        let c = repo
+            .current(i, None, at, Some(Health::Normal))
+            .await
+            .unwrap();
+        assert_eq!(
+            c.cycle,
+            Some(CycleEvent {
+                kind: Period,
+                started_at: at - hours(1),
+                ends_at: at - hours(1) + days(3),
+                message_id: None,
+            })
+        );
+        assert_eq!(c.background, None);
+        assert_eq!(
+            c.cycle_rows.period,
+            Some(PastEvent {
+                kind: Period,
+                started_at: at - days(28) - hours(1),
+                ends_at: at - days(25) - hours(1),
+            })
+        );
+
+        let c = repo.current(i, None, at, None).await.unwrap();
+        assert_eq!(c.cycle, None);
+        assert_eq!(c.cycle_rows, CycleRows::default());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_anchor_row_under_way_is_the_cycle_event(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let at = cycle_at();
+        let told = row(&pool, s, "assistant", "2026-03-01T11:00:00Z", false).await;
+        seed(
+            &pool,
+            span(i, s, "period", Period, at - hours(1), at + hours(71)),
+            Some(told),
+        )
+        .await;
+        let c = EventRepo { pool: &pool }
+            .current(i, None, at, Some(Health::Normal))
+            .await
+            .unwrap();
+        assert_eq!(
+            c.cycle,
+            Some(CycleEvent {
+                kind: Period,
+                started_at: at - hours(1),
+                ends_at: at + hours(71),
+                message_id: Some(told),
+            })
+        );
+        assert_eq!(c.background, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_period_shows_beside_a_trip(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let at = cycle_at();
+        seed(&pool, old_anchor(i, s), None).await;
+        seed(
+            &pool,
+            span(i, s, "trip", LongTrip, at - days(1), at + days(5)),
+            None,
+        )
+        .await;
+        let c = EventRepo { pool: &pool }
+            .current(i, None, at, Some(Health::Normal))
+            .await
+            .unwrap();
+        assert_eq!(c.background.map(|e| e.kind), Some(LongTrip));
+        assert_eq!(c.cycle.map(|e| e.kind), Some(Period));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_scare_under_way_is_the_cycle_event(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let at = cycle_at();
+        let told = row(&pool, s, "assistant", "2026-02-28T12:00:00Z", false).await;
+        seed(
+            &pool,
+            span(i, s, "anchor", Period, at - days(27), at - days(24)),
+            None,
+        )
+        .await;
+        seed(
+            &pool,
+            span(i, s, "scare", PeriodScare, at - days(1), at + days(3)),
+            Some(told),
+        )
+        .await;
+        let repo = EventRepo { pool: &pool };
+        let c = repo
+            .current(i, None, at, Some(Health::Normal))
+            .await
+            .unwrap();
+        assert_eq!(
+            c.cycle,
+            Some(CycleEvent {
+                kind: PeriodScare,
+                started_at: at - days(1),
+                ends_at: at + days(3),
+                message_id: Some(told),
+            })
+        );
+        assert_eq!(c.foreground, None);
+        // Read for a persona with no cycle, the scare lands in no slot.
+        let c = repo.current(i, None, at, None).await.unwrap();
+        assert_eq!((c.foreground, c.background, c.cycle), (None, None, None));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn current_reads_the_cycle_at_the_message(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let at = cycle_at();
+        seed(&pool, old_anchor(i, s), None).await;
+        // A newer anchor, started after the message's moment.
+        seed(
+            &pool,
+            span(i, s, "newer", Period, at - hours(1), at + hours(71)),
+            None,
+        )
+        .await;
+        let then = row(&pool, s, "user", "2026-02-19T12:00:00Z", false).await;
+        let c = EventRepo { pool: &pool }
+            .current(i, Some(then), at, Some(Health::Normal))
+            .await
+            .unwrap();
+        assert_eq!(c.cycle, None);
+        assert_eq!(c.at, at - days(10));
+        assert_eq!(
+            c.cycle_rows.period.map(|p| p.started_at),
+            Some(at - days(28) - hours(1)),
+            "the anchor is the newest row started by the moment"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_scare_under_way_blocks_no_write(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let at = cycle_at();
+        seed(
+            &pool,
+            span(i, s, "scare", PeriodScare, at - days(1), at + days(3)),
+            None,
+        )
+        .await;
+        let repo = EventRepo { pool: &pool };
+        let sick = repo
+            .insert(&span(i, s, "sick", Sick, at, at + days(2)), None)
+            .await
+            .unwrap();
+        assert!(sick.is_some(), "a background lands during a scare");
+        let reading = repo
+            .insert(
+                &span(i, s, "reading", Reading, at + hours(1), at + hours(2)),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(reading.is_some(), "an incident lands during a scare");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_preempting_write_leaves_a_scare_running(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let at = cycle_at();
+        seed(
+            &pool,
+            span(i, s, "scare", PeriodScare, at - days(1), at + days(3)),
+            None,
+        )
+        .await;
+        seed(
+            &pool,
+            span(
+                i,
+                s,
+                "reading",
+                Reading,
+                at - chrono::Duration::minutes(30),
+                at + chrono::Duration::minutes(30),
+            ),
+            None,
+        )
+        .await;
+        let mut tx = pool.begin().await.unwrap();
+        EventRepo::end_foreground_in_tx(&mut tx, i, at)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let ends = |key: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, DateTime<Utc>>(
+                    "SELECT ends_at FROM engine.persona_events WHERE session_id = $1 AND event_key = $2",
+                )
+                .bind(s)
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(ends("reading").await, at);
+        assert_eq!(ends("scare").await, at + days(3));
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §7, "Not the world system".
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backgrounds_at_leaves_period_out(pool: PgPool) {
+        let (_, a, sa) = instance_and_session(&pool).await;
+        let (_, b, sb) = instance_and_session(&pool).await;
+        let at = cycle_at();
+        seed(
+            &pool,
+            span(a, sa, "period", Period, at - hours(1), at + hours(71)),
+            None,
+        )
+        .await;
+        seed(
+            &pool,
+            span(b, sb, "sick", Sick, at - days(1), at + days(1)),
+            None,
+        )
+        .await;
+        let got = EventRepo { pool: &pool }
+            .backgrounds_at(&[a, b], at)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[&b].kind, Sick);
     }
 }

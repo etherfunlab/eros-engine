@@ -4427,25 +4427,23 @@ pub(crate) fn partner_gender_of(
 
 /// What she is doing at a picture's moment, as the composer reads it: the
 /// events under way for `instance_id` at `at_message` (or at `now` without
-/// one), plus `starting`. Fail-open: a failed read is warned and reads as no
-/// events under way (`starting` still counts), never blocks the picture.
+/// one), plus `starting`. `period` is the persona's
+/// `PersonaTraits::cycle_health`. Fail-open: a failed read is warned and reads
+/// as no events under way (`starting` still counts), never blocks the picture.
 pub(crate) async fn state_for_picture(
     pool: &sqlx::PgPool,
     instance_id: Uuid,
     at_message: Option<Uuid>,
     now: chrono::DateTime<chrono::Utc>,
     starting: Option<eros_engine_core::events::EventKind>,
+    period: Option<eros_engine_core::events::Health>,
 ) -> Option<String> {
     let current = (eros_engine_store::events::EventRepo { pool })
-        .current(instance_id, at_message, now)
+        .current(instance_id, at_message, now, period)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(%instance_id, "image-compose: event read failed: {e}");
-            eros_engine_store::events::CurrentEvents {
-                foreground: None,
-                background: None,
-                at: now,
-            }
+            eros_engine_store::events::CurrentEvents::none(now)
         });
     picture_state_of(&current, starting)
 }
@@ -5196,29 +5194,27 @@ pub(crate) fn run_stream_with(
                 tracing::warn!("stream: ignore conversion failed: {e}");
             }
         }
+        let traits = crate::prompt::persona_traits(&input.persona);
         // The events under way at this turn, anchored at its own row so a
         // re-driven turn sees the same ones (spec 2026-10-15-life-events-v2-
-        // design.md §6.4). Independent of the judge.
+        // design.md §6.4), with her cycle (spec 2026-11-24-period-cycle-
+        // design.md §7). Independent of the judge.
         let current = eros_engine_store::events::EventRepo { pool: &state.pool }
             .current(
                 user_msg.instance_id,
                 Some(user_msg.user_message_id),
                 chrono::Utc::now(),
+                traits.cycle_health(),
             )
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("stream: event read failed: {e}");
-                eros_engine_store::events::CurrentEvents {
-                    foreground: None,
-                    background: None,
-                    at: chrono::Utc::now(),
-                }
+                eros_engine_store::events::CurrentEvents::none(chrono::Utc::now())
             });
         // An action turn and a client-forced image turn are always answered,
         // never met with silence.
         let action_turn = user_msg.action.is_some();
         let force_image = user_msg.image.as_ref().is_some_and(|i| i.force);
-        let traits = crate::prompt::persona_traits(&input.persona);
         let offline_now = current
             .foreground
             .as_ref()
@@ -23760,7 +23756,7 @@ data: [DONE]\n\n"
             eros_engine_store::events::CurrentEvents {
                 foreground: foreground.map(live_event),
                 background: background.map(live_event),
-                at: chrono::DateTime::UNIX_EPOCH,
+                ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
             }
         };
         assert_eq!(
@@ -23914,13 +23910,9 @@ data: [DONE]\n\n"
         let under_way = eros_engine_store::events::CurrentEvents {
             foreground: Some(live_event(OnATrain)),
             background: Some(live_event(ShortTrip)),
-            at: chrono::DateTime::UNIX_EPOCH,
+            ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
         };
-        let nothing = eros_engine_store::events::CurrentEvents {
-            foreground: None,
-            background: None,
-            at: chrono::DateTime::UNIX_EPOCH,
-        };
+        let nothing = eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH);
         assert_eq!(
             picture_state_of(&under_way, None).as_deref(),
             Some("短途旅游；在坐火车")
@@ -23944,7 +23936,7 @@ data: [DONE]\n\n"
         let incident_only = eros_engine_store::events::CurrentEvents {
             foreground: Some(live_event(OnATrain)),
             background: None,
-            at: chrono::DateTime::UNIX_EPOCH,
+            ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
         };
         assert_eq!(
             picture_state_of(&incident_only, Some(LongTrip)).as_deref(),
@@ -23957,7 +23949,7 @@ data: [DONE]\n\n"
         let background_only = eros_engine_store::events::CurrentEvents {
             foreground: None,
             background: Some(live_event(ShortTrip)),
-            at: chrono::DateTime::UNIX_EPOCH,
+            ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
         };
         assert_eq!(
             picture_state_of(&background_only, Some(TakingSelfie)).as_deref(),
@@ -23988,7 +23980,7 @@ data: [DONE]\n\n"
         let on_a_date = eros_engine_store::events::CurrentEvents {
             foreground: Some(live_event(EventKind::OnADate)),
             background: None,
-            at: chrono::DateTime::UNIX_EPOCH,
+            ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
         };
         assert_eq!(
             picture_state_of(

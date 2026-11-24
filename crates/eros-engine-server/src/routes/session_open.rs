@@ -385,7 +385,7 @@ async fn plan_open(
     // She is offline (spec 2026-10-16-life-events-offline-and-scares-design.md
     // §4.2): no greeting.
     let away = eros_engine_store::events::EventRepo { pool: &state.pool }
-        .current(instance_id, None, now)
+        .current(instance_id, None, now, None)
         .await?
         .foreground
         .is_some_and(|e| e.kind.is_offline(&crate::prompt::persona_traits(&persona)));

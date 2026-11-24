@@ -169,24 +169,19 @@ async fn get_effects(
     } else {
         None
     };
-    let current = eros_engine_store::events::EventRepo { pool: &state.pool }
-        .current(instance_id, None, now)
+    // How `indulgence` drifts, whether an event keeps her offline, and her
+    // cycle depend on the persona. A BYOC instance has no genome, no events,
+    // no cycle and no traits.
+    let persona = eros_engine_store::persona::PersonaRepo { pool: &state.pool }
+        .load_companion(instance_id)
         .await?;
-    // How `indulgence` drifts, and whether an event keeps her offline, can
-    // depend on the persona. A BYOC instance has no genome, no events and no
-    // traits.
-    let persona =
-        if rating.is_some() || current.foreground.is_some() || current.background.is_some() {
-            eros_engine_store::persona::PersonaRepo { pool: &state.pool }
-                .load_companion(instance_id)
-                .await?
-        } else {
-            None
-        };
     let traits = persona
         .as_ref()
         .map(crate::prompt::persona_traits)
         .unwrap_or_default();
+    let current = eros_engine_store::events::EventRepo { pool: &state.pool }
+        .current(instance_id, None, now, traits.cycle_health())
+        .await?;
     let habits = persona
         .as_ref()
         .map(crate::prompt::persona_habits)

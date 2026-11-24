@@ -5182,7 +5182,7 @@ mod tests {
         eros_engine_store::events::CurrentEvents {
             foreground,
             background,
-            at,
+            ..eros_engine_store::events::CurrentEvents::none(at)
         }
     }
 
@@ -5233,7 +5233,7 @@ mod tests {
         let c = eros_engine_store::events::CurrentEvents {
             foreground: Some(reading),
             background: Some(trip),
-            at,
+            ..eros_engine_store::events::CurrentEvents::none(at)
         };
         assert_eq!(
             events_judge_text(&c, None, None, None, None).unwrap(),
@@ -5243,11 +5243,7 @@ mod tests {
             events_reply_text(&c).unwrap(),
             "长途旅游（约 3 天后结束）；在看书（约 2 小时后结束）"
         );
-        let nothing = eros_engine_store::events::CurrentEvents {
-            foreground: None,
-            background: None,
-            at,
-        };
+        let nothing = eros_engine_store::events::CurrentEvents::none(at);
         assert_eq!(events_judge_text(&nothing, None, None, None, None), None);
         assert_eq!(events_reply_text(&nothing), None);
     }
@@ -5271,11 +5267,7 @@ mod tests {
     fn having_sex_judge_suffix() {
         use eros_engine_core::events::EventKind;
         let (sex, at) = event_at(EventKind::HavingSex, 180, -120);
-        let nothing = eros_engine_store::events::CurrentEvents {
-            foreground: None,
-            background: None,
-            at,
-        };
+        let nothing = eros_engine_store::events::CurrentEvents::none(at);
         assert_eq!(
             events_judge_text(&nothing, Some(&sex), None, None, None).unwrap(),
             "在做爱（2 小时前结束，期间对方的消息你没有回）"
@@ -5290,18 +5282,14 @@ mod tests {
         let c = eros_engine_store::events::CurrentEvents {
             foreground: None,
             background: Some(trip),
-            at,
+            ..eros_engine_store::events::CurrentEvents::none(at)
         };
         assert_eq!(
             events_judge_text(&c, Some(&away), None, None, None).unwrap(),
             "出差（10 小时前开始，约 14 小时后结束）；没看手机（不到 1 小时前结束，期间对方的消息你没有回）"
         );
         let (long_ago, _) = event_at(EventKind::AwayFromPhone, 240, -120);
-        let nothing = eros_engine_store::events::CurrentEvents {
-            foreground: None,
-            background: None,
-            at,
-        };
+        let nothing = eros_engine_store::events::CurrentEvents::none(at);
         assert_eq!(
             events_judge_text(&nothing, Some(&long_ago), None, None, None).unwrap(),
             "没看手机（2 小时前结束，期间对方的消息你没有回）"
@@ -5316,7 +5304,7 @@ mod tests {
         let c = eros_engine_store::events::CurrentEvents {
             foreground: Some(scare),
             background: Some(trip),
-            at,
+            ..eros_engine_store::events::CurrentEvents::none(at)
         };
         assert_eq!(
             events_reply_text(&c).unwrap(),
@@ -5435,11 +5423,7 @@ mod tests {
         use eros_engine_core::events::EventKind::*;
         let (asleep, at) = event_at(Asleep, 180, -120);
         let (scare, _) = event_at(PregnancyScare, 70, -10);
-        let none = eros_engine_store::events::CurrentEvents {
-            foreground: None,
-            background: None,
-            at,
-        };
+        let none = eros_engine_store::events::CurrentEvents::none(at);
         assert_eq!(
             events_judge_text(&none, Some(&asleep), None, Some(&scare), None).as_deref(),
             Some("睡着了（2 小时前结束，期间对方的消息你没有回）；验出怀孕（不到 1 小时前结束，结果是虚惊一场）")
@@ -5450,11 +5434,7 @@ mod tests {
     fn a_returned_separation_has_two_wordings() {
         use eros_engine_core::events::EventKind::*;
         let (space, at) = event_at(TakingSpace, 480, -120);
-        let none = eros_engine_store::events::CurrentEvents {
-            foreground: None,
-            background: None,
-            at,
-        };
+        let none = eros_engine_store::events::CurrentEvents::none(at);
         let wrote = (space.clone(), true);
         let honoured = (space, false);
         assert_eq!(
@@ -5486,11 +5466,7 @@ mod tests {
         let (space, at) = event_at(TakingSpace, 480, -120);
         let (asleep, _) = event_at(Asleep, 100, -20);
         let (scare, _) = event_at(PregnancyScare, 70, -10);
-        let none = eros_engine_store::events::CurrentEvents {
-            foreground: None,
-            background: None,
-            at,
-        };
+        let none = eros_engine_store::events::CurrentEvents::none(at);
         let honoured = (space.clone(), false);
         // The standard entry for the same event gives way: said once.
         assert_eq!(
@@ -5536,11 +5512,7 @@ mod tests {
             settled_at: Some(ended),
             created_at: ended - chrono::Duration::hours(4),
         };
-        let none = eros_engine_store::events::CurrentEvents {
-            foreground: None,
-            background: None,
-            at,
-        };
+        let none = eros_engine_store::events::CurrentEvents::none(at);
         assert_eq!(
             just_now_text(None, None, None, Some(&date)).as_deref(),
             Some("你们刚约会回来（海边，看海）")
