@@ -5,6 +5,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::cycle::{self, CycleRows};
 use crate::needs::{Habits, NeedLevel, Needs};
 
 const DAY: i64 = 24;
@@ -689,7 +690,11 @@ fn rule(kind: EventKind) -> Rule {
         Showering => (2.0, 12, Lasts::Minutes(30)),
         Bathing => (1.0, 48, Lasts::Hours(1, 1)),
         OnTheWay => (2.0, 12, Lasts::Minutes(30)),
-        PeriodScare => (0.5, 28 * DAY, Lasts::Hours(1, 1)),
+        // The `Lasts` of `period` and `period_scare` only bound `lookback()`:
+        // `draw` sets their real length from the cycle (spec
+        // 2026-11-24-period-cycle-design.md §5, §6). A scare starts at most
+        // three days before its due moment and ends at most three after.
+        PeriodScare => (0.5, 0, Lasts::Hours(DAY, 6 * DAY)),
         PregnancyScare => (0.5, 60 * DAY, Lasts::Hours(1, 1)),
         GotBumped => (1.0, 72, Lasts::Minutes(30)),
         Quarrel => (1.0, 48, Lasts::Hours(1, 1)),
@@ -722,7 +727,7 @@ fn rule(kind: EventKind) -> Rule {
         WantToGoOut => (1.0, 24, Lasts::Hours(1, 3)),
         WantToGoHome => (1.0, 24, Lasts::Hours(1, 3)),
         Sick => (3.0, 14 * DAY, Lasts::Hours(DAY, 3 * DAY)),
-        Period => (3.0, 28 * DAY, Lasts::Hours(3 * DAY, 7 * DAY)),
+        Period => (3.0, 28 * DAY, Lasts::Hours(DAY, 5 * DAY)),
         Hospitalized => (0.5, 60 * DAY, Lasts::Hours(2 * DAY, 5 * DAY)),
         PostSurgery => (0.5, 90 * DAY, Lasts::Hours(3 * DAY, 7 * DAY)),
         BusinessTrip => (3.0, 0, Lasts::Hours(DAY, DAY)),
@@ -1071,11 +1076,20 @@ fn follows(prior: EventKind, kind: EventKind) -> bool {
 }
 
 /// `FOLLOW_FACTOR` once for every distinct live prior of `kind`: under way
-/// at `now`, or ended within `FOLLOW_WINDOW_HOURS` before it.
-fn follow_factor(kind: EventKind, history: &[PastEvent], now: DateTime<Utc>) -> f64 {
+/// at `now`, or ended within `FOLLOW_WINDOW_HOURS` before it. `latest_period`
+/// is the period the cycle derives, which has no row in `history` (spec
+/// 2026-11-24-period-cycle-design.md §7): one more prior, and the same one as
+/// a `period` row of `history` when both are there.
+fn follow_factor(
+    kind: EventKind,
+    history: &[PastEvent],
+    latest_period: Option<&PastEvent>,
+    now: DateTime<Utc>,
+) -> f64 {
     let since = now - Duration::hours(FOLLOW_WINDOW_HOURS);
     let mut live: Vec<EventKind> = history
         .iter()
+        .chain(latest_period)
         .filter(|e| e.ends_at > since && follows(e.kind, kind))
         .map(|e| e.kind)
         .collect();
@@ -1092,6 +1106,23 @@ fn prior_factor(kind: EventKind, persona: &PersonaTraits, ever_had_sex: bool) ->
             UNLIKELY_FACTOR
         }
         EventKind::PregnancyScare if !ever_had_sex => UNLIKELY_FACTOR,
+        _ => 1.0,
+    }
+}
+
+/// `FOLLOW_FACTOR`, once, for `period_scare` when any kind of sex started
+/// since `window` opened, the three days before her next period is due (spec
+/// 2026-11-24-period-cycle-design.md §6); 1 for every other kind, and without
+/// a window.
+fn sex_before_period_factor(
+    kind: EventKind,
+    history: &[PastEvent],
+    window: Option<DateTime<Utc>>,
+) -> f64 {
+    match window {
+        Some(since) if kind == EventKind::PeriodScare && had_sex_since(history, since) => {
+            FOLLOW_FACTOR
+        }
         _ => 1.0,
     }
 }
@@ -1269,6 +1300,10 @@ pub struct DrawInput<'a> {
     /// Whether the session's scopes are romance-compatible
     /// (`scope::romance_compatible`): the gate on `strip`.
     pub romance_compatible: bool,
+    /// The newest `period` and `period_scare` rows started at or before
+    /// `now`, however old (spec 2026-11-24-period-cycle-design.md §5);
+    /// `CycleRows::default()` for a persona with no period.
+    pub cycle: CycleRows,
 }
 
 /// Three uniform draws in [0, 1): one per stage, one for the length.
@@ -1286,22 +1321,50 @@ pub struct Drawn {
     pub lasts: Duration,
 }
 
-/// The kind drawn, or `None` (§5).
+/// Whether `history` holds a kind of [`EventKind::SEX`] that started at or
+/// after `since`.
+fn had_sex_since(history: &[PastEvent], since: DateTime<Utc>) -> bool {
+    history
+        .iter()
+        .any(|e| EventKind::SEX.contains(&e.kind) && e.started_at >= since)
+}
+
+/// The kind drawn, or `None` (§5). Her cycle (spec
+/// 2026-11-24-period-cycle-design.md §5–§7) enters as `input.cycle`: a
+/// period under way keeps backgrounds out and the false alarms ruled out as
+/// a `period` background does, `period` is drawn only without an anchor and
+/// `period_scare` only in the days before her next period is due.
 pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
     let under_way = |e: &&PastEvent| e.ends_at > input.now;
     if input
         .history
         .iter()
         .filter(under_way)
-        .any(|e| !e.kind.is_background())
+        .any(|e| e.kind.slot() == Slot::Foreground)
     {
         return None;
     }
+    // A persona with no period has no cycle, whatever rows her instance holds.
+    let cycle = if input.persona.period {
+        input.cycle
+    } else {
+        CycleRows::default()
+    };
+    let health = input.persona.health;
+    let cycle_state = cycle::state(&cycle, health, input.now);
+    let on_period = cycle_state.is_some_and(|s| s.kind == EventKind::Period);
+    let latest_period = cycle::latest_period(&cycle, health, input.now);
+    // Her next due moment, and the window before it that a scare can start in.
+    let due = cycle
+        .period
+        .map(|anchor| cycle::next_due(anchor.started_at, input.now));
+    let window = due.map(|due| due - Duration::days(cycle::SCARE_WINDOW_DAYS));
+    let scare_allowed = cycle_state.is_none() && window.is_some_and(|w| input.now >= w);
     let background = input
         .history
         .iter()
         .filter(under_way)
-        .find(|e| e.kind.is_background())
+        .find(|e| e.kind.slot() == Slot::Background)
         .map(|e| e.kind);
     let cooling =
         |started_at: DateTime<Utc>, hours: i64| started_at + Duration::hours(hours) > input.now;
@@ -1317,6 +1380,11 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
             )
         })
         .filter(|k| k.fits(input.persona.setting))
+        .filter(|k| match k {
+            EventKind::Period => cycle.period.is_none(),
+            EventKind::PeriodScare => scare_allowed,
+            _ => true,
+        })
         .filter(|k| {
             !input
                 .history
@@ -1336,9 +1404,11 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
                         && cooling(e.started_at, OFFLINE_COOLDOWN_HOURS)
                 })
         })
-        .filter(|k| match background {
-            Some(b) => !k.is_background() && !rules_out(b, *k),
-            None => true,
+        .filter(|k| {
+            let kept_out = (background.is_some() || on_period) && k.is_background();
+            let ruled_out = background.is_some_and(|b| rules_out(b, *k))
+                || (on_period && rules_out(EventKind::Period, *k));
+            !kept_out && !ruled_out
         })
         .filter(|k| match needs_background(*k) {
             Some(during) => input
@@ -1368,21 +1438,24 @@ pub fn draw(input: &DrawInput, rolls: Rolls) -> Option<Drawn> {
                 * needs_factor(k, input.needs.as_ref())
                 * indulgence_factor(k, input.needs.as_ref())
                 * preference_factor(k, input.persona)
-                * follow_factor(k, input.history, input.now)
+                * follow_factor(k, input.history, latest_period.as_ref(), input.now)
                 * prior_factor(k, input.persona, input.ever_had_sex)
                 * homesick_factor(k, input.persona)
                 * sex_addict_factor(k, input.persona)
                 * hygienic_factor(k, input.persona)
                 * employed_factor(k, input.persona)
-                * outdoorsy_factor(k, input.persona);
+                * outdoorsy_factor(k, input.persona)
+                * sex_before_period_factor(k, input.history, window);
             (k, weight)
         })
         .collect();
     let kind = pick(&kinds, rolls.kind)?;
-    Some(Drawn {
-        kind,
-        lasts: lasts(kind, rolls.duration),
-    })
+    let lasts = match (kind, due) {
+        (EventKind::Period, _) => Duration::days(cycle::period_days(health)),
+        (EventKind::PeriodScare, Some(due)) => cycle::scare_ends(due, rolls.duration) - input.now,
+        _ => lasts(kind, rolls.duration),
+    };
+    Some(Drawn { kind, lasts })
 }
 
 /// One entry by cumulative weight; a roll of exactly 1.0 (or float residue)
@@ -1402,7 +1475,9 @@ fn pick<T: Copy>(weighted: &[(T, f64)], roll: f64) -> Option<T> {
     weighted.last().map(|(item, _)| *item)
 }
 
-/// How long `kind` lasts for a uniform `roll` in [0, 1).
+/// How long `kind` lasts for a uniform `roll` in [0, 1). The table only
+/// bounds `period` and `period_scare` (for `lookback()`); `draw` sets their
+/// length from the cycle.
 pub fn lasts(kind: EventKind, roll: f64) -> Duration {
     match rule(kind).lasts {
         Lasts::Minutes(m) => Duration::minutes(m),
@@ -1534,6 +1609,7 @@ mod tests {
                 allowed,
                 ever_had_sex: false,
                 romance_compatible: false,
+                cycle: CycleRows::default(),
             },
             r,
         )
@@ -1552,6 +1628,7 @@ mod tests {
                 allowed,
                 ever_had_sex: false,
                 romance_compatible: true,
+                cycle: CycleRows::default(),
             },
             r,
         )
@@ -1561,6 +1638,56 @@ mod tests {
     /// A female persona at rung 3 without needs: every gate open.
     fn pick(history: &[PastEvent], allowed: &[EventKind], r: Rolls) -> Option<EventKind> {
         pick_with(&female(), None, 3, history, allowed, r)
+    }
+
+    /// A draw for `persona` with no needs, handed the cycle rows.
+    fn draw_cycle(
+        persona: &PersonaTraits,
+        cycle: CycleRows,
+        history: &[PastEvent],
+        allowed: &[EventKind],
+        rung: u8,
+        r: Rolls,
+    ) -> Option<Drawn> {
+        draw(
+            &DrawInput {
+                now: now(),
+                needs: None,
+                intimacy_rung: rung,
+                persona,
+                history,
+                allowed,
+                ever_had_sex: false,
+                romance_compatible: false,
+                cycle,
+            },
+            r,
+        )
+    }
+
+    /// The anchor row: a three-day `period` that started `hours_ago`.
+    fn anchor(hours_ago: i64) -> PastEvent {
+        past(Period, hours_ago, 72)
+    }
+
+    /// An anchor whose next due moment is `now() + 24h`: inside the scare
+    /// window.
+    fn due_tomorrow() -> PastEvent {
+        anchor(27 * 24)
+    }
+
+    /// An anchor whose period 1 started an hour ago: a derived period is
+    /// under way.
+    fn on_period() -> PastEvent {
+        anchor(28 * 24 + 1)
+    }
+
+    /// The cycle rows of an instance whose only row is `anchor`.
+    fn cycle_of(anchor: PastEvent) -> CycleRows {
+        CycleRows {
+            period: Some(anchor),
+            scare: None,
+        }
     }
 
     #[test]
@@ -1910,6 +2037,7 @@ mod tests {
                     allowed: &[kind],
                     ever_had_sex: false,
                     romance_compatible: false,
+                    cycle: CycleRows::default(),
                 },
                 Rolls {
                     category: 0.0,
@@ -2043,35 +2171,262 @@ mod tests {
     fn the_false_alarm_gates() {
         let male = PersonaTraits::default();
         for (k, min_rung) in [(PeriodScare, 2), (PregnancyScare, 3)] {
-            assert_eq!(
-                pick_with(&female(), None, min_rung - 1, &[], &[k], rolls(0.0, 0.0)),
-                None,
-                "{k:?} below its rung"
-            );
-            assert_eq!(
-                pick_with(&female(), None, min_rung, &[], &[k], rolls(0.0, 0.0)),
-                Some(k),
-                "{k:?} at its rung"
-            );
-            assert_eq!(
-                pick_with(&male, None, 3, &[], &[k], rolls(0.0, 0.0)),
-                None,
-                "{k:?} needs a female persona"
-            );
+            // A late-period scare is drawn only in the days before her
+            // period is due.
+            let cycle = if k == PeriodScare {
+                cycle_of(due_tomorrow())
+            } else {
+                CycleRows::default()
+            };
+            let kind = |p: &PersonaTraits, rung| {
+                draw_cycle(p, cycle, &[], &[k], rung, rolls(0.0, 0.0)).map(|d| d.kind)
+            };
+            assert_eq!(kind(&female(), min_rung - 1), None, "{k:?} below its rung");
+            assert_eq!(kind(&female(), min_rung), Some(k), "{k:?} at its rung");
+            assert_eq!(kind(&male, 3), None, "{k:?} needs a female persona");
         }
     }
 
     #[test]
     fn a_period_rules_the_false_alarms_out() {
-        let h = [past(Period, 24, 96)];
+        // The anchor row under way is her period: it is in the cycle rows
+        // and in the history, as the server reads it.
+        let period = past(Period, 24, 96);
+        let h = [period];
+        let kind = |cycle: CycleRows, history: &[PastEvent], k: EventKind| {
+            draw_cycle(&female(), cycle, history, &[k], 3, rolls(0.0, 0.0)).map(|d| d.kind)
+        };
         for k in [PeriodScare, PregnancyScare] {
-            assert_eq!(pick(&h, &[k], rolls(0.0, 0.0)), None, "{k:?}");
+            assert_eq!(kind(cycle_of(period), &h, k), None, "{k:?}");
         }
-        assert_eq!(pick(&h, &[Reading], rolls(0.0, 0.0)), Some(Reading));
+        assert_eq!(
+            kind(cycle_of(period), &h, Reading),
+            Some(Reading),
+            "an incident is still drawn"
+        );
         let trip = [past(BusinessTrip, 2, 24)];
         assert_eq!(
-            pick(&trip, &[PeriodScare], rolls(0.0, 0.0)),
+            kind(cycle_of(due_tomorrow()), &trip, PeriodScare),
             Some(PeriodScare)
+        );
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §5.
+    #[test]
+    fn period_is_drawn_once() {
+        // No anchor: drawn, and it lasts by health.
+        for (health, days) in [(Health::Strong, 1), (Health::Normal, 3), (Health::Weak, 5)] {
+            let persona = PersonaTraits { health, ..female() };
+            let d = draw_cycle(
+                &persona,
+                CycleRows::default(),
+                &[],
+                &[Period],
+                3,
+                rolls(0.0, 0.0),
+            )
+            .unwrap();
+            assert_eq!(
+                (d.kind, d.lasts),
+                (Period, Duration::days(days)),
+                "{health:?}"
+            );
+        }
+        // With an anchor, however old: never again.
+        let rows = cycle_of(anchor(400 * 24));
+        assert_eq!(
+            draw_cycle(&female(), rows, &[], &[Period], 3, rolls(0.0, 0.0)),
+            None
+        );
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §6.
+    #[test]
+    fn a_scare_is_drawn_only_in_the_three_days_before_her_period() {
+        let scare = |rows: CycleRows, persona: &PersonaTraits, rung: u8, duration: f64| {
+            draw_cycle(
+                persona,
+                rows,
+                &[],
+                &[PeriodScare],
+                rung,
+                Rolls {
+                    category: 0.0,
+                    kind: 0.0,
+                    duration,
+                },
+            )
+        };
+        let due = cycle_of(due_tomorrow());
+        let d = scare(due, &female(), 2, 0.0).unwrap();
+        assert_eq!((d.kind, d.lasts), (PeriodScare, Duration::hours(24 + 24)));
+        let d = scare(due, &female(), 2, 0.99).unwrap();
+        assert_eq!(d.lasts, Duration::hours(24 + 72));
+        // Mid-cycle.
+        assert_eq!(scare(cycle_of(anchor(10 * 24)), &female(), 2, 0.0), None);
+        // No anchor.
+        assert_eq!(scare(CycleRows::default(), &female(), 2, 0.0), None);
+        // The rung gate.
+        assert_eq!(scare(due, &female(), 1, 0.0), None);
+        let no_trait = PersonaTraits {
+            period: false,
+            ..female()
+        };
+        assert_eq!(scare(due, &no_trait, 2, 0.0), None);
+        // The window opens exactly three days before the due moment.
+        assert!(scare(cycle_of(anchor(25 * 24)), &female(), 2, 0.0).is_some());
+        assert_eq!(
+            scare(cycle_of(anchor(25 * 24 - 1)), &female(), 2, 0.0),
+            None
+        );
+    }
+
+    #[test]
+    fn sex_before_her_period_makes_a_scare_likelier() {
+        // Short, in draw order: animal_encounter 3.0 then period_scare 0.5. A
+        // kind roll of 0.7 lands on the animal (2.45 of 3.5) and, with the
+        // scare at 1.5, on the scare (3.15 of 4.5).
+        let rows = cycle_of(due_tomorrow());
+        let both = [AnimalEncounter, PeriodScare];
+        let kind = |h: &[PastEvent]| {
+            draw_cycle(&female(), rows, h, &both, 2, rolls(0.0, 0.7)).map(|d| d.kind)
+        };
+        assert_eq!(kind(&[]), Some(AnimalEncounter));
+        assert_eq!(kind(&[past(JustHaveSex, 24, 1)]), Some(PeriodScare));
+        assert_eq!(kind(&[past(HavingSexTogether, 24, 1)]), Some(PeriodScare));
+        // Before the window.
+        assert_eq!(kind(&[past(JustHaveSex, 5 * 24, 1)]), Some(AnimalEncounter));
+        // Once, however many: the scare weighs 1.5, not 4.5, so it takes
+        // the roll from 3/4.5 on and not from 3/7.5.
+        let twice = [past(JustHaveSex, 24, 1), past(HavingSexTogether, 30, 1)];
+        let at = |roll: f64| {
+            draw_cycle(&female(), rows, &twice, &both, 2, rolls(0.0, roll)).map(|d| d.kind)
+        };
+        assert_eq!(at(0.5), Some(AnimalEncounter));
+        assert_eq!(at(0.68), Some(PeriodScare));
+    }
+
+    /// Spec 2026-11-24-period-cycle-design.md §7: a derived period does what
+    /// a `period` row under way does.
+    #[test]
+    fn a_derived_period_acts_as_a_period_background() {
+        // The anchor row under way, and period 1 derived from an anchor that
+        // started 28 days ago; the history holds the anchor row as the server
+        // reads it.
+        let row = anchor(24);
+        let derived = on_period();
+        for (rows, history) in [(cycle_of(row), [row]), (cycle_of(derived), [derived])] {
+            let kind = |k: EventKind| {
+                draw_cycle(&female(), rows, &history, &[k], 3, rolls(0.0, 0.0)).map(|d| d.kind)
+            };
+            for k in [ShortTrip, Sick] {
+                assert_eq!(kind(k), None, "{k:?}");
+            }
+            assert_eq!(kind(PregnancyScare), None);
+            assert_eq!(kind(AnimalEncounter), Some(AnimalEncounter));
+        }
+        // No trait, no cycle.
+        let no_trait = PersonaTraits {
+            period: false,
+            ..female()
+        };
+        for k in [ShortTrip, Sick, PregnancyScare] {
+            assert_eq!(
+                draw_cycle(&no_trait, cycle_of(derived), &[], &[k], 3, rolls(0.0, 0.0))
+                    .map(|d| d.kind),
+                Some(k),
+                "{k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn irritable_follows_a_period_for_two_days_after() {
+        // Mid, in draw order: reading 2 then irritable 1.
+        let kind = |rows: CycleRows, history: &[PastEvent], roll: f64| {
+            draw_cycle(
+                &female(),
+                rows,
+                history,
+                &[Reading, Irritable],
+                3,
+                rolls(0.0, roll),
+            )
+            .map(|d| d.kind)
+        };
+        // Irritable weighs 3 with a live period: it takes the roll from 2/5.
+        let weighs_three = |rows: CycleRows, history: &[PastEvent]| {
+            kind(rows, history, 0.39) == Some(Reading)
+                && kind(rows, history, 0.41) == Some(Irritable)
+        };
+        // Irritable weighs 1 otherwise: it takes the roll from 2/3.
+        let weighs_one = |rows: CycleRows, history: &[PastEvent]| {
+            kind(rows, history, 0.65) == Some(Reading)
+                && kind(rows, history, 0.68) == Some(Irritable)
+        };
+        assert!(weighs_one(CycleRows::default(), &[]));
+        // The anchor row under way, a derived period under way, and one
+        // that ended 24 hours ago.
+        assert!(weighs_three(cycle_of(anchor(24)), &[]));
+        assert!(weighs_three(cycle_of(on_period()), &[]));
+        assert!(weighs_three(cycle_of(anchor(32 * 24)), &[]));
+        // One that ended 72 hours ago.
+        assert!(weighs_one(cycle_of(anchor(34 * 24)), &[]));
+        // The anchor row, held in the history and in the cycle rows, is one
+        // prior and not two.
+        assert!(weighs_three(cycle_of(anchor(24)), &[anchor(24)]));
+        // The multiplier itself: the latest period is one more prior.
+        let latest = cycle::latest_period(&cycle_of(on_period()), Health::Normal, now());
+        assert_eq!(
+            follow_factor(Irritable, &[], latest.as_ref(), now()),
+            FOLLOW_FACTOR * follow_factor(Irritable, &[], None, now())
+        );
+    }
+
+    #[test]
+    fn a_derived_period_does_not_cool_the_body_category() {
+        // Period 1 started five days ago; the anchor row is 33 days old.
+        let rows = cycle_of(anchor(33 * 24));
+        assert_eq!(
+            draw_cycle(&female(), rows, &[], &[Sick], 3, rolls(0.0, 0.0)).map(|d| d.kind),
+            Some(Sick)
+        );
+    }
+
+    #[test]
+    fn a_scare_under_way_stops_nothing() {
+        let s = past(PeriodScare, 24, 96);
+        let rows = CycleRows {
+            period: Some(anchor(27 * 24 + 12)),
+            scare: Some(s),
+        };
+        for k in [AnimalEncounter, ShortTrip] {
+            assert_eq!(
+                draw_cycle(&female(), rows, &[s], &[k], 3, rolls(0.0, 0.0)).map(|d| d.kind),
+                Some(k),
+                "{k:?}"
+            );
+        }
+        // One per cycle.
+        assert_eq!(
+            draw_cycle(&female(), rows, &[s], &[PeriodScare], 3, rolls(0.0, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_scare_waits_for_a_foreground_to_end() {
+        let rows = cycle_of(due_tomorrow());
+        assert_eq!(
+            draw_cycle(
+                &female(),
+                rows,
+                &[past(Reading, 1, 3)],
+                &[PeriodScare],
+                2,
+                rolls(0.0, 0.0)
+            ),
+            None
         );
     }
 
@@ -2172,6 +2527,7 @@ mod tests {
                     allowed: &[kind],
                     ever_had_sex: false,
                     romance_compatible: false,
+                    cycle: cycle_of(due_tomorrow()),
                 },
                 Rolls {
                     category: 0.0,
@@ -2182,7 +2538,8 @@ mod tests {
             .unwrap()
             .lasts
         };
-        assert_eq!(lasts(PeriodScare, 0.5), Duration::hours(1));
+        // Due in 24 hours; a duration of 0.5 ends it two days after that.
+        assert_eq!(lasts(PeriodScare, 0.5), Duration::hours(24 + 48));
         assert_eq!(lasts(PregnancyScare, 0.9), Duration::hours(1));
         assert_eq!(lasts(Busy, 0.0), Duration::hours(1));
         assert_eq!(lasts(Busy, 1.0), Duration::hours(3));
@@ -2365,6 +2722,7 @@ mod tests {
                     allowed: &[kind],
                     ever_had_sex: false,
                     romance_compatible: false,
+                    cycle: CycleRows::default(),
                 },
                 Rolls {
                     category: 0.0,
@@ -2798,6 +3156,7 @@ mod tests {
                 allowed,
                 ever_had_sex,
                 romance_compatible: false,
+                cycle: CycleRows::default(),
             },
             r,
         )
@@ -3997,17 +4356,19 @@ mod tests {
             period: false,
             ..female()
         };
+        // Even an anchor inside the scare window gives a machine nothing.
+        let cycle = cycle_of(due_tomorrow());
         for k in [Period, PeriodScare, PregnancyScare] {
-            assert_eq!(
-                pick_with(&machine, None, 3, &[], &[k], rolls(0.0, 0.0)),
-                None,
-                "{k:?}"
-            );
-            assert_eq!(
-                pick_with(&female(), None, 3, &[], &[k], rolls(0.0, 0.0)),
-                Some(k),
-                "{k:?}"
-            );
+            let cycle = if k == Period {
+                CycleRows::default()
+            } else {
+                cycle
+            };
+            let kind = |p: &PersonaTraits| {
+                draw_cycle(p, cycle, &[], &[k], 3, rolls(0.0, 0.0)).map(|d| d.kind)
+            };
+            assert_eq!(kind(&machine), None, "{k:?}");
+            assert_eq!(kind(&female()), Some(k), "{k:?}");
         }
         for k in [Sick, SawBag] {
             assert_eq!(
@@ -4135,16 +4496,17 @@ mod tests {
             ..Default::default()
         };
         for k in [Period, PeriodScare] {
-            assert_eq!(
-                pick_with(&no_period, None, 3, &[], &[k], rolls(0.0, 0.0)),
-                None,
-                "{k:?}"
-            );
-            assert_eq!(
-                pick_with(&card_period, None, 3, &[], &[k], rolls(0.0, 0.0)),
-                Some(k),
-                "{k:?}"
-            );
+            // The scare also needs an anchor whose due moment is near.
+            let cycle = if k == Period {
+                CycleRows::default()
+            } else {
+                cycle_of(due_tomorrow())
+            };
+            let kind = |p: &PersonaTraits| {
+                draw_cycle(p, cycle, &[], &[k], 3, rolls(0.0, 0.0)).map(|d| d.kind)
+            };
+            assert_eq!(kind(&no_period), None, "{k:?}");
+            assert_eq!(kind(&card_period), Some(k), "{k:?}");
         }
         // `pregnancy_scare` keeps reading gender.
         assert_eq!(

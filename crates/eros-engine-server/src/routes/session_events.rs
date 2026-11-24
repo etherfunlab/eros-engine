@@ -959,6 +959,7 @@ async fn plan_event(
             allowed: &allowed,
             ever_had_sex,
             romance_compatible,
+            cycle: Default::default(),
         },
         rolls,
     ) else {
