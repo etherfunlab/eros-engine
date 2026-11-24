@@ -267,6 +267,11 @@ pub const NUDGE_AFFIRM_P: f64 = 0.33;
 pub const NUDGE_SHARE_P: f64 = 0.13;
 pub const NUDGE_QUESTION_P: f64 = 0.05;
 
+/// The one `[this_turn]` line of a `focused` turn, the same at work and off
+/// work (spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
+/// §5.4).
+const FOCUSED_WORK_LINE: &str = "你手上有工作，心思在工作上：回得简短利落，先顾手上的事";
+
 /// Veto-then-roll (spec 2026-09-13 §3.2 moves the call site, not the odds):
 /// an axis the affinity has already judged cold (same floors and scope gating
 /// as the cold `[mood]` directives) keeps its die out of the cup entirely.
@@ -1817,6 +1822,11 @@ pub(crate) fn render_recall_sections(
 ///
 /// `user_profile = false` leaves the `[user_profile]` block out, header and
 /// placeholder included (the `emotional` tone).
+///
+/// `focused = true` renders the `focused` tone (spec
+/// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
+/// §5.4): no `[feelings]`, `[reply_length]` at the lowest tier whatever the
+/// affinity and the mode, and `[this_turn]` holding `FOCUSED_WORK_LINE` alone.
 #[allow(clippy::too_many_arguments)] // signature mirrors the gateway's port-of-origin
 fn render_prompt(
     persona: &CompanionPersona,
@@ -1852,7 +1862,8 @@ fn render_prompt(
     // omitted and the prompt is byte-identical to the pre-change layout.
     character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
     // Engine-rolled per-turn nudges (`roll_nudges` at the call site).
-    // All-false ⇒ the [this_turn] block is omitted.
+    // All-false ⇒ the [this_turn] block is omitted, except on a focused turn,
+    // where the block holds the work line and the nudges are not read.
     nudges: TurnNudges,
     // The instant plus the user's side of `[now]` (spec 2026-09-26 §5).
     // `NowContext::default()` ⇒ no holiday line.
@@ -1877,6 +1888,7 @@ fn render_prompt(
     // right after the birthday line. Empty ⇒ no line.
     anniversaries: &[String],
     user_profile: bool,
+    focused: bool,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -1973,9 +1985,10 @@ fn render_prompt(
     // already lives in [mood]/[reply_length]. No clause yet (feature off /
     // fresh session), or a zero-axis scope ⇒ block absent, byte-identical
     // to the old empty case. The clause changes only on movement turns, so
-    // this section is more cache-stable than the floats it replaces.
+    // this section is more cache-stable than the floats it replaces. A focused
+    // turn renders no such block.
     let state = affinity
-        .filter(|_| affinity_scope.active_count() > 0)
+        .filter(|_| !focused && affinity_scope.active_count() > 0)
         .and_then(|a| a.feeling_clause.as_deref())
         .map(str::trim)
         .filter(|c| !c.is_empty())
@@ -2184,14 +2197,18 @@ fn render_prompt(
     // the behavior, so absence is the default (naming demonstrates, #329).
     let this_turn = {
         let mut won: Vec<&str> = Vec::new();
-        if nudges.affirm {
-            won.push("给对方「小小有成就感」的反应，留余地");
-        }
-        if nudges.share_slice {
-            won.push("主动分享一个自己的生活片段");
-        }
-        if nudges.open_question {
-            won.push("抛一个开放性问题，别问得刻意");
+        if focused {
+            won.push(FOCUSED_WORK_LINE);
+        } else {
+            if nudges.affirm {
+                won.push("给对方「小小有成就感」的反应，留余地");
+            }
+            if nudges.share_slice {
+                won.push("主动分享一个自己的生活片段");
+            }
+            if nudges.open_question {
+                won.push("抛一个开放性问题，别问得刻意");
+            }
         }
         if won.is_empty() {
             String::new()
@@ -2233,6 +2250,12 @@ fn render_prompt(
         })
         .collect();
 
+    let lr = if focused {
+        length_rule(None, affinity_scope, None)
+    } else {
+        length_rule(affinity, affinity_scope, reply_mode)
+    };
+
     format!(
         "{head}{guard}{identity}\n\
          \n\
@@ -2256,7 +2279,6 @@ fn render_prompt(
          \n\
          [output]直接输出回复文字（纯文本，不要 JSON，不要 markdown，不要 quote 符号；不要用括号或星号标注动作、神态、心理活动或旁白，想表达动作或情绪，让它体现在话语本身）",
         tc = now_context_at(now.now, timezone, now.user_timezone),
-        lr = length_rule(affinity, affinity_scope, reply_mode),
         rule1 = rule_one(reply_mode),
     )
 }
@@ -2310,6 +2332,7 @@ pub fn build_prompt(
         shared_memories,
         anniversaries,
         true,
+        false,
     )
 }
 
@@ -2360,6 +2383,62 @@ pub fn build_emotional_prompt(
         shared_memories,
         &[],
         false,
+        false,
+    )
+}
+
+/// The `focused` tone's system prompt (spec
+/// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
+/// §5.4): the default prompt without `[feelings]` and `[emotional_context]`,
+/// `[reply_length]` at the lowest tier, and `[this_turn]` holding the work
+/// line alone. Every parameter is documented on `render_prompt`.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub fn build_focused_prompt(
+    persona: &CompanionPersona,
+    profile_groups: &[(String, Vec<String>)],
+    relationship_facts: &[String],
+    affinity: Option<&Affinity>,
+    hints: &[String],
+    reply_mode: Option<ReplyMode>,
+    clothing: Option<&str>,
+    prompt_traits: &[PromptTrait],
+    affinity_scope: AffinityScope,
+    world: Option<&WorldContext>,
+    stories: Option<&StoriesContext>,
+    quote: Option<&QuotedMessage>,
+    character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    now: &NowContext,
+    body_state: Option<&str>,
+    needs: Option<&str>,
+    event: Option<&EventLines>,
+    shared_memories: Option<&str>,
+    anniversaries: &[String],
+) -> String {
+    render_prompt(
+        persona,
+        profile_groups,
+        relationship_facts,
+        affinity,
+        hints,
+        reply_mode,
+        clothing,
+        prompt_traits,
+        affinity_scope,
+        &[],
+        world,
+        stories,
+        quote,
+        character_state,
+        TurnNudges::default(),
+        now,
+        body_state,
+        needs,
+        event,
+        shared_memories,
+        anniversaries,
+        true,
+        true,
     )
 }
 
@@ -8175,6 +8254,222 @@ mod tests {
             None,
         );
         assert!(p.contains("[quote]") && p.contains("QUOTED-LINE"), "{p}");
+    }
+
+    // ─── The `focused` tone (spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §5.4) ───
+
+    const FOCUSED_CLAUSE: &str = "我现在很想跟他多聊几句。";
+    const FOCUSED_WORK_BULLET: &str = "- 你手上有工作，心思在工作上：回得简短利落，先顾手上的事";
+    const FOCUSED_LOWEST_TIER: &str = "[reply_length]\n最多 1 句，不超过 40 字";
+    const FOCUSED_TOP_TIER: &str = "[reply_length]\n最多 3 句，不超过 120 字";
+
+    const FOCUSED_MODES: [Option<ReplyMode>; 5] = [
+        None,
+        Some(ReplyMode::Follow),
+        Some(ReplyMode::Listen),
+        Some(ReplyMode::Ask),
+        Some(ReplyMode::Judge),
+    ];
+
+    /// High on every axis, with a feeling clause: the top `[reply_length]`
+    /// tier, a non-empty `[feelings]` and a `[mood]` made of unlocks.
+    fn focused_warm_affinity() -> Affinity {
+        let mut a = make_affinity(0.8, 0.8, 0.8, 0.8, 0.8, 0.8);
+        a.feeling_clause = Some(FOCUSED_CLAUSE.into());
+        a
+    }
+
+    /// Cold warmth and low patience: `[mood]` carries cold-side directives.
+    fn focused_cold_affinity() -> Affinity {
+        let mut a = make_affinity(0.1, 0.5, 0.5, 0.5, 0.2, 0.5);
+        a.feeling_clause = Some(FOCUSED_CLAUSE.into());
+        a
+    }
+
+    fn focused_profile() -> Vec<(String, Vec<String>)> {
+        vec![("基础画像".to_string(), vec!["住在上海".to_string()])]
+    }
+
+    fn focused_hints() -> Vec<String> {
+        vec!["HINT-LINE".to_string()]
+    }
+
+    /// The default tone's prompt from the fixtures `focused_prompt_of` uses.
+    fn default_prompt_of(
+        a: &Affinity,
+        reply_mode: Option<ReplyMode>,
+        emotional_context: &[String],
+        nudges: TurnNudges,
+    ) -> String {
+        build_prompt(
+            &fixture_persona(),
+            &focused_profile(),
+            &["FACT-LINE".to_string()],
+            Some(a),
+            &focused_hints(),
+            reply_mode,
+            None,
+            &[],
+            AffinityScope::full(),
+            emotional_context,
+            None,
+            None,
+            None,
+            None,
+            nudges,
+            &NowContext::default(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+    }
+
+    fn focused_prompt_of(a: &Affinity, reply_mode: Option<ReplyMode>) -> String {
+        build_focused_prompt(
+            &fixture_persona(),
+            &focused_profile(),
+            &["FACT-LINE".to_string()],
+            Some(a),
+            &focused_hints(),
+            reply_mode,
+            None,
+            &[],
+            AffinityScope::full(),
+            None,
+            None,
+            None,
+            None,
+            &NowContext::default(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+    }
+
+    #[test]
+    fn a_focused_prompt_keeps_the_relationship_and_drops_the_feelings() {
+        let reason = vec!["REASON-LINE".to_string()];
+        let all = TurnNudges {
+            affirm: true,
+            share_slice: true,
+            open_question: true,
+        };
+
+        let warm = focused_warm_affinity();
+        let d = default_prompt_of(&warm, None, &reason, all);
+        for carried in [
+            "[feelings]",
+            "[emotional_context]",
+            FOCUSED_CLAUSE,
+            "REASON-LINE",
+            FOCUSED_TOP_TIER,
+        ] {
+            assert!(d.contains(carried), "the default prompt has {carried}: {d}");
+        }
+
+        let f = focused_prompt_of(&warm, None);
+        for kept in [
+            "[user_profile]\n[基础画像]\n- 住在上海",
+            "[shared_memories]\n- FACT-LINE",
+            "[relationship]",
+            "[mood]",
+            "[inner_state]\n- HINT-LINE",
+            "[now]",
+            "[iron_rules",
+            "[output]",
+        ] {
+            assert!(f.contains(kept), "{kept} must render: {f}");
+        }
+        for gone in [
+            "[feelings]",
+            "[emotional_context]",
+            FOCUSED_CLAUSE,
+            "REASON-LINE",
+            FOCUSED_TOP_TIER,
+        ] {
+            assert!(!f.contains(gone), "{gone} must not render: {f}");
+        }
+        assert!(f.contains(FOCUSED_LOWEST_TIER), "{f}");
+
+        // The cold-side `[mood]` directives render as on the default path.
+        let cold = focused_cold_affinity();
+        let f = focused_prompt_of(&cold, None);
+        assert!(f.contains("[mood]"), "{f}");
+        assert!(f.contains("语气冷淡，不主动延伸话题"), "{f}");
+        assert!(f.contains("你有点不耐烦了，回复可以更敷衍"), "{f}");
+        assert!(
+            !f.contains("[feelings]") && !f.contains(FOCUSED_CLAUSE),
+            "{f}"
+        );
+    }
+
+    #[test]
+    fn a_focused_prompt_holds_the_work_line_in_every_reply_mode() {
+        let block = format!("\n\n[this_turn]（这一轮自然融入，别刻意）\n{FOCUSED_WORK_BULLET}");
+        let a = focused_warm_affinity();
+        for mode in FOCUSED_MODES {
+            let p = focused_prompt_of(&a, mode);
+            assert_eq!(p.matches("[this_turn]").count(), 1, "{mode:?}: {p}");
+            assert!(
+                p.contains(&format!("{block}\n\n---\n[iron_rules")),
+                "{mode:?}: the block is the header and the one line: {p}"
+            );
+            assert!(
+                p.contains(&format!("① {}", rule_one(mode))),
+                "rule ① follows the mode: {mode:?}"
+            );
+            assert!(p.contains(FOCUSED_LOWEST_TIER), "{mode:?}: {p}");
+        }
+    }
+
+    /// Everything but the dropped blocks, the lowest tier and the work line
+    /// renders as the default prompt does.
+    #[test]
+    fn a_focused_prompt_differs_from_the_default_only_in_its_four_blocks() {
+        let a = focused_warm_affinity();
+        let d = default_prompt_of(&a, None, &[], TurnNudges::default());
+        let feelings = format!(
+            "\n[feelings]（你此刻对他的真实感觉，这是内心状态，绝对不要复述）\n{FOCUSED_CLAUSE}"
+        );
+        let work = format!("\n\n[this_turn]（这一轮自然融入，别刻意）\n{FOCUSED_WORK_BULLET}");
+        assert!(d.contains(&feelings) && d.contains(FOCUSED_TOP_TIER), "{d}");
+        let expected = d
+            .replacen(&feelings, "", 1)
+            .replacen(FOCUSED_TOP_TIER, FOCUSED_LOWEST_TIER, 1)
+            .replacen(
+                "\n\n---\n[iron_rules",
+                &format!("{work}\n\n---\n[iron_rules"),
+                1,
+            );
+        assert_eq!(focused_prompt_of(&a, None), expected);
+    }
+
+    #[test]
+    fn the_default_and_emotional_prompts_do_not_move() {
+        let reason = vec!["REASON-LINE".to_string()];
+        let a = focused_warm_affinity();
+        for mode in FOCUSED_MODES {
+            let d = default_prompt_of(&a, mode, &reason, TurnNudges::default());
+            assert!(!d.contains("你手上有工作"), "{mode:?}: {d}");
+            assert!(!d.contains("[this_turn]"), "{mode:?}: {d}");
+            for carried in ["[feelings]", "[emotional_context]"] {
+                assert!(d.contains(carried), "{mode:?}: {carried}: {d}");
+            }
+            // The top tier holds unless `listen` drops it one tier.
+            let tier = if mode == Some(ReplyMode::Listen) {
+                "[reply_length]\n最多 2 句，不超过 80 字"
+            } else {
+                FOCUSED_TOP_TIER
+            };
+            assert!(d.contains(tier), "{mode:?}: {d}");
+
+            let e = emotional(mode, None);
+            assert!(!e.contains("你手上有工作"), "{mode:?}: {e}");
+        }
     }
 
     #[test]
