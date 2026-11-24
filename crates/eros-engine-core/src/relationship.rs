@@ -171,8 +171,8 @@ const COMPOSED: [[(&str, &str); 5]; 5] = [
         ("", ""),
         ("intriguing_stranger", "初识心动对象"),
         ("heady_stranger", "让你上头的陌生人"),
-        ("headlong_lover", "闪恋爱人"),
-        ("instant_obsession", "骤燃挚爱"),
+        ("fling", "露水情人"),
+        ("love_at_first_sight", "一见倾心的人"),
     ],
     [
         ("casual_friend", "普通朋友"),
@@ -183,10 +183,10 @@ const COMPOSED: [[(&str, &str); 5]; 5] = [
     ],
     [
         ("trusted_friend", "亲近好友"),
-        ("intimate_spark", "微醺密友"),
-        ("heartfelt_crush", "心上密友"),
+        ("more_than_friends", "友达以上"),
+        ("almost_lovers", "恋人未满"),
         ("tender_lover", "相依恋人"),
-        ("cherished_love", "深情挚爱"),
+        ("inseparable", "难分难舍的人"),
     ],
     [
         ("kindred_spirit", "知音"),
@@ -419,8 +419,8 @@ mod tests {
         assert_eq!(
             composed_relation(3, 2).unwrap(),
             ComposedRelation {
-                key: "intimate_spark",
-                zh: "微醺密友"
+                key: "more_than_friends",
+                zh: "友达以上"
             }
         );
         assert_eq!(
