@@ -527,7 +527,10 @@ impl EventKind {
 
     /// Whether the kind belongs in a persona's world (spec
     /// 2026-11-08-strip-and-world-setting-design.md §4): the kinds that need
-    /// modern life fit only `modern`; `on_the_road` fits only `fantasy`,
+    /// modern life fit only `modern`, among them the five modern-life ones
+    /// (`saw_bag`, `saw_clothes`, `out_shopping`, `want_to_quit_job`,
+    /// `admiring_art`; spec 2026-11-24-focused-tone-four-together-actions-
+    /// and-user-gender-design.md §4); `on_the_road` fits only `fantasy`,
     /// where the vehicles do not exist (spec 2026-11-19-vehicles-actions-
     /// species-design.md §3), and so does `fighting_together` (spec
     /// 2026-11-23-hot-spring-fight-challenge-bet-design.md §5); every other
@@ -551,6 +554,11 @@ impl EventKind {
                 | OnATrain
                 | OnAPlane
                 | Driving
+                | SawBag
+                | SawClothes
+                | OutShopping
+                | WantToQuitJob
+                | AdmiringArt
         );
         if modern_only {
             setting == Setting::Modern
@@ -3057,8 +3065,9 @@ mod tests {
     }
 
     /// Spec 2026-11-08-strip-and-world-setting-design.md §4; spec
-    /// 2026-11-16-prune-life-events-design.md §4.3.
-    const MODERN_ONLY: [EventKind; 15] = [
+    /// 2026-11-16-prune-life-events-design.md §4.3; spec
+    /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §4.
+    const MODERN_ONLY: [EventKind; 20] = [
         OnACruise,
         OnABus,
         OnATrain,
@@ -3074,6 +3083,11 @@ mod tests {
         PostSurgery,
         TempWork,
         ScoldedSuperior,
+        SawBag,
+        SawClothes,
+        OutShopping,
+        WantToQuitJob,
+        AdmiringArt,
     ];
 
     /// Spec 2026-11-19-vehicles-actions-species-design.md §3.
@@ -3122,6 +3136,32 @@ mod tests {
                 Some(Reading),
                 "{r}"
             );
+        }
+    }
+
+    /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §4.
+    #[test]
+    fn five_modern_life_kinds_never_fit_fantasy() {
+        let fantasy = PersonaTraits {
+            setting: Setting::Fantasy,
+            ..female()
+        };
+        for k in [SawBag, SawClothes, OutShopping, WantToQuitJob, AdmiringArt] {
+            assert!(
+                k.fits(Setting::Modern) && !k.fits(Setting::Fantasy),
+                "{k:?}"
+            );
+            let fan = PersonaTraits {
+                prefer_events: vec![k],
+                ..fantasy.clone()
+            };
+            for r in [0.0, 0.5, 0.99] {
+                assert_eq!(
+                    pick_with(&fan, None, 3, &[], &[k, Reading], rolls(r, r)),
+                    Some(Reading),
+                    "{k:?} {r}"
+                );
+            }
         }
     }
 
@@ -3177,7 +3217,7 @@ mod tests {
             assert_eq!(rule(k).cooldown_hours, cd, "{k:?}");
             assert_eq!(lasts(k, 0.5), want, "{k:?}");
             assert!(!k.may_be_offline() && !k.is_photo(), "{k:?}");
-            assert!(k.fits(Setting::Fantasy), "{k:?}");
+            assert_eq!(k.fits(Setting::Fantasy), k != WantToQuitJob, "{k:?}");
             assert!(is_told(k, 0, &PersonaTraits::default()), "{k:?}");
             assert!(EventKind::ALL.contains(&k), "{k:?}");
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
