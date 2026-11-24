@@ -127,19 +127,19 @@ The names *(picked by the owner)*, kept in one table that is cheap to edit:
 
 | bond \ chem | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
-| **1** | none | 初识心动对象 `intriguing_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
-| **2** | 普通朋友 `casual_friend` | 暧昧对象 `budding_flame` | 迷恋对象 `friend_and_crush` | 热恋对象 `passionate_flame` | 热烈爱人 `ardent_beloved` |
-| **3** | 亲近好友 `trusted_friend` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 相依恋人 `tender_lover` | 难分难舍的人 `inseparable` |
+| **1** | none | 眉来眼去的人 `flirtatious_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
+| **2** | 普通朋友 `casual_friend` | 暧昧搭子 `flirtatious_buddy` | 心头好 `cherished_crush` | 干柴烈火之人 `fast_burning_lover` | 神魂颠倒之人 `dizzying_blind_love` |
+| **3** | 死党 `best_buddy` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 两情相悦的人 `fond_close_sweetheart` | 难分难舍的人 `inseparable` |
 | **4** | 知音 `kindred_spirit` | 心照不宣的知己 `knowing_confidant` | 暗生情愫的知己 `smitten_confidant` | 知心爱人 `heart_lover` | 挚爱 `beloved` |
 | **5** | 莫逆之交 `lifelong_kindred_spirit` | 动了心的灵魂之交 `stirred_kindred` | 柏拉图式的爱人 `platonic_love` | 灵犀恋人 `destined_lover` | 命中注定的人 `destined` |
 
-Names avoid the status words (伴侣, 伙伴, 同事, 前任, 未婚) so the two never
+Names avoid the status words (伴侣, 伙伴, 同事, 前任, 未婚, 床伴) so the two never
 read as the same claim.
 
 **Incompatible pairs** *(owner's ruling)*. Chemistry accrues for every pair,
 since scope only gates the read side. In the prompt, a pair whose scope is
 not `romance_compatible` takes its name from the chemistry-1 column
-(普通朋友, 亲近好友, 知音, 莫逆之交; none at bond tier 1), the same reading as
+(普通朋友, 死党, 知音, 莫逆之交; none at bond tier 1), the same reading as
 "an incompatible pair is never confessed to". The prompt builder passes the
 turn's own scope. The API reports the cell of the real tiers: a snapshot
 carries no scope, and the caller knows whether it marked the pair
@@ -300,8 +300,7 @@ cold-war check therefore read the instance kind first.
   and travel checks *(my call)*. `propose` is never askable in a status that
   allows `confess` or `partner_up`, so its place among them changes nothing.
 
-Stage cues, working copy (same register as the existing ones; the owner
-reviews them with the rest of the copy):
+Stage cues *(approved by the owner)*, in the register of the existing ones:
 
 - `confess`: `（你发现自己喜欢上对方了。你决定郑重地向对方告白，问对方愿不愿意和你在一起，希望对方给你一个答复。）`
 - `partner_up`: `（你越来越觉得对方是值得托付的人。你决定郑重地提出和对方结成伙伴，希望对方给你一个答复。）`
@@ -391,8 +390,8 @@ Up to three lines, each present only when it has something to say:
 - **Status line**, when the status is not `none`: `你是用户的{noun}`. Nouns:
   `dating` 女朋友 / 男朋友, `engaged` 未婚妻 / 未婚夫, by the persona's
   `gender` (伴侣 / 订婚对象 for any other value); `partner` 伙伴; `peer`
-  同事; `ex` 前任. `fwb` and `situationship` have no settled Chinese wording
-  yet; working copy 伙伴，也是情人 and 同事，私下在交往.
+  同事; `ex` 前任. `fwb` 床伴; `situationship` 同事，私下在交往 *(both picked by the
+  owner)*.
 - **Composed line**, when there is a composed relation (for an incompatible
   pair, the chemistry-1 name of §5). With no status line it is the identity
   itself: `你是用户的{composed}`.

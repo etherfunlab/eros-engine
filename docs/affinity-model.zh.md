@@ -329,7 +329,7 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
 | `dating` | 伴侣 | 是 |
 | `partner` | 伙伴 | 是 |
 | `peer` | 同事 | 否 |
-| `fwb` | 伙伴，也是情人 | 是 |
+| `fwb` | 床伴 | 是 |
 | `situationship` | 同事，私下在交往 | 是 |
 | `engaged` | 已订婚 | 是 |
 | `ex` | 前任 | 否 |
@@ -389,15 +389,15 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
 
 | bond \ chemistry | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
-| **1** | 无 | 初识心动对象 `intriguing_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
-| **2** | 普通朋友 `casual_friend` | 暧昧对象 `budding_flame` | 迷恋对象 `friend_and_crush` | 热恋对象 `passionate_flame` | 热烈爱人 `ardent_beloved` |
-| **3** | 亲近好友 `trusted_friend` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 相依恋人 `tender_lover` | 难分难舍的人 `inseparable` |
+| **1** | 无 | 眉来眼去的人 `flirtatious_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
+| **2** | 普通朋友 `casual_friend` | 暧昧搭子 `flirtatious_buddy` | 心头好 `cherished_crush` | 干柴烈火之人 `fast_burning_lover` | 神魂颠倒之人 `dizzying_blind_love` |
+| **3** | 死党 `best_buddy` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 两情相悦的人 `fond_close_sweetheart` | 难分难舍的人 `inseparable` |
 | **4** | 知音 `kindred_spirit` | 心照不宣的知己 `knowing_confidant` | 暗生情愫的知己 `smitten_confidant` | 知心爱人 `heart_lover` | 挚爱 `beloved` |
 | **5** | 莫逆之交 `lifelong_kindred_spirit` | 动了心的灵魂之交 `stirred_kindred` | 柏拉图式的爱人 `platonic_love` | 灵犀恋人 `destined_lover` | 命中注定的人 `destined` |
 
-名字里不用状态词（伴侣、伙伴、同事、前任、未婚）。组合关系不作任何门槛：没有事件、生活选择或动作读它。
+名字里不用状态词（伴侣、伙伴、同事、前任、未婚、床伴）。组合关系不作任何门槛：没有事件、生活选择或动作读它。
 
-- **提示词里**，这一轮 `affinity_scope` 不浪漫相容的一对，不管 chemistry 多高，都取 chemistry 第 1 列的名字（普通朋友、亲近好友、知音、莫逆之交；bond 第 1 档没有）。
+- **提示词里**，这一轮 `affinity_scope` 不浪漫相容的一对，不管 chemistry 多高，都取 chemistry 第 1 列的名字（普通朋友、死党、知音、莫逆之交；bond 第 1 档没有）。
 - **API 里**，`composed_relation` 是真实档位那一格的键，不套用相容与否。快照不带 scope，调用方自己知道有没有把这一对标为相容。
 
 ### `[relationship]`
