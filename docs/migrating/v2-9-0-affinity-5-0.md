@@ -25,6 +25,7 @@ Each session now stores a relationship status, moved only by answered asks, with
 - **The user's `propose` needs a status.** It is refused before the judge unless the pair is `dating`, `fwb` or `situationship`; the refusal costs nothing. Accepted, the pair is `engaged`.
 - **The user can break up.** A new user action, `break_up`, from a breakable status (`dating`, `partner`, `fwb`, `situationship`, `engaged`). Accepted, the pair is `ex`; refused, a cold war starts. Neither costs a tier.
 - **Her prompt names the relationship.** `[relationship]` now states the status, a name for the pair's bond tier × chemistry tier (the *composed relation*), and the cold war. The judge reads the status and the cold war.
+- **Her asks follow the pair's scopes.** Every ask of hers, the existing kinds included, is generated under the scopes the pair's replies recorded, the ones her ordinary replies read; before, an ask used the engine's default scopes. A pair with no scopes recorded reads as romance-compatible. The cold-war message uses the engine's default scopes.
 
 ## Deployments
 
