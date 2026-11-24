@@ -54,11 +54,18 @@ model_name_display_override = true
 #   shower_together, bath_together, sex_together, streak_together, propose,
 #   break_up, threaten or tip, accepted or refused, and
 #   the start message of sixteen life-event kinds, are ALWAYS emotional,
-#   whatever the value (see docs/model-config.md, "tones").
+#   whatever the value (see docs/model-config.md, "tones");
+# - with `focused` set, a 1:1 text turn without a user action that did not
+#   come up `emotional` is `focused` with that probability while she is at
+#   work (a temp_work incident, or a business_trip with no incident under
+#   way), and 1 time in 8 off work for a persona whose art_metadata.employed
+#   is full_time and who has no incident under way. A focused reply keeps
+#   the history and the relationship, and is brief: at most one sentence and
+#   40 characters. Either key works without the other.
 # An emotional reply is written without the chat history, the user profile or
 # the affinity conclusions, in at most one sentence and 40 characters.
 # Task-level; absent or 0 = off.
-#tones = { emotional = 0.05 }
+#tones = { emotional = 0.05, focused = 1.0 }
 
 # Per-tier overrides are OPTIONAL and downstream-defined: `tier` is whatever
 # your product sends per request. The OSS template enables none — with no tier
