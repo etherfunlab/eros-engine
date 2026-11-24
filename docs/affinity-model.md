@@ -9,8 +9,12 @@ axis is bounded to `[0, 1]` and clamped on every update. It moves only on
 text-channel, non-`product_qa` chat turns; voice turns and `product_qa`
 turns never write an affinity event, and neither do group turns (a group
 reads each member's affinity and writes none). Two moves are not turns: the
-tier drop of an answered life choice ([below](#life-choice-drops-and-the-slowdown)),
+tier drop of an answered life choice ([below](#life-choice-drops-and-the-cold-war-halving)),
 and the one verdict on a settled date ([below](#dates)).
+
+On top of the six axes each session stores a [relationship status](#relationship-status):
+what the pair has agreed to be, moved only by life choices and two user actions,
+with a cold-war flag over it.
 
 The judge (the LLM evaluator) only ever outputs ordinal buckets: a grade
 or a level, never a continuous number. The engine owns every score, every
@@ -53,9 +57,10 @@ base. A stranger starts with limited patience; that is deliberate.
 The base pair is what the user *feels* turn to turn. It feeds directly
 into:
 
-- the `[relationship]` prompt section: a warmth × patience quadrant, each
-  axis split at `0.5`. The four cells are the actual prompt strings, never
-  translated:
+- the `[relationship]` prompt section, when the pair has no status, no
+  composed relation and no cold war ([`[relationship]`](#relationship)): a
+  warmth × patience quadrant, each axis split at `0.5`. The four cells are
+  the actual prompt strings, never translated:
 
   | | patience ≥ 0.5 | patience < 0.5 |
   |---|---|---|
@@ -209,9 +214,9 @@ uniformly.
 **4. Threshold gate.** Each axis keeps a signed accumulator; it commits once
 `|accumulated| ≥ AFFINITY_DELTA_THRESHOLD` (default `0`, so every turn
 commits), otherwise the turn's real score buffers in `pending_deltas`.
-Committed deltas apply 1:1 and clamp to `[0,1]`; in the 72 hours after a
-separation she asked for, the positive ones are first halved
-([below](#life-choice-drops-and-the-slowdown)). The judge's levels, when
+Committed deltas apply 1:1 and clamp to `[0,1]`; while a cold war is on, the
+positive ones are first halved
+([below](#life-choice-drops-and-the-cold-war-halving)). The judge's levels, when
 read this turn, then overwrite the stored levels, and both endpoints
 re-derive from the post-turn lines.
 
@@ -277,7 +282,10 @@ roll can refuse whatever the judge says
   `fight_together` to a persona whose `setting` is not `fantasy` is refused the same way and drops
   no line. The other together actions have no such rule. A `smoke_together`, `smoke_weed_together` or
   `drink_together` the roll refuses drops Chemistry too, not Bond.
-- **Proposal:** a refused `propose` drops no line; the turn is graded like any other.
+- **Proposal and break-up:** a refused `propose` or `break_up` drops no line; the turn is
+  graded like any other. Before the judge, a `propose` from a status other than `dating`,
+  `fwb` or `situationship`, and a `break_up` from a status that is not breakable, are refused
+  the same way; an answered one moves the [relationship status](#relationship-status).
 - **Gift:** accepted, the gift also joins the persona's items or wardrobe;
   refused, it joins nothing and drops Bond like a refused `give`.
 - **Date:** a refused `date` invitation drops no line; the turn is graded like
@@ -286,20 +294,22 @@ roll can refuse whatever the judge says
 
 Example: chemistry `0.80` (64% of tier 4) lands at 64% of tier 3, `≈ 0.524`.
 
-### Life-choice drops and the slowdown
+### Life-choice drops and the cold-war halving
 
 A life choice she puts to the user costs the relationship on some answers
-([the ask for space](life-events-needs.md#the-ask-for-space-choice), [the
-romantic choices](life-events-needs.md#the-romantic-choices)). Nothing here is
+([life choices](life-events-needs.md#life-choices)). Nothing here is
 a chat turn: no judge runs.
 
-- **The drop.** Which answer drops which line depends on the kind:
+- **The drop.** Only a decline drops a line, and which line depends on the kind:
 
   | kind | accept | decline |
   |---|---|---|
-  | `ask_for_space` | bond and chemistry | bond and chemistry |
-  | `sleep_together` | no drop | chemistry |
+  | `confess` | no drop | chemistry |
+  | `partner_up` | no drop | no drop |
   | `propose` | no drop | bond and chemistry |
+  | `break_up` | no drop | no drop |
+  | `sleep_together` | no drop | chemistry |
+  | `fall_asleep_together` | no drop | chemistry |
   | `bathe_together` | no drop | chemistry |
 
   Each line named falls one tier by the landing rule of a refused action: the
@@ -308,31 +318,28 @@ a chat turn: no judge runs.
   not named keeps its axes and its balance. It is computed from the snapshot
   after time decay and the endpoint refresh (with the deployment's affinity
   tuning), inside the row lock and in the transaction that resolves the
-  choice, so a rolled-back resolution leaves no drop. On an `ask_for_space`
-  accept the drop is the state she comes back to; nothing further happens at
-  return. An answer typed in words (`ignored`) and an expiry drop no line, for
-  any kind.
+  choice, so a rolled-back resolution leaves no drop. An answer typed in words
+  (`ignored`) and an expiry drop no line, for any kind.
 - **Its event row.** One row of its own non-turn `event_type`, `life_choice`,
   for every drop. `deltas` and
   `effective_deltas` carry the same figures, because the drop is the whole raw
   change; `label_changes`, `effective_line_deltas` and the two state snapshots
   record the tier move. `context` holds `life_choice` (`accept` | `decline`)
-  and `choice_id`. An accepted `sleep_together`, `propose` or `bathe_together` moves nothing and
-  writes no row, so `accept` appears only for `ask_for_space`. The row has no
+  and `choice_id`. No accept drops a line, so a row carries `decline`; `accept`
+  appears only on stored rows of the retired `ask_for_space`. The row has no
   `user_message_id`. The delta route
   `GET /bff/v1/comp/affinity/{session_id}/event` never returns it, like
-  `time_decay`, and it is not a judged turn either.
-- **The slowdown (an accepted ask for space only).** For 72 hours after the
-  separation ends, every
-  positive committed delta on the four line axes is halved before it is
-  applied. Negative deltas apply in full, and `warmth` and `patience` re-derive
-  from the post-turn lines as always. The cut part is gone: it is not parked in
-  the gate's balance. It applies in the choice's session only, and the window
-  is derived, with no new state: the choice's `event_id` leads to the
-  separation's `ends_at`, and the window is `ends_at` to `ends_at` plus 72
-  hours, wall-clock. A slowed turn's event row carries `context.growth_scale`
-  (`0.5`), absent at full speed, and its `effective_deltas` show the halved
-  values. An accepted romantic choice never slows growth.
+  `time_decay`, and it is not a judged turn either. A status the answer moves
+  writes a `relationship` row of its own ([Event rows](#event-rows)).
+- **The cold-war halving.** While the session's [cold war](#the-cold-war) is
+  on, every positive committed delta on the four line axes is halved before it
+  is applied, on a judged turn and on a date's settlement. Negative deltas
+  apply in full, and `warmth` and `patience` re-derive from the post-turn lines
+  as always. The cut part is gone: it is not parked in the gate's balance.
+  Nothing drops when a cold war starts. The flag is read as stored on the
+  session's affinity row; a read that fails commits at full speed. A halved
+  turn's event row carries `context.growth_scale` (`0.5`), absent at full
+  speed, and its `effective_deltas` show the halved values.
 
 ### Dates
 
@@ -356,7 +363,7 @@ its line.
   date's length ([Tuning knobs](#tuning-knobs)). Each axis's raw score, its
   real score and the assessed cross-line penalty scale by `weight` ahead of the
   threshold gate; tier decay, `AFFINITY_NEG_FACTOR`, the demo boost, the clamp
-  and the slowdown after a separation apply as on a turn. The levels, when the
+  and the cold-war halving apply as on a turn. The levels, when the
   verdict parsed, overwrite the stored ones, and both endpoints re-derive.
 - **The one-tier cap.** Each line then lands no further than one tier from
   where it stood before the write: up to the same relative position in the
@@ -428,10 +435,165 @@ Per-turn transitions are recorded in `label_changes` JSONB on the event
 row: `{bond: {from, to}, chemistry: {from, to}}`, `NULL` when neither line
 moved (format in [Event rows](#event-rows)).
 
+## Relationship status
+
+The two lines say how close a pair is, not what they are to each other. Two
+things sit on top of them, and neither feeds back into the axes, the tiers or
+the write pipeline:
+
+- the **relationship status**: what the pair has agreed to be, stored per
+  session and moved only by an answered ask, with a **cold war** that can sit
+  on top of any status;
+- the **composed relation**: a name for the pair's bond tier × chemistry tier,
+  derived, never stored, and read by her prompt only.
+
+### The statuses
+
+Eight statuses, one per session. The Chinese wording is what the judge's
+`[关系]` line reads; the prompt's status line uses it too, except for the two
+gendered nouns ([`[relationship]`](#relationship)).
+
+| Status | Wording | Breakable |
+|---|---|---|
+| `none` | 未确定 | no |
+| `dating` | 伴侣 | yes |
+| `partner` | 伙伴 | yes |
+| `peer` | 同事 | no |
+| `fwb` | 伙伴，也是情人 | yes |
+| `situationship` | 同事，私下在交往 | yes |
+| `engaged` | 已订婚 | yes |
+| `ex` | 前任 | no |
+
+Every session starts at `none` and never returns to it. `engaged` is the top
+status. A *breakable* status is one a break-up can end.
+
+### Transitions
+
+Four asks move the status, and nothing else does: her `confess` and
+`partner_up`, and `propose` and `break_up`, which she can ask and the user can
+too ([life choices](life-events-needs.md#the-romantic-choices),
+[the user's actions](api-reference.md#post-compchatsession_idmessagestream)).
+
+| From | What happens | To |
+|---|---|---|
+| `none`, `ex` | `confess` accepted | `dating` |
+| `partner` | `confess` accepted | `fwb` |
+| `peer` | `confess` accepted | `situationship` |
+| `none`, `ex`, `peer` | `partner_up` accepted | `partner` |
+| `none`, `ex`, `peer` | `partner_up` declined | `peer` |
+| `dating`, `fwb`, `situationship` | `propose` accepted | `engaged` |
+| any breakable status | `break_up` accepted | `ex`, and the cold war ends |
+| any breakable status | `break_up` refused | unchanged, and a cold war starts unless one is on |
+
+A declined `confess` or `propose` keeps the status. Each ask is made only from
+the statuses in its rows: she does not ask it from any other, and the user's
+`propose` or `break_up` from any other is refused before the judge, with no
+effect. A status already reached stays when the caller's scopes change.
+
+The move is written in the transaction that settles the ask, under the affinity
+row's lock: her ask's answer at the life-choice route, which `409`s and writes
+nothing when the status has moved to one the kind is no longer asked from; the
+user's action when its answer is stored, on the turn's session (on a date, the
+session the invitation was sent in). Every change of status or cold war writes
+one `relationship` event row ([Event rows](#event-rows)).
+
+### The cold war
+
+A cold war is a flag over the status (`cold_war_since`); ending it uncovers the
+status underneath unchanged.
+
+- **It starts** after a judged 1:1 text turn when, among the session's judged
+  turns since the streak anchor, the newest three all carry the judge's lowest
+  patience level, or at least five of the newest seven do; and when a break-up
+  is refused. No tier gap, compatibility or status is read.
+- **It ends** when the newest three judged turns since the anchor all carry a
+  patience level above the lowest, and when a break-up is accepted.
+- **The levels** are the judge's own (`patience_grade`, `1..=3`, from each
+  judged turn's `state_after`; a turn whose snapshot lacks it reads as `2`),
+  not the derived `patience`: that is the level times the bond line's boost, so
+  with a low bond even the top level stays under `0.5`, and a threshold on it
+  could hold a new relationship in a cold war for good.
+- **The anchor** is the later of the session's newest life choice (its ask, its
+  answer) and its newest `relationship` event, so every start and end of a cold
+  war, and every status change, begins a fresh streak.
+- **While it lasts** she keeps replying, coldly: `[relationship]` says so. Every
+  positive committed delta on the four line axes is halved
+  ([above](#life-choice-drops-and-the-cold-war-halving)). She asks nothing warm
+  (`confess`, `partner_up`, `propose`, her sleep ask, `bathe_together`,
+  `travel_together`), and from a breakable status she can ask to break up.
+- **She says so** when a streak starts it, in one proactive message with no
+  choice row, `metadata.proactive = 'cold_war'`. The flag is committed first: a
+  failed or blank message leaves it on, and she says nothing. A cold war started
+  by a refused break-up has no message of its own, and ending one writes none.
+
+Only a 1:1 text session of a genome persona has one; a pending ask or a date
+under way does not hold it back. The rules and the cue are in
+[life-events-needs.md](life-events-needs.md#the-cold-war).
+
+### BYOC sessions
+
+A [BYOC](byoc.md) session stays outside the status: it is always `none`, with no
+cold war. Her asks never fire there, the user's `propose` goes to the judge as
+any action does and moves nothing, and the user's `break_up` is refused before
+the judge with no effect.
+
+### The composed relation
+
+A name for the pair's two tiers, one per cell, `null` at `(1, 1)`. The names
+are the actual prompt strings, never translated; the keys are what the API
+serves:
+
+| bond \ chemistry | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| **1** | none | 有好感的陌生人 `fond_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
+| **2** | 普通朋友 `casual_friend` | 有点暧昧的朋友 `flirty_friend` | 暗恋的朋友 `secret_crush` | 朋友以上的情人 `friend_and_lover` | 热恋的人 `new_flame` |
+| **3** | 好朋友 `good_friend` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 亲密的情人 `close_lover` | 难分难舍的人 `inseparable` |
+| **4** | 知己 `confidant` | 心照不宣的知己 `knowing_confidant` | 暗生情愫的知己 `smitten_confidant` | 知心爱人 `heart_lover` | 挚爱 `beloved` |
+| **5** | 灵魂之交 `kindred_spirit` | 动了心的灵魂之交 `stirred_kindred` | 柏拉图式的爱人 `platonic_love` | 灵魂爱人 `soul_lover` | 命中注定的人 `destined` |
+
+No name uses a status word (伴侣, 伙伴, 同事, 前任, 未婚). A composed relation
+gates nothing: no event, life choice or action reads it.
+
+- **In the prompt**, a pair whose turn `affinity_scope` is not
+  romance-compatible takes its name from the chemistry-1 column (普通朋友,
+  好朋友, 知己, 灵魂之交; none at bond tier 1), whatever its chemistry.
+- **In the API**, `composed_relation` is the key of the real tiers' cell; no
+  compatibility is applied. A snapshot carries no scope, and the caller knows
+  whether it marked the pair compatible.
+
+### `[relationship]`
+
+The text-chat prompt's `[relationship]` block says who the user is to her, in up
+to three lines, each present only when it has something to say:
+
+```
+[relationship]
+你是用户的未婚妻
+论感情，你们现在是知心爱人
+你们正在冷战
+```
+
+- **The status line**, when the status is not `none`: `你是用户的{noun}`.
+  `dating` reads 女朋友 or 男朋友 and `engaged` 未婚妻 or 未婚夫, by the persona's
+  `art_metadata.gender` (`female` / `male`; 伴侣 and 订婚对象 for any other
+  value or none); every other status reads its wording above.
+- **The composed line**, when there is a composed relation (for an incompatible
+  pair, the chemistry-1 name): `论感情，你们现在是{name}` after a status line,
+  and `你是用户的{name}` without one.
+- **The cold-war line**, `你们正在冷战`, while it lasts.
+
+With none of the three the block is the base pair's quadrant noun
+([above](#the-base-pair--warmth--patience)), under the quadrant's scope gate.
+The three lines are settled conclusions about the pair, not an axis steering
+the reply, so no single axis of `affinity_scope` gates them; the block is
+omitted only with no affinity row or an empty scope. Voice and group prompts
+read no status: they keep their tier-label lines.
+
 ## What reads affinity
 
-- `[relationship]` — the base-pair quadrant (see
-  [the base pair](#the-base-pair--warmth--patience)).
+- `[relationship]` — the status line, the composed relation of the two tiers
+  and the cold-war line, and the base-pair quadrant when none of the three has
+  anything to say (see [`[relationship]`](#relationship)).
 - `[mood]` — per-axis threshold gates: cold bans and warm unlocks.
 - `[feelings]` — the LLM-written feeling clause stored on the affinity row
   (`feeling_clause`), rewritten on movement turns and on a refused action's tier drop.
@@ -440,8 +602,12 @@ moved (format in [Event rows](#event-rows)).
 - Per-turn dice (`TurnNudges`) vetoes — the same cold floors as `[mood]`:
   `warmth ≤ 0.2` / `trust < 0.3` / `intrigue < 0.3`.
 - PDE judge context — the intimacy rung (`1..=3`, an image gate over
-  `max(bond, chemistry)`; rung 3 opens at `0.76`, inside tier 4 by design)
-  and the patience band.
+  `max(bond, chemistry)`; rung 3 opens at `0.76`, inside tier 4 by design),
+  the patience band, and a `[关系]` line, so its accept and refuse decisions
+  agree with the relationship: `[关系] 状态={wording}；冷战中={是|否}`
+  (`engaged` reads 已订婚). At `none` the line is `[关系] 冷战中=是` during a
+  cold war and absent otherwise. It carries no composed relation. The judge's
+  audit `inputs` record `relationship_status` and `cold_war`.
 - The group director — the Bond and Chemistry labels and the intimacy rung of
   each member, read from the member's 1:1 session and never written.
 - The life-event draw — the intimacy rung gates `ex_message`, `breakup` and
@@ -450,14 +616,14 @@ moved (format in [Event rows](#event-rows)).
   `out_shopping` are announced (from rung 2); from rung 2 she also says she wants
   what the shopping finds (`saw_bag`, `saw_clothes`) put in front of her
   (see [the events route](api-reference.md#post-v2compsessionsession_idevents)).
-- The ask for space — the two tier ladders (chemistry two tiers or more above
-  bond) and the derived `patience` of the last three judged turns decide
-  whether she asks for a break
-  ([the choice](life-events-needs.md#the-ask-for-space-choice)).
-- The romantic choices — the chemistry tier (and, for `propose`, the bond
-  tier) and the derived `warmth` and `patience` of the newest judged turns
-  decide whether she asks to sleep together or proposes, for a pair the
-  caller's scopes mark as romantic
+- The cold war — the judge's patience levels of the newest judged turns start
+  and end it, and ground her ask to break up
+  ([the cold war](life-events-needs.md#the-cold-war)).
+- The relationship and romantic choices — the status, the leading line and its
+  tier, and the derived `warmth` and `patience` of the newest judged turns
+  decide whether she confesses, offers a partnership, proposes, or asks to
+  sleep together or fall asleep together; all but the partnership only for a
+  pair the caller's scopes mark as romantic
   ([the choices](life-events-needs.md#the-romantic-choices)).
 - The trip — the bond tier and the derived `warmth` and `patience` of the
   newest judged turns decide whether she suggests going away together
@@ -471,6 +637,10 @@ moved (format in [Event rows](#event-rows)).
   `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2`, with hard
   vetoes (first 10 messages, streak ≥ 2, 1 h cooldown) and threshold `0.65`
   (`0.85` once the session has ghosted).
+- The story director — the relationship status and the cold-war flag, beside
+  the six axes and the two labels, as an engine-recorded fact that its
+  `user_relationship` must not contradict
+  ([world-system.md](world-system.md#the-story-round)).
 
 ## `affinity.rs` vs `scope.rs`
 
@@ -481,7 +651,8 @@ derivation, time decay, the Bond/Chemistry scores, tiers, labels.
 `AffinityScope` — six booleans, which axes may influence *this* request's
 prompt — plus `MemoryScope`. It gates prompt injection and `length_score`,
 and the `affinity_scope` a request records is what `romance_compatible` reads to decide
-whether a pair is eligible for the romantic life choices; post-process writes
+whether a pair is eligible for the romantic life choices (and, per turn, which
+column of the [composed relation](#the-composed-relation) the prompt reads); post-process writes
 (insight extraction, memory writes, the six-axis eval) are unaffected.
 
 **What they share.** Both live in core. Both group the six axes into two
@@ -545,6 +716,20 @@ derivation over each row's lines.
 only, as of 4.0; a stale `warmth` key from an older row is ignored and
 drains naturally. `NULL` reads as all-zero.
 
+### Relationship columns
+
+Two columns on `engine.companion_affinity` (migration `0088`) carry the
+[relationship status](#relationship-status):
+
+- `relationship_status text NOT NULL DEFAULT 'none'`, checked against the eight
+  keys;
+- `cold_war_since timestamptz`, when the cold war began; `NULL` means none is
+  on, and is the one carrier of the flag.
+
+They are the authority: the status is never re-derived from life choices or
+chat messages. Writing them leaves the row's `updated_at` alone, since that is
+the time-decay clock.
+
 ### Event rows
 
 Each delta turn appends one row to `engine.companion_affinity_events`:
@@ -552,7 +737,7 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
 - `deltas` — raw scores: grade conversion plus rule nudges, pre-decay; on an
   `activity` row, times its `weight`.
   `warmth`/`patience` are always `0.0` here, except on a `life_choice` row,
-  whose `deltas` equal its `effective_deltas` ([above](#life-choice-drops-and-the-slowdown)).
+  whose `deltas` equal its `effective_deltas` ([above](#life-choice-drops-and-the-cold-war-halving)).
 - `effective_deltas` — the applied change, `after − before`; for the base
   pair, the per-turn derivation delta.
 - `context` — `affinity_reason`, `eval_skip_reason`, the verbatim signed
@@ -561,15 +746,19 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
   `decay_factor`, `units`. `cross_penalty_assessed` joins them whenever a
   turn was taxed; `tier_drop` (`bond` | `chemistry`) joins them on a turn
   whose refused action dropped that line; `growth_scale` (`0.5`) joins them
-  on a turn whose positive growth was halved by the slowdown after a
-  separation. A life choice's own `life_choice` row has a `context` of
-  `life_choice` and `choice_id` instead (see
-  [above](#life-choice-drops-and-the-slowdown)). A date's `activity` row adds
-  `activity_id`, `turns`, `weight`, the judge's `reason` and, when the cap held
-  a line, `capped` ([above](#dates)).
+  on a turn whose positive growth was halved by the cold war. A life choice's
+  own `life_choice` row has a `context` of `life_choice` and `choice_id`
+  instead (see [above](#life-choice-drops-and-the-cold-war-halving)). A date's
+  `activity` row adds `activity_id`, `turns`, `weight`, the judge's `reason`
+  and, when the cap held a line, `capped` ([above](#dates)). A `relationship`
+  row's `context` is `from` and `to` (status keys), `cold_war` (`entered` |
+  `ended`) when the flag switched, and `choice_id` when her answered ask moved
+  it (below).
 - `user_message_id` — a real FK to `chat_messages`,
   `ON DELETE SET NULL`. `NULL` on `proactive`/`time_decay`/`life_choice`/`activity`
-  rows and on pre-migration rows; never backfilled. Assistant rows point at the same
+  rows and on pre-migration rows; never backfilled. A `relationship` row carries
+  it when the user's own `propose` or `break_up` moved the status, and is `NULL`
+  when her ask or a patience streak did. Assistant rows point at the same
   message through `chat_messages.user_message_id`, so the replies for an
   event are a join.
 - `label_changes` — the engine-authoritative tier transition for the turn:
@@ -589,8 +778,14 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
   against `engine.companion_affinity_events`.
 
 `event_type` is `message`, `ghost`, `gift`, `proactive`, `time_decay`,
-`life_choice` or `activity`. The last three are not turns: the per-turn delta
-route reads `message`, `gift`, `proactive` and `ghost` only.
+`life_choice`, `activity` or `relationship`. The last four are not turns: the
+per-turn delta route reads `message`, `gift`, `proactive` and `ghost` only.
+
+A `relationship` row is written for every change of the status or the cold-war
+flag, in the transaction that makes it, and only then: an answer that leaves
+both as they were (a declined `partner_up` from `peer`) writes none. Its
+`deltas` keep their default and it takes no state snapshot. It is not a judged
+turn, but it moves the life choices' streak anchor.
 
 ### API surfaces
 
@@ -612,6 +807,9 @@ refreshed at read time (`apply_time_decay` + `refresh_endpoints`):
   "chem_tier": 1,
   "bond_label": "acquaintance",
   "chemistry_label": "spark",
+  "relationship_status": "none",
+  "cold_war": false,
+  "composed_relation": null,
   "ghost_streak": 0,
   "total_ghosts": 0,
   "updated_at": "2026-08-16T12:00:00.000000Z"
@@ -622,6 +820,11 @@ refreshed at read time (`apply_time_decay` + `refresh_endpoints`):
 `bond_tier`/`chem_tier` are `tier_index`'s own result; clients read one of
 the two rather than re-deriving it from the score. `bond_label`/
 `chemistry_label` are always one of the five tier keys for that line.
+`relationship_status` is one of the eight status keys and `cold_war` whether a
+cold war is on. `composed_relation` is the key of the real tiers' cell, or
+`null` at `(1, 1)`; the pair's compatibility is not applied
+([the composed relation](#the-composed-relation)). The life-choice answer and
+the date's end route return the same shape.
 
 `GET /bff/v1/comp/affinity/{session_id}/event` returns the per-turn delta:
 
@@ -693,24 +896,32 @@ env override could break.
   pipeline, endpoint derivation, time decay, bond/chemistry scores, tiers,
   labels; a date's `grade_weighted`, `cap_line_shift` and
   `AffinityTuning::activity_weight`
+- `crates/eros-engine-core/src/relationship.rs` — the statuses and their
+  wording, `settle` (the transition table), `composed_relation`,
+  `leading_line`, the cold-war streak rules, `sleep_ask_is_sex`
 - `crates/eros-engine-core/src/scope.rs` — `AffinityScope` / `MemoryScope`,
   `length_score`, `romance_compatible` (see
   [`affinity.rs` vs `scope.rs`](#affinityrs-vs-scopers))
 - `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`
   (persist_with_event, record_ghost, persist_life_choice_drop_in_tx,
-  persist_activity_in_tx, last_judged_endpoints); its tables are in
-  `migrations/0000_baseline.sql`, and the `activity` event type in
-  `migrations/0085_activities.sql`
+  persist_activity_in_tx, last_judged_endpoints, write_relationship_in_tx,
+  set_cold_war); its tables are in `migrations/0000_baseline.sql`, the
+  `activity` event type in `migrations/0085_activities.sql`, and the
+  relationship columns and event type in `migrations/0088_relationship_status.sql`
 - `crates/eros-engine-server/src/pipeline/activity.rs` — a date's settlement
   and the activity judge call
 - `crates/eros-engine-store/src/life_choices.rs` — `LifeChoiceRepo`
-  (the choice rows; `growth_slowed` derives the slowdown window)
+  (the choice rows, the streak anchor)
+- `crates/eros-engine-server/src/pipeline/life_choice.rs` — the cold war's
+  start and end, her asks, `growth_scale_for` (the halving)
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM
   evaluation, grade/level parsing
 - `crates/eros-engine-server/src/prompt.rs` — affinity → attitude directive
-  + eval prompt
+  + eval prompt; `relationship_ground` (the `[relationship]` block)
+- `crates/eros-engine-server/src/pipeline/stream.rs` — `build_pde_ctx` (the
+  judge's `[关系]` line); the status gate on the user's `propose` and `break_up`
 - `crates/eros-engine-server/src/routes/dto.rs` — `AffinitySnapshot`
-  (composite scores + labels)
+  (composite scores, labels, status, cold war, composed relation)
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF affinity
   surface (value + event)
 - Design spec: `docs/superpowers/specs/2026-08-16-affinity-40-design.md` —
@@ -720,6 +931,9 @@ env override could break.
 - Design spec: `docs/superpowers/specs/2026-10-05-chat-user-actions-design.md` —
   user actions, the judge's response, the tier drop
 - Design spec: `docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md` —
-  the ask-for-space choice, its double tier drop and the growth slowdown
+  the life-choice mechanism and the tier drop of an answer (its ask for space
+  is retired)
 - Design spec: `docs/superpowers/specs/2026-11-12-activity-sub-session-design.md` —
   a date as a sub-session, its weighted verdict and the one-tier cap
+- Design spec: `docs/superpowers/specs/2026-11-23-affinity-50-design.md` —
+  the relationship status, the cold war and its halving, the composed relation

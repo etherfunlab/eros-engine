@@ -4,7 +4,9 @@
 
 ## 1. 概要
 
-Affinity(親密度)は、セッション(会話単位の関係)ごとに保持される6軸のベクトルである。各軸の値は `[0, 1]` の範囲に収まり、更新のたびにクランプされる。値が変化するのは、テキストチャンネルの `product_qa` 以外のチャットターンに限られる。voice チャンネルのターンと `product_qa` ターンでは、親密度イベントは一切書き込まれない。グループチャットのターンも同様で、グループは各メンバーの親密度を読み取るだけで、書き込まない。ターンではない変化は 2 つある。回答された生活選択によるティア降格([生活選択による降格と成長の鈍化](#生活選択による降格と成長の鈍化)を参照)と、精算されたデートに対する 1 回きりの判定([デート](#デート)を参照)である。
+Affinity(親密度)は、セッション(会話単位の関係)ごとに保持される6軸のベクトルである。各軸の値は `[0, 1]` の範囲に収まり、更新のたびにクランプされる。値が変化するのは、テキストチャンネルの `product_qa` 以外のチャットターンに限られる。voice チャンネルのターンと `product_qa` ターンでは、親密度イベントは一切書き込まれない。グループチャットのターンも同様で、グループは各メンバーの親密度を読み取るだけで、書き込まない。ターンではない変化は 2 つある。回答された生活選択によるティア降格([生活選択による降格と冷戦中の半減](#生活選択による降格と冷戦中の半減)を参照)と、精算されたデートに対する 1 回きりの判定([デート](#デート)を参照)である。
+
+6軸の上に、各セッションは[関係ステータス](#6-関係ステータス)を1つ保存する。ペアが互いに何であると決めたかを表し、生活選択と2つのユーザーアクションだけが動かす。その上に冷戦のフラグが重なることがある。
 
 ジャッジ(LLM 評価器)が返すのは、グレードやレベルといった離散的な区分による順序尺度のみである。実数値、ラベル、ティア遷移の判定は、すべてエンジンが担う。数値を決定する唯一の主体はエンジンである。
 
@@ -14,7 +16,7 @@ Affinity(親密度)は、セッション(会話単位の関係)ごとに保持�
 - Bond ライン(友情線): `trust` / `intrigue`
 - Chemistry ライン(恋愛線): `intimacy` / `tension`
 
-以下では、まずこの3グループをそれぞれ解説し(§2)、値が変化する仕組み(§3)、基礎ペアの導出に用いる定数(§4)、ティアとラベル(§5)、親密度の利用先(§6)、`affinity.rs` と `scope.rs` の対比(§7)、永続化と API(§8)、調整パラメータ(§9)、ソースマップ(§10)の順に説明する。
+以下では、まずこの3グループをそれぞれ解説し(§2)、値が変化する仕組み(§3)、基礎ペアの導出に用いる定数(§4)、ティアとラベル(§5)、関係ステータス(§6)、親密度の利用先(§7)、`affinity.rs` と `scope.rs` の対比(§8)、永続化と API(§9)、調整パラメータ(§10)、ソースマップ(§11)の順に説明する。
 
 ## 2. 6軸を3グループに分ける
 
@@ -39,7 +41,7 @@ bond が低く chemistry が高い組み合わせからは、「ツンデレ」�
 
 基礎ペアはユーザーがターンごとに「体感する」値であり、以下に直接反映される。
 
-- `[relationship]` プロンプトセクション: warmth × patience をそれぞれ 0.5 で分割した四象限。各セルの4語はプロンプト内の実際の文字列であり、そのまま引用する。
+- `[relationship]` プロンプトセクション(ペアに関係ステータスも合成関係も冷戦もないとき。[§6.6](#66-relationship)参照): warmth × patience をそれぞれ 0.5 で分割した四象限。各セルの4語はプロンプト内の実際の文字列であり、そのまま引用する。
 
   | | patience ≥ 0.5 | patience < 0.5 |
   |---|---|---|
@@ -144,7 +146,7 @@ penalty = κ_line × ((y − y₀)⁺ / (1 − y₀))² × (|g| / 4)
 
 4. **閾値ゲート。** 軸ごとに符号付きアキュムレータを持つ。累積値の絶対値が `AFFINITY_DELTA_THRESHOLD`(デフォルト 0 = 毎ターン確定)以上になった時点で確定し、それ以外は `pending_deltas` に蓄積される。
 
-   確定したデルタは 1:1 で適用され、`[0,1]` にクランプされる(彼女が持ち出した別離が終わってから 72 時間は、正のデルタが先に半分になる。[生活選択による降格と成長の鈍化](#生活選択による降格と成長の鈍化)を参照)。その後、そのターンでジャッジのレベルが読み取られていれば保存済みレベルを上書きし、両エンドポイントをターン後のライン値から再導出する。
+   確定したデルタは 1:1 で適用され、`[0,1]` にクランプされる(冷戦中は、正のデルタが先に半分になる。[生活選択による降格と冷戦中の半減](#生活選択による降格と冷戦中の半減)を参照)。その後、そのターンでジャッジのレベルが読み取られていれば保存済みレベルを上書きし、両エンドポイントをターン後のライン値から再導出する。
 
 ### 3.3 時間
 
@@ -167,28 +169,31 @@ PDE が決めたゴーストターンは `persist_with_event` に到達しない
 - **拒否されたチップ：** `tip` はラインを下げない。返信はジャッジの判定に従い、ターンは通常どおり採点される。
 - **ソーシャルアクション：** 拒否された `bluff`・`threaten`・`trick` は見抜いたことを意味し、拒否された `challenge`・`bet` は受けて立たなかったことを意味する。どれもやはりラインを下げない。ターンは通常どおり採点される。
 - **脱衣：** `affinity_scope` が恋愛的に相容れないペアからの `strip` は、ジャッジの判定にかかわらず拒否となり、拒否された身体的アクションと同じく Chemistry を一段下げる。そのようなペアからの `shower_together`・`bath_together`・`sex_together`・`streak_together` も同様であり、機械のペルソナへの `toilet_together` も拒否となる。`setting` が `fantasy` でないペルソナへの `fight_together` も同じく拒否となるが、ラインは下げない。ほかの一緒にするアクションにはこの規則がない。習慣のロールで断られた `smoke_together`・`smoke_weed_together`・`drink_together` も Chemistry を一段下げ、Bond は下げない。
-- **プロポーズ：** 断られた `propose` はラインを下げず、ターンは通常どおり採点される。
+- **プロポーズと別れ話：** 断られた `propose` や `break_up` はラインを下げず、ターンは通常どおり採点される。関係ステータスが `dating`・`fwb`・`situationship` 以外のときの `propose` と、別れられないステータスのときの `break_up` は、ジャッジの前に同じく拒否となる。回答されたものは[関係ステータス](#6-関係ステータス)を動かす。
 - **ギフト：** 受け取られると、キャラクターの持ち物かワードローブにも加わる。断られると何も加わらず、断られた `give` と同じく Bond が一段下がる。
 - **デート：** 断られた `date` の誘いはラインを下げず、ターンは通常どおり採点される。受け入れられた誘いは採点されない。その誘いがデートを開き、デートは精算時に一度だけ評価される([下記](#デート)を参照)。
 
 例：chemistry `0.80`（段階 4 の 64% の位置）は段階 3 の 64% の位置、約 `0.524` に着地する。
 
-### 生活選択による降格と成長の鈍化
+### 生活選択による降格と冷戦中の半減
 
-彼女がユーザーに生活選択を切り出すと、答えによっては関係に代償が生じる([距離を置く選択](life-events-needs.md#the-ask-for-space-choice)と[ロマンチックな選択](life-events-needs.md#the-romantic-choices)を参照)。ここにチャットのターンはなく、ジャッジも動かない。
+彼女がユーザーに生活選択を切り出すと、答えによっては関係に代償が生じる([生活選択](life-events-needs.md#life-choices)を参照)。ここにチャットのターンはなく、ジャッジも動かない。
 
-- **降格。** どの答えがどのラインを下げるかは種別による。
+- **降格。** ラインを下げるのは decline だけであり、どのラインを下げるかは種別による。
 
   | 種別 | accept | decline |
   |---|---|---|
-  | `ask_for_space` | bond と chemistry | bond と chemistry |
-  | `sleep_together` | 降格なし | chemistry |
+  | `confess` | 降格なし | chemistry |
+  | `partner_up` | 降格なし | 降格なし |
   | `propose` | 降格なし | bond と chemistry |
+  | `break_up` | 降格なし | 降格なし |
+  | `sleep_together` | 降格なし | chemistry |
+  | `fall_asleep_together` | 降格なし | chemistry |
   | `bathe_together` | 降格なし | chemistry |
 
-  名前の挙がったラインは、拒否されたアクションと同じ着地規則で 1 段階下がる。下の段階の中で同じ相対位置に着地し、ラインの 2 軸は同じ係数で縮小され、段階 1 のラインは `0` になる。そのラインの `pending_deltas` はクリアされ、名前の挙がらないラインは軸も残高もそのままである。時間減衰とエンドポイント再計算(デプロイの affinity チューニングを使う)を済ませたスナップショットから、行ロック内で、選択を解決するトランザクションの中で計算されるため、解決がロールバックされれば降格も残らない。`ask_for_space` の accept の場合、降格は彼女が戻ってきたときの状態であり、戻った時点でさらに何かが起きることはない。言葉で打った答え(`ignored`)と期限切れは、どの種別でもラインを下げない。
-- **そのイベント行。** 降格ごとに、ターンではない専用の `event_type`、`life_choice` の 1 行が書かれる。降格が生の変化のすべてなので、`deltas` と `effective_deltas` は同じ値を持つ。`label_changes`、`effective_line_deltas`、前後 2 つの状態スナップショットがティアの移動を記録する。`context` には `life_choice`(`accept` | `decline`)と `choice_id` が入る。accept された `sleep_together`、`propose`、`bathe_together` は何も動かさず行も書かれないため、`accept` が現れるのは `ask_for_space` だけである。この行に `user_message_id` はない。ターンごとの delta ルート `GET /bff/v1/comp/affinity/{session_id}/event` は `time_decay` と同様にこの行を返さず、ジャッジが採点したターンとしても数えられない。
-- **成長の鈍化(accept された `ask_for_space` のみ)。** 別離が終わってから 72 時間、4 つのライン軸で確定した正のデルタはすべて、適用前に半分になる。負のデルタは全額適用され、`warmth` と `patience` は従来どおりターン後のライン値から再導出される。削られた分は失われ、ゲートの残高には積まれない。適用されるのは選択が行われたセッションだけである。ウィンドウは導出されるもので新しい状態はない。選択の `event_id` から別離の `ends_at` を引き、`ends_at` から `ends_at` + 72 時間までを実時間で数える。鈍化したターンのイベント行は `context.growth_scale`(`0.5`)を持ち、通常の速度ではこのキーは付かず、`effective_deltas` には半分になった値が出る。accept されたロマンチックな選択が成長を鈍らせることはない。
+  名前の挙がったラインは、拒否されたアクションと同じ着地規則で 1 段階下がる。下の段階の中で同じ相対位置に着地し、ラインの 2 軸は同じ係数で縮小され、段階 1 のラインは `0` になる。そのラインの `pending_deltas` はクリアされ、名前の挙がらないラインは軸も残高もそのままである。時間減衰とエンドポイント再計算(デプロイの affinity チューニングを使う)を済ませたスナップショットから、行ロック内で、選択を解決するトランザクションの中で計算されるため、解決がロールバックされれば降格も残らない。言葉で打った答え(`ignored`)と期限切れは、どの種別でもラインを下げない。
+- **そのイベント行。** 降格ごとに、ターンではない専用の `event_type`、`life_choice` の 1 行が書かれる。降格が生の変化のすべてなので、`deltas` と `effective_deltas` は同じ値を持つ。`label_changes`、`effective_line_deltas`、前後 2 つの状態スナップショットがティアの移動を記録する。`context` には `life_choice`(`accept` | `decline`)と `choice_id` が入る。accept でラインが下がることはないため、行が持つのは `decline` であり、`accept` が現れるのは廃止された `ask_for_space` の保存済みの行だけである。この行に `user_message_id` はない。ターンごとの delta ルート `GET /bff/v1/comp/affinity/{session_id}/event` は `time_decay` と同様にこの行を返さず、ジャッジが採点したターンとしても数えられない。回答がステータスを動かした場合は、別に `relationship` の行が書かれる([イベント行](#イベント行companion_affinity_events)を参照)。
+- **冷戦中の半減。** セッションの[冷戦](#63-冷戦)が続いている間、4 つのライン軸で確定した正のデルタはすべて、適用前に半分になる。ジャッジが採点したターンにも、デートの精算にも適用される。負のデルタは全額適用され、`warmth` と `patience` は従来どおりターン後のライン値から再導出される。削られた分は失われ、ゲートの残高には積まれない。冷戦が始まった時点では何も下がらない。フラグはセッションの親密度の行に保存された値を読み、読み取りに失敗した場合は通常の速度で確定する。半減したターンのイベント行は `context.growth_scale`(`0.5`)を持ち、通常の速度ではこのキーは付かず、`effective_deltas` には半分になった値が出る。
 
 ### デート
 
@@ -200,7 +205,7 @@ PDE が決めたゴーストターンは `persist_with_event` に到達しない
   weight = min(turns, cap) × AFFINITY_ACTIVITY_TURN_SHARE
   ```
 
-  `turns` はデート中の実質的なターン数、`cap` はデートの長さに応じて `AFFINITY_ACTIVITY_TURN_CAP_SHORT` または `AFFINITY_ACTIVITY_TURN_CAP_MID` である(§9)。各軸の生スコア、実スコア、査定されたクロスラインペナルティは、閾値ゲートの前に `weight` 倍される。ティア減衰、`AFFINITY_NEG_FACTOR`、デモブースト、クランプ、別離後の鈍化はターンと同じく適用される。判定がパースできた場合はレベルが保存済みレベルを上書きし、両エンドポイントが再導出される。
+  `turns` はデート中の実質的なターン数、`cap` はデートの長さに応じて `AFFINITY_ACTIVITY_TURN_CAP_SHORT` または `AFFINITY_ACTIVITY_TURN_CAP_MID` である(§10)。各軸の生スコア、実スコア、査定されたクロスラインペナルティは、閾値ゲートの前に `weight` 倍される。ティア減衰、`AFFINITY_NEG_FACTOR`、デモブースト、クランプ、冷戦中の半減はターンと同じく適用される。判定がパースできた場合はレベルが保存済みレベルを上書きし、両エンドポイントが再導出される。
 - **1 段階の上限。** その後、各ラインは書き込み前の位置から最大 1 段階しか動かない。上へは上の段階の中の同じ相対位置まで(拒否されたアクションの着地規則の鏡像)、下へは下の段階の中の同じ相対位置までである。上限を超えたラインは、2 軸がそれぞれのデルタに沿って同じ比率で引き戻され、ちょうど上限に着地する。段階 1 のラインは `0` まで下がることがあり、段階 5 のラインはクランプで抑えられる。上限で削られた分は失われ、そのラインの `pending_deltas` はクリアされる。
 - **そのイベント行。** ターンではない `event_type`、`activity` の 1 行で、`user_message_id` はない。`context` には通常の監査キーに加えて、`activity_id`、`turns`、`weight`、ジャッジの `reason`、`capped`(上限で抑えられたライン。なければ付かない)が入る。delta ルートはこの行を返さず、生活選択のトリガーではジャッジが採点したターンとして数えられず、その `reason` は `[emotional_context]` に入らない。
 
@@ -242,11 +247,105 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 ターンごとのティア遷移は、イベント行の `label_changes` JSONB に記録される(`{bond: {from, to}, chemistry: {from, to}}`、どちらも変化しなかった場合は NULL)。
 
-## 6. 親密度の読み取り先(利用先マップ)
+## 6. 関係ステータス
 
-親密度の値を実際に読み取る先は、次の9つである。
+2本のラインが示すのはペアの近さであり、互いに何であるかではない。その上に2つのものが重なる。どちらも6軸、ティア、書き込みパイプラインには影響しない。
 
-- `[relationship]` — 基礎ペアの象限を使う(§2.1参照)。
+- **関係ステータス**: ペアが互いに何であると決めたか。セッションごとに保存され、回答された申し出だけが動かす。どのステータスの上にも**冷戦**が重なりうる。
+- **合成関係**: ペアの bond ティア × chemistry ティアに付けた名前。導出されるだけで保存されず、読むのは彼女のプロンプトだけである。
+
+### 6.1 ステータス
+
+ステータスは8つあり、セッションごとに1つ。中国語の表記は、ジャッジの `[关系]` 行がそのまま読む文字列である。プロンプトのステータス行も、性別で変わる2つの呼称を除いてこれを使う([§6.6](#66-relationship)参照)。
+
+| ステータス | 表記 | 別れられる |
+|---|---|---|
+| `none` | 未确定 | いいえ |
+| `dating` | 伴侣 | はい |
+| `partner` | 伙伴 | はい |
+| `peer` | 同事 | いいえ |
+| `fwb` | 伙伴，也是情人 | はい |
+| `situationship` | 同事，私下在交往 | はい |
+| `engaged` | 已订婚 | はい |
+| `ex` | 前任 | いいえ |
+
+どのセッションも `none` から始まり、一度離れると戻らない。最上位のステータスは `engaged` である。*別れられる*ステータスとは、別れ話で終わらせられるステータスを指す。
+
+### 6.2 遷移
+
+ステータスを動かすのは4つの申し出だけである。彼女の `confess` と `partner_up`、そして彼女もユーザーも持ち出せる `propose` と `break_up`([生活選択](life-events-needs.md#the-romantic-choices)、[ユーザーのアクション](api-reference.md#post-compchatsession_idmessagestream)を参照)。
+
+| 元のステータス | 起きたこと | 新しいステータス |
+|---|---|---|
+| `none`、`ex` | `confess` が受け入れられた | `dating` |
+| `partner` | `confess` が受け入れられた | `fwb` |
+| `peer` | `confess` が受け入れられた | `situationship` |
+| `none`、`ex`、`peer` | `partner_up` が受け入れられた | `partner` |
+| `none`、`ex`、`peer` | `partner_up` が断られた | `peer` |
+| `dating`、`fwb`、`situationship` | `propose` が受け入れられた | `engaged` |
+| 別れられるステータス | `break_up` が受け入れられた | `ex`。冷戦は終わる |
+| 別れられるステータス | `break_up` が断られた | 変わらない。冷戦中でなければ冷戦が始まる |
+
+断られた `confess` や `propose` はステータスを変えない。各申し出は、その行にあるステータスからしか持ち出されない。ほかのステータスでは彼女は持ち出さず、ユーザーの `propose` や `break_up` はジャッジの前に拒否され、何も起きない。一度到達したステータスは、呼び出し側の scope が変わっても取り消されない。
+
+変更は、申し出を解決するトランザクションの中で、親密度の行ロックの下で書かれる。彼女の申し出は生活選択ルートで回答されたときに書かれ、ステータスがその種別を持ち出さないものに変わっていれば、ルートは `409` を返して何も書かない。ユーザーのアクションは、その回答が保存されるときに、そのターンのセッションに書かれる(デート中は誘いを送ったセッション)。ステータスか冷戦が変わるたびに、`relationship` イベント行が1行書かれる([イベント行](#イベント行companion_affinity_events)を参照)。
+
+### 6.3 冷戦
+
+冷戦はステータスに重なるフラグ(`cold_war_since`)である。冷戦が終わると、下にあったステータスがそのまま現れる。
+
+- **始まる**のは、ジャッジが採点した 1:1 テキストターンの後、ストリークの起点以降の採点済みターンのうち、最新3つがすべてジャッジの最低の忍耐レベルであるか、最新7つのうち5つ以上がそうであるときである。別れ話が断られたときにも始まる。ティアの差、相性、ステータスは読まない。
+- **終わる**のは、起点以降の最新3つの採点済みターンの忍耐レベルがすべて最低より上のとき、および別れ話が受け入れられたときである。
+- **読むレベル**はジャッジ自身のもの(`patience_grade`、`1..=3`、各採点済みターンの `state_after` から。スナップショットにない古いターンは `2` として読む)であり、導出された `patience` ではない。後者はレベルに bond ラインのブーストを掛けた値なので、bond が低いと最上位のレベルでも `0.5` に届かず、それに閾値を置くと、新しい関係を冷戦に閉じ込めたままにしかねない。
+- **起点**は、セッションの最新の生活選択(申し出、回答)と最新の `relationship` イベントのうち遅いほうである。冷戦の開始と終了、ステータスの変更のたびに、新しいストリークが始まる。
+- **冷戦中**も彼女は返信するが、冷たい。`[relationship]` がそれを伝える。4つのライン軸で確定した正のデルタはすべて半分になる([上記](#生活選択による降格と冷戦中の半減)を参照)。温かい申し出(`confess`、`partner_up`、`propose`、一緒に寝ようという誘い、`bathe_together`、`travel_together`)は持ち出さず、別れられるステータスなら別れ話を持ち出すことがある。
+- **彼女は口に出す。** ストリークで冷戦が始まると、選択の行を伴わないプロアクティブなメッセージを1通送る。`metadata.proactive = 'cold_war'` である。フラグが先に確定するため、生成が失敗したり空だったりしても冷戦は続き、彼女は何も言わない。断られた別れ話で始まった冷戦には専用のメッセージはなく、冷戦が終わってもメッセージは書かれない。
+
+冷戦があるのは genome ペルソナの 1:1 テキストセッションだけである。保留中の申し出や進行中のデートは冷戦を止めない。規則とステージキューは [life-events-needs.md](life-events-needs.md#the-cold-war) にある。
+
+### 6.4 BYOC セッション
+
+[BYOC](byoc.md) セッションはステータスの外にある。常に `none` で、冷戦もない。彼女の申し出はそこでは発火せず、ユーザーの `propose` はほかのアクションと同じくジャッジに渡り何も動かさず、ユーザーの `break_up` はジャッジの前に拒否されて何も起きない。
+
+### 6.5 合成関係
+
+ペアの2つのティアに付けた名前で、セルごとに1つ、`(1, 1)` は `null` である。名前はプロンプト内の実際の文字列でありそのまま引用する。キーは API が返す値である。
+
+| bond \ chemistry | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| **1** | なし | 有好感的陌生人 `fond_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
+| **2** | 普通朋友 `casual_friend` | 有点暧昧的朋友 `flirty_friend` | 暗恋的朋友 `secret_crush` | 朋友以上的情人 `friend_and_lover` | 热恋的人 `new_flame` |
+| **3** | 好朋友 `good_friend` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 亲密的情人 `close_lover` | 难分难舍的人 `inseparable` |
+| **4** | 知己 `confidant` | 心照不宣的知己 `knowing_confidant` | 暗生情愫的知己 `smitten_confidant` | 知心爱人 `heart_lover` | 挚爱 `beloved` |
+| **5** | 灵魂之交 `kindred_spirit` | 动了心的灵魂之交 `stirred_kindred` | 柏拉图式的爱人 `platonic_love` | 灵魂爱人 `soul_lover` | 命中注定的人 `destined` |
+
+ステータスの語(伴侣、伙伴、同事、前任、未婚)を使う名前はない。合成関係は何のゲートにもならない。イベント、生活選択、アクションのどれも読まない。
+
+- **プロンプトでは**、そのターンの `affinity_scope` が恋愛的に相容れないペアは、chemistry にかかわらず chemistry 1 の列の名前を取る(普通朋友、好朋友、知己、灵魂之交。bond ティア1ではなし)。
+- **API では**、`composed_relation` は実際のティアのセルのキーであり、相性は適用しない。スナップショットは scope を持たず、ペアを相容れるとしたかどうかは呼び出し側が知っている。
+
+### 6.6 `[relationship]`
+
+テキストチャットのプロンプトの `[relationship]` ブロックは、ユーザーが彼女にとって誰であるかを最大3行で伝える。各行は伝えることがあるときだけ現れる。
+
+```
+[relationship]
+你是用户的未婚妻
+论感情，你们现在是知心爱人
+你们正在冷战
+```
+
+- **ステータス行**(ステータスが `none` でないとき): `你是用户的{呼称}`。`dating` は 女朋友 か 男朋友、`engaged` は 未婚妻 か 未婚夫 になり、ペルソナの `art_metadata.gender`(`female` / `male`。それ以外の値やないときは 伴侣 と 订婚对象)で決まる。ほかのステータスは上表の表記を読む。
+- **合成関係の行**(合成関係があるとき。相容れないペアは chemistry 1 の列の名前): ステータス行の後では `论感情，你们现在是{名前}`、ステータス行がなければ `你是用户的{名前}`。
+- **冷戦の行**(冷戦中): `你们正在冷战`。
+
+3行のどれもないとき、ブロックは基礎ペアの象限の名詞になり([§2.1](#21-基礎ペア--warmth-と-patience)参照)、象限の scope ゲートに従う。3行はペアについての確定した結論であり、返信を左右する軸ではないため、`affinity_scope` の個々の軸ではゲートされない。親密度の行がないときか scope が空のときにだけ、ブロックは省略される。音声とグループのプロンプトはステータスを読まず、ティアラベルの行を使い続ける。
+
+## 7. 親密度の読み取り先(利用先マップ)
+
+親密度の値を実際に読み取る先は、次のとおりである。
+
+- `[relationship]` — ステータス行、2つのティアの合成関係、冷戦の行を使い、3つとも伝えることがないときは基礎ペアの象限を使う([§6.6](#66-relationship)参照)。
 
 - `[mood]` — 軸ごとの閾値ゲートを使う(cold 禁止と warm 解禁)。
 
@@ -256,20 +355,22 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 - ターンごとのダイス(`TurnNudges`)の veto 判定 — `[mood]` と同じ cold 下限を使う(warmth ≤ 0.2 / trust < 0.3 / intrigue < 0.3)。
 
-- PDE ジャッジのコンテキスト — intimacy rung(`max(bond, chemistry)` 上の 1..=3 の画像ゲート、rung3 は 0.76 で開き、設計上ティア4の内側に収まる)と patience バンドを使う。
+- PDE ジャッジのコンテキスト — intimacy rung(`max(bond, chemistry)` 上の 1..=3 の画像ゲート、rung3 は 0.76 で開き、設計上ティア4の内側に収まる)、patience バンド、そして受け入れと拒否の判断を関係と食い違わせないための `[关系]` 行を使う。行は `[关系] 状态={表記}；冷战中={是|否}`(`engaged` は 已订婚)である。`none` のときは、冷戦中なら `[关系] 冷战中=是`、それ以外は行がない。合成関係は含まない。ジャッジの監査 `inputs` は `relationship_status` と `cold_war` を記録する。
 
 - グループチャットのディレクター — 各メンバーの Bond と Chemistry のラベルおよび intimacy rung。メンバーの 1:1 セッションから読み取るだけで、書き込みは一切行わない。
 
 - ライフイベントの抽選 — intimacy rung が `ex_message`、`breakup`、`period_scare`(rung 1 では抽選されない)、`sudden_desire`、`pregnancy_scare`(rung 3 のみ)の可否と、`busy`、`in_battle`、女性ペルソナの `out_shopping` を告げるかどうか(rung 2 から)を決める。rung 2 からは、ショッピングの小さな発見(`saw_bag`、`saw_clothes`)で目に留まったものを「欲しい」と口に出すようにもなる(events ルートの説明は [API reference](api-reference.md#post-v2compsessionsession_idevents) を参照)。
 
-- 距離を置きたいという切り出し — 2 本のティア階段(chemistry が bond より 2 段階以上高い)と、直近 3 回のジャッジ採点ターンから導出された `patience` が、彼女が休みを切り出すかどうかを決める([選択](life-events-needs.md#the-ask-for-space-choice)を参照)。
-- ロマンチックな選択 — chemistry のティア(`propose` では bond のティアも)と、直近のジャッジ採点ターンから導出された `warmth` と `patience` が、彼女が一緒に寝ようと誘うか、プロポーズするかを決める。呼び出し側の scope がこのペアをロマンチックと示している場合に限る([選択](life-events-needs.md#the-romantic-choices)を参照)。
+- 冷戦 — 直近のジャッジ採点ターンでジャッジが付けた忍耐レベルが、冷戦の開始と終了を決め、彼女が別れ話を持ち出す根拠になる([冷戦](life-events-needs.md#the-cold-war)を参照)。
+- 関係の選択とロマンチックな選択 — ステータス、先行するラインとそのティア、直近のジャッジ採点ターンから導出された `warmth` と `patience` が、彼女が告白するか、パートナーになろうと持ちかけるか、プロポーズするか、一緒に寝よう(あるいは並んで眠ろう)と誘うかを決める。パートナーの申し出以外は、呼び出し側の scope がこのペアをロマンチックと示している場合に限る([選択](life-events-needs.md#the-romantic-choices)を参照)。
 - 一緒に旅行 — bond のティアと、直近のジャッジ採点ターンから導出された `warmth` と `patience` が、彼女が一緒に旅行しようと持ちかけるかを決める([一緒に旅行](life-events-needs.md#going-away-together)を参照)。
 - リコールゲート — 時間減衰後の行の Bond と Chemistry のティアが、どの基礎プロフィールの親密フィールドとどの domain 付きプロフィール層メモリーがプロンプトに入るか、そして各層から何件リコールするかを決める。行がないペアは両ラインともティア 1 とみなす。テキスト、グループ、音声、画像編集のテキスト返信はいずれも減衰後の値を読む([memory-layers.md](memory-layers.md#affinity-gate)を参照)。
 
 - ゴーストスコアリング — `score = (1−intrigue)·0.4 + (1−patience)·0.4 + tension·0.2` を使い、ハード veto(最初の10メッセージ、streak ≥ 2、1時間クールダウン)と閾値 0.65(セッションが一度ゴーストした後は 0.85)を適用する。
 
-## 7. affinity.rs と scope.rs
+- ストーリーディレクター — 6軸と2つのラベルに加えて、関係ステータスと冷戦のフラグを、エンジンが記録した事実として読む。ディレクターが書く `user_relationship` はこれと矛盾してはならない([world-system.md](world-system.md#the-story-round)を参照)。
+
+## 8. affinity.rs と scope.rs
 
 この節では、モデル本体である `affinity.rs` と、リクエストごとの注入ゲートである `scope.rs` を対比する。両者は名前も扱う軸グループも似ているため混同されやすいが、役割はまったく異なる。この違いは意図的なものである。
 
@@ -277,7 +378,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 `crates/eros-engine-core/src/affinity.rs` はモデルそのものである。状態構造体、書き込みパイプライン(`grade_turn`)、基礎ペアの導出、時間減衰、Bond/Chemistry のスコア、ティア、ラベルを持つ。
 
-`crates/eros-engine-core/src/scope.rs` はリクエストごとの注入ゲートである。`AffinityScope`(6つの真偽値で、どの軸が「このリクエスト」のプロンプトに影響してよいかを表す)と `MemoryScope` を持つ。プロンプト注入と `length_score` を制御し、リクエストが記録した `affinity_scope` は、ペアがロマンチックな生活選択の対象になるかを `romance_compatible` が判定する材料にもなる。後処理の書き込み(インサイト抽出、メモリ書き込み、6軸評価)には影響しない。
+`crates/eros-engine-core/src/scope.rs` はリクエストごとの注入ゲートである。`AffinityScope`(6つの真偽値で、どの軸が「このリクエスト」のプロンプトに影響してよいかを表す)と `MemoryScope` を持つ。プロンプト注入と `length_score` を制御し、リクエストが記録した `affinity_scope` は、ペアがロマンチックな生活選択の対象になるかを `romance_compatible` が判定する材料にもなる(ターンごとに、プロンプトが[合成関係](#65-合成関係)のどの列を読むかも決める)。後処理の書き込み(インサイト抽出、メモリ書き込み、6軸評価)には影響しない。
 
 ### 共通点
 
@@ -293,7 +394,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 4. **これは既知の、意図的に残された欠陥(wart)である。** scope の名前やグループ分けを変更すると `length_score` の入力が変わり、既存の呼び出し元で返信長にリグレッションが生じる。デフォルトの scope は `bond()`(warmth/intimacy/tension の三つ組)である。「修正」してはならない。scope に導出や書き込みパスを制御させてはならない。
 
-## 8. 永続化と API
+## 9. 永続化と API
 
 ここでは、DB のカラム定義とイベント行の構造、それらを外部に公開する BFF API の契約を扱う。
 
@@ -316,21 +417,32 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 
 `pending_deltas` は JSONB である(ライン軸のみ。旧行に残る `warmth` キーは無視され、順次排出される。NULL はすべてゼロとして読み取られる)。
 
+### 関係ステータスのカラム
+
+`engine.companion_affinity` の2つのカラム(マイグレーション `0088`)が[関係ステータス](#6-関係ステータス)を持つ。
+
+- `relationship_status text NOT NULL DEFAULT 'none'`。8つのキーに対する CHECK が付く。
+- `cold_war_since timestamptz`。冷戦が始まった時刻。NULL は冷戦がないことを表し、冷戦フラグの唯一の保持先である。
+
+これらが正である。ステータスが生活選択やチャットメッセージから再導出されることはない。書き込んでも行の `updated_at` は変わらない。それが時間減衰の時計だからである。
+
 ### イベント行(`companion_affinity_events`)
 
 デルタが生じたターンごとに1行が追加される。
 
-- `deltas` = 生スコア(グレード変換 + ルールナッジ、減衰前)。`activity` 行ではさらにその `weight` 倍になる。ここでは `warmth`/`patience` は常に 0.0 である。ただし `life_choice` 行は例外で、その `deltas` は `effective_deltas` と同じ値を持つ([上記](#生活選択による降格と成長の鈍化)を参照)。
+- `deltas` = 生スコア(グレード変換 + ルールナッジ、減衰前)。`activity` 行ではさらにその `weight` 倍になる。ここでは `warmth`/`patience` は常に 0.0 である。ただし `life_choice` 行は例外で、その `deltas` は `effective_deltas` と同じ値を持つ([上記](#生活選択による降格と冷戦中の半減)を参照)。
 
 - `effective_deltas` = after − before の適用済み変化(基礎ペアについては、そのターンの導出デルタ)。
 
-- `context` = `affinity_reason`、`eval_skip_reason`、判定どおりの符号付き `grades`、`pending_after`、エンドポイント監査情報(読み取られた場合の `warmth_grade` / `patience_grade`、`boost_warmth` / `boost_patience`、`decay_factor`、`units`)、ペナルティが課された場合の `cross_penalty_assessed`、拒否されたアクションでラインが下がった場合の `tier_drop`(`bond` | `chemistry`)、別離後の鈍化で正の成長が半分になった場合の `growth_scale`(`0.5`)。生活選択自身の `life_choice` 行の `context` は、代わりに `life_choice` と `choice_id` になる([上記](#生活選択による降格と成長の鈍化)を参照)。デートの `activity` 行には `activity_id`、`turns`、`weight`、ジャッジの `reason`、ラインが上限で抑えられた場合の `capped` が加わる([上記](#デート)を参照)。
+- `context` = `affinity_reason`、`eval_skip_reason`、判定どおりの符号付き `grades`、`pending_after`、エンドポイント監査情報(読み取られた場合の `warmth_grade` / `patience_grade`、`boost_warmth` / `boost_patience`、`decay_factor`、`units`)、ペナルティが課された場合の `cross_penalty_assessed`、拒否されたアクションでラインが下がった場合の `tier_drop`(`bond` | `chemistry`)、冷戦で正の成長が半分になった場合の `growth_scale`(`0.5`)。生活選択自身の `life_choice` 行の `context` は、代わりに `life_choice` と `choice_id` になる([上記](#生活選択による降格と冷戦中の半減)を参照)。デートの `activity` 行には `activity_id`、`turns`、`weight`、ジャッジの `reason`、ラインが上限で抑えられた場合の `capped` が加わる([上記](#デート)を参照)。`relationship` 行の `context` は `from` と `to`(ステータスのキー)、フラグが切り替わった場合の `cold_war`(`entered` | `ended`)、彼女の申し出への回答で動いた場合の `choice_id` である(下記を参照)。
 
-- `user_message_id`: `chat_messages` への実際の FK、`ON DELETE SET NULL`。`proactive` / `time_decay` / `life_choice` / `activity` 行および移行前の行では NULL であり、バックフィルはされない。
+- `user_message_id`: `chat_messages` への実際の FK、`ON DELETE SET NULL`。`proactive` / `time_decay` / `life_choice` / `activity` 行および移行前の行では NULL であり、バックフィルはされない。`relationship` 行は、ユーザー自身の `propose` や `break_up` がステータスを動かした場合に値を持ち、彼女の申し出や忍耐のストリークで動いた場合は NULL である。
 
 - `label_changes`(§5参照)、`effective_line_deltas`(ターンごとの正確な bond/chemistry デルタ、`effective_deltas_computed` として提供される)、`state_after`(ターン後の全ベクトル)。`state_before` は存在するが提供されない。リプレイは直接クエリで行う。
 
-`event_type` は `message`、`ghost`、`gift`、`proactive`、`time_decay`、`life_choice`、`activity` のいずれかである。後ろの 3 つはターンではなく、ターンごとの delta ルートが読むのは `message`、`gift`、`proactive`、`ghost` だけである。
+`event_type` は `message`、`ghost`、`gift`、`proactive`、`time_decay`、`life_choice`、`activity`、`relationship` のいずれかである。後ろの 4 つはターンではなく、ターンごとの delta ルートが読むのは `message`、`gift`、`proactive`、`ghost` だけである。
+
+`relationship` 行は、ステータスか冷戦フラグが変わるたびに、その変更を行うトランザクションの中で書かれ、変わったときだけ書かれる。回答の後どちらも変わらない場合(`peer` からの `partner_up` が断られた場合など)は書かれない。`deltas` はデフォルトのままで、状態スナップショットは取らない。ジャッジが採点したターンではないが、生活選択のストリークの起点を動かす。
 
 ### API インターフェース
 
@@ -350,11 +462,16 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
   "chem_tier": 1,
   "bond_label": "acquaintance",
   "chemistry_label": "spark",
+  "relationship_status": "none",
+  "cold_war": false,
+  "composed_relation": null,
   "ghost_streak": 0,
   "total_ghosts": 0,
   "updated_at": "2026-08-16T12:00:00.000000Z"
 }
 ```
+
+`relationship_status` は8つのステータスキーのいずれか、`cold_war` は冷戦中かどうかである。`composed_relation` は実際のティアのセルのキーで、`(1, 1)` では `null` になる。ペアの相性は適用しない([合成関係](#65-合成関係)を参照)。生活選択の回答とデートの終了ルートも同じ形を返す。
 
 `GET /bff/v1/comp/affinity/{session_id}/event` はターンごとのイベントを返す。`effective_deltas`(軸ごとの適用済み変化、`after − before`。warmth/patience についてはターンごとの導出デルタ)に加え、次を含む。
 
@@ -391,7 +508,7 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 
 `effective_deltas_computed`、`label_changes`、`state_after` は、いずれもイベント行に保存された値である。対応する `state_before` はこのレスポンスには含まれない。範囲を指定したリプレイは、`engine.companion_affinity_events` への直接クエリで行う。
 
-## 9. 調整パラメータ
+## 10. 調整パラメータ
 
 以下はサーバー側の環境変数である。未設定の場合は、それぞれのデフォルト値が使われる。
 
@@ -414,21 +531,25 @@ DB が書き込みのたびに再計算するため、ライン軸の値との�
 
 すべてのスカラー値は、起動時に許容範囲がチェックされる。不正な値はログに記録され、デフォルト値が維持される。エンジンの起動は妨げない。0.35 のピボットと `B_MAX` 1.5 はコード定数であり、調整パラメータではない。
 
-## 10. ソースマップ
+## 11. ソースマップ
 
 実装を直接確認する場合の参照先は、次のとおりである。
 
 - `crates/eros-engine-core/src/affinity.rs` — 型定義、`grade_turn` 書き込みパイプライン、エンドポイント導出、時間減衰、bond/chemistry スコア、ティア、ラベル、`diff_labels`。デートの `grade_weighted`、`cap_line_shift`、`AffinityTuning::activity_weight`
-- `crates/eros-engine-core/src/scope.rs` — `AffinityScope` / `MemoryScope`、`length_score`、`romance_compatible`(§7参照)
-- `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`(persist_with_event、record_ghost、persist_life_choice_drop_in_tx、persist_activity_in_tx、last_judged_endpoints)。テーブルは `migrations/0000_baseline.sql`、`activity` イベント型は `migrations/0085_activities.sql`
+- `crates/eros-engine-core/src/relationship.rs` — ステータスとその表記、`settle`(遷移表)、`composed_relation`、`leading_line`、冷戦のストリーク規則、`sleep_ask_is_sex`
+- `crates/eros-engine-core/src/scope.rs` — `AffinityScope` / `MemoryScope`、`length_score`、`romance_compatible`(§8参照)
+- `crates/eros-engine-store/src/affinity.rs` — `AffinityRepo`(persist_with_event、record_ghost、persist_life_choice_drop_in_tx、persist_activity_in_tx、last_judged_endpoints、write_relationship_in_tx、set_cold_war)。テーブルは `migrations/0000_baseline.sql`、`activity` イベント型は `migrations/0085_activities.sql`、関係ステータスのカラムと `relationship` イベント型は `migrations/0088_relationship_status.sql`
 - `crates/eros-engine-server/src/pipeline/activity.rs` — デートの精算とアクティビティジャッジの呼び出し
-- `crates/eros-engine-store/src/life_choices.rs` — `LifeChoiceRepo`(選択の行。`growth_slowed` が鈍化ウィンドウを導出する)
+- `crates/eros-engine-store/src/life_choices.rs` — `LifeChoiceRepo`(選択の行、ストリークの起点)
+- `crates/eros-engine-server/src/pipeline/life_choice.rs` — 冷戦の開始と終了、彼女の申し出、`growth_scale_for`(冷戦中の半減)
 - `crates/eros-engine-server/src/pipeline/post_process.rs` — LLM 評価、grade/level のパース
-- `crates/eros-engine-server/src/prompt.rs` — affinity → attitude ディレクティブ + eval プロンプト
-- `crates/eros-engine-server/src/routes/dto.rs` — `AffinitySnapshot`(複合スコア + ラベル)
+- `crates/eros-engine-server/src/prompt.rs` — affinity → attitude ディレクティブ + eval プロンプト、`relationship_ground`(`[relationship]` ブロック)
+- `crates/eros-engine-server/src/pipeline/stream.rs` — `build_pde_ctx`(ジャッジの `[关系]` 行)、ユーザーの `propose` と `break_up` のステータスゲート
+- `crates/eros-engine-server/src/routes/dto.rs` — `AffinitySnapshot`(複合スコア、ラベル、ステータス、冷戦、合成関係)
 - `crates/eros-engine-server/src/routes/bff/affinity.rs` — BFF affinity インターフェース(value + event)
 - 設計仕様書: `docs/superpowers/specs/2026-08-16-affinity-40-design.md` — ライン数式、エンドポイント導出、ティア
 - 設計仕様書: `docs/superpowers/specs/2026-08-17-affinity-41-design.md` — 永続化されたティアカラム、イベントの状態スナップショット、value エンドポイント
 - 設計仕様書: `docs/superpowers/specs/2026-10-05-chat-user-actions-design.md` — ユーザーアクション、ジャッジの応答、ティア降格
-- 設計仕様書: `docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md` — 距離を置きたいという切り出し、両ラインの降格、成長の鈍化
+- 設計仕様書: `docs/superpowers/specs/2026-10-19-life-events-shopping-gatherings-and-ask-for-space-design.md` — 生活選択の仕組み、回答による降格(そこにある距離を置く申し出は廃止済み)
 - 設計仕様書: `docs/superpowers/specs/2026-11-12-activity-sub-session-design.md` — サブセッションとしてのデート、重み付きの判定、1 段階の上限
+- 設計仕様書: `docs/superpowers/specs/2026-11-23-affinity-50-design.md` — 関係ステータス、冷戦とその半減、合成関係
