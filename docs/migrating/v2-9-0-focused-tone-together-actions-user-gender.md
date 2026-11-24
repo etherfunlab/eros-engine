@@ -8,7 +8,7 @@
 - readers of `metadata.tone` on stored rows, or of the composer's audit `inputs`;
 - crate users who match on `EventKind`, `UserAction` or `Tone`, build `Tones` by hand, rely on the length of `EventKind::SPECIAL`, or call `pde::world_ruled_out`.
 
-No migration. Every HTTP change is additive: four action types, four event kinds, one optional request field (`user_gender`), one new `metadata.tone` value and one new key in the composer's audit `inputs`. One new setting, `tones.focused`, is off when absent. A `fantasy` persona stops drawing five kinds.
+No migration. Every field on the wire is additive (four action types, four event kinds, one optional request field `user_gender`, one new `metadata.tone` value and one new key in the composer's audit `inputs`), but one behaviour changes: a `fantasy` persona stops drawing five kinds. One new setting, `tones.focused`, is off when absent.
 **Design:** [`2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md`](../superpowers/specs/2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md)
 
 The other note for this release is [Affinity 5.0, the relationship status and the cold war](v2-9-0-affinity-5-0.md).
@@ -33,9 +33,9 @@ Nothing to run: no migration. Deploy the image as for any release; [Affinity 5.0
 
 - **The `focused` tone is off until you set it.** `tones = { emotional = 0.05, focused = 1.0 }` on `[tasks.chat_companion]`; either key works without the other, and a value outside `[0.0, 1.0]` refuses to boot. The key is the probability at work. It also switches on the off-work 1/8 for `full_time` personas, which it does not scale: a deployment that sets the key for turns at work gets that too. The assistant rows of a turn that made either draw carry `metadata.tone`, now `"emotional"`, `"focused"` or `"default"`.
 - **`employed = full_time` has a second reading.** It still weighs the work kinds three times; with `tones.focused` on, it also makes the persona career-minded. Review the cards that set it before you turn the tone on.
-- **A custom composer `filter_prompt`.** When the chat request carries `user_gender` and a shared kind is under way, the composer's payload gains a `[对方]` section right after `[此刻状态]`, holding `男性` or `女性`. The built-in prompt names it. A custom prompt should add a line such as: *When a [对方] section is present and the partner appears in the picture, draw the partner as that gender.* Without it the model still sees the section. Without the section the payload is byte-identical to before.
+- **A custom composer `filter_prompt`.** When the chat request carries a `user_gender` of `male` or `female` and a kind named in `[此刻状态]` is one she shares with the user (the one an accepted together action places this turn included), the composer's payload gains a `[对方]` section right after `[此刻状态]`, holding `男性` or `女性`. The built-in prompt names it. A custom prompt should add a line such as: *When a [对方] section is present and the partner appears in the picture, draw the partner as that gender.* Without it the model still sees the section. Without the section the payload is byte-identical to before.
 - **A custom judge prompt.** The judge's `[用户动作]` line carries the new markers, as in `[用户动作] 对方想和你一起健身`, `对方想和你一起游泳`, `对方想和你一起骑单车` and `对方想和你一起爬山`. A fantasy persona's `cycle_together` ends the line with `，这次你不会答应` (`[用户动作] 对方想和你一起骑单车，这次你不会答应`), as a modern persona's `fight_together` does. A prompt that treats actions generically needs nothing.
-- **Audit.** Every `engine.chat_images_events` row of the image-prompt composer (every `source` but `image_edit`) carries `partner_gender` in `inputs`: the `[对方]` section as sent, or `""` without one (always `""` on the standalone compose endpoint). A reader that expects a fixed key set should accept it. `user_gender` itself is kept in the turn's `chat_turn_queue.params`, beside the locale fields, and is not written to the user row.
+- **Audit.** Every `engine.chat_images_events` row of the image-prompt composer (every `source` but `image_edit`) carries `partner_gender` in `inputs`: the `[对方]` section as sent, or `""` without one (always `""` on the standalone compose endpoint, on a group turn's picture, and on an event message's, the one proactive message that carries a picture). A reader that expects a fixed key set should accept it. `user_gender` itself is kept in the turn's `chat_turn_queue.params`, beside the locale fields, and is not written to the user row.
 
 ### Rollback
 
@@ -49,7 +49,7 @@ These changes need no database change; roll the release back as [Affinity 5.0](v
 ## Clients
 
 1. **Add the four action types** if your client offers them. None carries a field. The answer arrives as for any action: the `action_response` frame, then `response` on the stored row in both history routes. A `cycle_together` to a `fantasy` persona is always `refuse` and costs nothing; a client may offer it to `modern` personas only, as it offers `fight_together` to `fantasy` ones only.
-2. **Expect a picture on an accepted one**, as on any accepted together action: with `image` in the request and the composer configured, the frames run `action_response → meta(reply_text_image) → delta* → done → image_request → final`. A refusal, and a deployment without the composer, are text only.
+2. **Expect a picture on an accepted one**, as on any accepted together action: with `image` in the request and the composer configured, the frames run `action_response → meta(reply_text_image) → delta* → done → image_request → final`. A refusal, and a deployment without the composer, are text only, except that `image.force = true` still makes a refused turn `reply_image`, its picture following the refusal.
 3. **Add the four event kinds to your catalog** before or with the upgrade. Each is placed by the accepted action and never drawn:
 
    | action | kind | label | category | lasts |

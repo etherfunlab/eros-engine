@@ -395,7 +395,7 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `is_virgin` | `true`, `false` (default) | while she is a virgin, `having_sex` weighs a fifth within `mid` and `just_have_sex` a fifth within `short` |
 | `sex_addict` | `true`, `false`, absent (default) | within `short`: `true` weighs `sudden_desire`, `strip`, `streaking` and `just_have_sex` 3 times, `false` a third; their gates hold either way. Only `true` lets her draw `having_sex` and `masturbating` |
 | `hygienic` | `true`, `false`, absent (default) | within `short`: `true` weighs `showering`, `bathing`, `want_hot_spring` and `want_sauna` 3 times, `false` a third; it also sets the chemistry tier [a bath together](#a-bath-together) needs |
-| `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` weigh a third, 1 time, 3 times within their categories; a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time`. `full_time` also makes her career-minded: while the deployment has the `focused` tone on, a turn off work with no incident under way is `focused` 1 time in 8 ([at work](#at-work)) |
+| `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` weigh a third, 1 time, 3 times within their categories; a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time`. `full_time` also makes her career-minded: with `tones.focused` above 0, a turn that may draw a tone, off work and with no incident under way, is `focused` 1 time in 8 ([at work](#at-work)) |
 | `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | within each category, `outdoor` weighs the outdoor kinds 3 times and the indoor kinds a third, `indoor` the reverse; neutral kinds are untouched ([below](#outdoors-or-in)); any other value reads as `neutral` |
 | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in ([below](#her-world)); a persona that is not `fantasy` refuses the user's `fight_together`, and a `fantasy` one the user's `cycle_together` ([together actions](#showering-bathing-and-the-sauna-together)); any other value reads as `modern` |
 | `species` | any word | `"robot"` and `"android"` are machines: she never draws `period`, `period_scare`, `pregnancy_scare` or `using_toilet`, and refuses the user's `toilet_together` ([together actions](#showering-bathing-and-the-sauna-together)); every other word leaves the draw alone. What the word does to the prompt is in [eros-character-v1.1.md](eros-character-v1.1.md) |
@@ -631,9 +631,10 @@ on, the story and world directors read them too ([Beyond the chat](#beyond-the-c
   picture of an accepted [together action](#showering-bathing-and-the-sauna-together) shows the
   event it places. The standalone compose endpoint and image edit send no such section. See
   [the composer](model-config.md#taskschat_image_prompt_compose--image-prompt-composer-required-for-image-turns).
-  When the chat request carries `user_gender` and one of the two is a kind she shares with the
-  user (`traveling_together`, `on_a_date` or any `…_together` kind), a `[对方]` section after it
-  gives the user's gender, so a picture that shows the user draws them as it.
+  When the chat request carries a `user_gender` of `male` or `female` and a kind the section
+  names is one she shares with the user (`traveling_together`, `on_a_date` or any `…_together`
+  kind, the one an accepted together action places this turn included), a `[对方]` section after
+  it gives the user's gender, so a picture that shows the user draws them as it.
 - **The caller** gets them from `GET …/effects`: `event` is the incident under way, and
   `background_event` the background. An offline kind under way is reported as `event`
   like any incident, with `"offline": true`; how a client shows it is its call.
@@ -658,8 +659,8 @@ modern persona is ever at work.
 Only a 1:1 text turn without a user action draws, and a turn that comes up `emotional` stays
 `emotional`. A `focused` reply keeps the chat history, the user profile, the memories and the
 relationship (`[relationship]`, `[mood]`, `[inner_state]`); it drops `[feelings]` and
-`[emotional_context]`, is held to one sentence of at most 40 characters, and its `[this_turn]`
-holds one line instead of the rolled nudges:
+`[emotional_context]` and is held to one sentence of at most 40 characters. No nudge dice are
+rolled: its `[this_turn]` holds this one line and nothing else:
 
 ```
 - 你手上有工作，心思在工作上：回得简短利落，先顾手上的事

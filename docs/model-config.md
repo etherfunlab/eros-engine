@@ -635,7 +635,7 @@ only a reply that bears text has one:
   | the turn | p |
   |---|---|
   | she is at work: the incident under way is `temp_work`, or the background is `business_trip` and no incident is under way | `focused` |
-  | off work, the persona's `art_metadata.employed` is `"full_time"`, no incident under way, any background | 1/8, whatever the value of `focused` |
+  | off work, the persona's `art_metadata.employed` is `"full_time"`, no incident under way, any background | 1/8, for any value of `focused` above 0 |
   | any other | no roll |
 
   `focused = 1.0` makes every such turn at work `focused`; the key switches
@@ -647,7 +647,7 @@ only a reply that bears text has one:
   `emotional`, accepted or refused, while `emotional` is above 0. Any other
   action turn is never `emotional`, and no action turn is ever `focused`.
 - **The message a life event sends when it starts** is `emotional` for sixteen
-  kinds ([life-events-needs.md](life-events-needs.md#how-she-tells-it)).
+  kinds while `emotional` is above 0 ([life-events-needs.md](life-events-needs.md#how-she-tells-it)).
 
 Group turns, `/open` and the other proactive messages, edit and image-edit turns
 and voice calls never take a tone.
@@ -691,10 +691,11 @@ Post-processing (memory, insights, affinity) runs as on any turn, and the model,
 sampling, output filter and frames are those of the chat task.
 
 **The record.** Every assistant row of a turn that made either draw carries
-`metadata.tone`: the final tone, `"emotional"`, `"focused"` or `"default"`. The
-rows of a listed action turn and of a listed
+`metadata.tone`: the final tone, `"emotional"`, `"focused"` or `"default"`. While
+`emotional` is above 0, the rows of a listed action turn and of a listed
 event message carry `"emotional"` too; the user row's `metadata.action` and the
-message's `metadata.proactive` tell those apart from a drawn turn. A turn the
+message's `metadata.proactive` tell those apart from a drawn turn. With
+`focused` alone, a listed action turn makes no draw and its rows carry no `tone`. A turn the
 tone did not touch has no `tone` key. The tone is stored nowhere else: not on
 the judge's decision row and not in any frame.
 

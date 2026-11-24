@@ -301,7 +301,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内、`just_have_sex` 在 `short` 内权重为五分之一 |
 | `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire`、`strip`、`streaking` 与 `just_have_sex` 3 倍，`false` 时三分之一；它们的门槛两种情况都照旧。只有 `true` 才会抽到 `having_sex` 和 `masturbating` |
 | `hygienic` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 3 倍，`false` 时三分之一；它也决定[一起洗澡](#一起洗澡)要 chemistry 到第几档 |
-| `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内分别为三分之一、1 倍、3 倍；`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读。`full_time` 还表示她有事业心：部署打开 `focused` 语气时，不在上班、也没有插曲在进行的回合，有八分之一用 `focused` 语气（见[上班时](#上班时)） |
+| `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内分别为三分之一、1 倍、3 倍；`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读。`full_time` 还表示她有事业心：`tones.focused` 大于 0 时，可以抽语气、不在上班、也没有插曲在进行的回合，有八分之一用 `focused` 语气（见[上班时](#上班时)） |
 | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | 每个类别内部：`outdoor` 时户外种类 3 倍、室内种类三分之一，`indoor` 反过来；中性种类不动（见[下文](#户外还是室内)）；其他值按 `neutral` 读 |
 | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界（见[下文](#她的世界)）；不是 `fantasy` 的角色拒绝用户的 `fight_together`，`fantasy` 的角色拒绝用户的 `cycle_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）；其他值按 `modern` 读 |
 | `species` | 任意词 | `"robot"` 和 `"android"` 是机器：她不会抽到 `period`、`period_scare`、`pregnancy_scare`、`using_toilet`，也拒绝用户的 `toilet_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）；其他词不影响抽取。这个词对 prompt 的作用见 [eros-character-v1.1.md](eros-character-v1.1.md) |
@@ -479,8 +479,8 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
   载荷里没有这一段。正在开始的事件即使还没落库也算进行中：事件消息的图画的是它讲述的事件，被接受的
   [一起做的动作](#一起淋浴泡澡和蒸桑拿)所出的图画的是它写入的事件。独立的 compose 端点和改图不发这一段。见
   [合成器](model-config.zh.md#taskschat_image_prompt_compose--出图-prompt-合成器图片轮次必需)。
-  聊天请求带了 `user_gender`，且这两件里有一件是她和用户一起做的种类（`traveling_together`、`on_a_date` 或任何
-  `…_together` 种类）时，它后面再跟一段 `[对方]`，写用户的性别，图里画到用户时就按这个性别画。
+  聊天请求带的 `user_gender` 是 `male` 或 `female`，且这一段写到的种类里有一种是她和用户一起做的（`traveling_together`、`on_a_date`
+  或任何 `…_together` 种类，这一轮被接受的一起做的动作写入的那种也算）时，它后面再跟一段 `[对方]`，写用户的性别，图里画到用户时就按这个性别画。
 - **调用方**从 `GET …/effects` 拿到：`event` 是进行中的插曲，`background_event` 是进行中的背景。
   进行中的离线类事件和其他插曲一样作为 `event` 返回，带 `"offline": true`；客户端怎么展示由它自己决定。
 
@@ -500,7 +500,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 只有不带用户动作的 1:1 文字回合会掷，掷出 `emotional` 的回合仍是 `emotional`。`focused` 的回复保留聊天历史、用户画像、
 记忆和关系（`[relationship]`、`[mood]`、`[inner_state]`）；去掉 `[feelings]` 和 `[emotional_context]`，限定为一句、
-不超过 40 字，`[this_turn]` 不再放掷出来的提示，只放一行：
+不超过 40 字。不掷每轮的 nudge 骰子：`[this_turn]` 只放这一行，别的都没有：
 
 ```
 - 你手上有工作，心思在工作上：回得简短利落，先顾手上的事

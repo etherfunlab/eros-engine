@@ -547,14 +547,14 @@ tones = { emotional = 0.05, focused = 1.0 }
   | 这一轮 | 概率 |
   |---|---|
   | 她在上班：进行中的插曲是 `temp_work`，或者背景是 `business_trip` 而没有插曲在进行 | `focused` |
-  | 不在上班，角色的 `art_metadata.employed` 为 `"full_time"`，没有插曲在进行，背景不限 | 1/8，不管 `focused` 取多少 |
+  | 不在上班，角色的 `art_metadata.employed` 为 `"full_time"`，没有插曲在进行，背景不限 | 1/8，`focused` 大于 0 时不管取多少 |
   | 其他 | 不掷 |
 
   `focused = 1.0` 让上班时的这类回合全都用 `focused`；这个键只负责打开那个 1/8，不缩放它。见
   [life-events-needs.zh.md](life-events-needs.zh.md#上班时)。
 - **带十三种用户动作之一的 1:1 回合**（`french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、
   `shower_together`、`bath_together`、`sex_together`、`streak_together`、`propose`、`break_up`、`threaten`、`tip`）在 `emotional` 大于 0 时一律用 `emotional`，接受、拒绝都一样。其余带动作的回合从不用 `emotional`，带动作的回合也从不用 `focused`。
-- **生活事件开始时发的那条消息**，有十六种事件用 `emotional`（[life-events-needs.zh.md](life-events-needs.zh.md#她怎么讲出来)）。
+- **生活事件开始时发的那条消息**，在 `emotional` 大于 0 时有十六种事件用 `emotional`（[life-events-needs.zh.md](life-events-needs.zh.md#她怎么讲出来)）。
 
 群聊回合、`/open` 和其他主动消息、编辑与改图回合、语音通话从不带语气。
 
@@ -583,8 +583,8 @@ tones = { emotional = 0.05, focused = 1.0 }
 post-process（记忆、insights、亲密度）照常跑；模型、采样、输出 filter 和各帧都和 chat 任务一样。
 
 **记录。** 两次抽签至少掷过一次的回合，它的每一行 assistant 消息都带 `metadata.tone`：最终的语气，
-`"emotional"`、`"focused"` 或 `"default"`。名单内动作回合的行、名单内事件消息的行也带 `"emotional"`；用户行的 `metadata.action`
-和消息的 `metadata.proactive` 能把它们和抽签的回合区分开。语气没碰到的回合没有 `tone` 这个键。
+`"emotional"`、`"focused"` 或 `"default"`。`emotional` 大于 0 时，名单内动作回合的行、名单内事件消息的行也带 `"emotional"`；用户行的 `metadata.action`
+和消息的 `metadata.proactive` 能把它们和抽签的回合区分开。只开 `focused` 时，名单内动作回合不抽签，它的行不带 `tone`。语气没碰到的回合没有 `tone` 这个键。
 语气不存别处：判官的决策行上没有，任何帧里也没有。
 
 ## 任务名
