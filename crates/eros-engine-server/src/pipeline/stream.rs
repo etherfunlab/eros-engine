@@ -20948,6 +20948,42 @@ data: [DONE]\n\n";
         }
     }
 
+    /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
+    /// design.md §6: each is a picture turn when accepted.
+    #[test]
+    fn workout_swim_cycle_and_hike_are_picture_turns() {
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
+        use eros_engine_core::types::UserAction::{
+            CycleTogether, HikeTogether, SwimTogether, WorkoutTogether,
+        };
+        let mut cases = Vec::new();
+        for a in [WorkoutTogether, SwimTogether, CycleTogether, HikeTogether] {
+            assert!(is_picture_action(&a), "{a:?}");
+            cases.extend([
+                (a.clone(), Accept, ReplyText, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyImage, true, Some(ReplyTextImage)),
+                (a.clone(), Accept, ReplyText, false, None),
+                (a.clone(), Refuse, ReplyTextImage, true, Some(ReplyText)),
+                (a, Refuse, ReplyText, true, None),
+            ]);
+        }
+        for (a, response, ty, available, want) in cases {
+            let mut input = fixture_decision_input();
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a.clone());
+            }
+            let mut plan = pde::decide(&input);
+            plan.action_response = Some(response);
+            plan.action_type = ty;
+            assert_eq!(
+                picture_action(&input.event, &plan, available),
+                want,
+                "{a:?} {response:?} {ty:?} {available}"
+            );
+        }
+    }
+
     #[test]
     fn apply_forced_refusal_turns_only_an_accept() {
         use eros_engine_core::types::ActionResponse::{Accept, Refuse};
