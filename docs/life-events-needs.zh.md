@@ -188,15 +188,15 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 时长写成区间的，在事件开始时按整小时均匀抽定。
 
-另有二十一种永远不会被抽到：`taking_space`（说好暂时分开）、`fell_out`（为分开的事闹得不愉快）、`traveling_together`（和对方一起旅行）、`bathing_together`（和对方一起洗澡）、`on_a_date`（和对方约会）、`showering_together`（和对方一起淋浴）、`sauna_together`（和对方一起蒸桑拿），以及其余一起做的动作写入的十四种，从 `using_toilet_together` 到 `fighting_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）。
+另有二十五种永远不会被抽到：`taking_space`（说好暂时分开）、`fell_out`（为分开的事闹得不愉快）、`traveling_together`（和对方一起旅行）、`bathing_together`（和对方一起洗澡）、`on_a_date`（和对方约会）、`showering_together`（和对方一起淋浴）、`sauna_together`（和对方一起蒸桑拿），以及其余一起做的动作写入的十八种，从 `using_toilet_together` 到 `hiking_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）。
 前两种属于已经退役的提出分开：engine 不再写入它们，它们只留在存量数据里（见[选择存在哪](#选择存在哪)）。
 它们按形态是 `mid` 插曲，其中 `taking_space` 超出了这个类别的 4 小时：它持续 12 到 24 小时。
 `traveling_together` 是 `trip` 类的背景，用户接受她的提议时由 engine 写入（见[一起去旅行](#一起去旅行)）；
 `showering_together` 和 `bathing_together` 是 30 分钟的 `short` 插曲，用户答应和她一起洗澡时由 engine 写入其中之一，两者机会均等（见[一起洗澡](#一起洗澡)），她答应用户的 `shower_together` 或 `bath_together` 时也会写入；
 `sauna_together` 是 1 小时的 `short` 插曲，她答应用户的 `sauna_together` 时由 engine 写入（见[一起淋浴、泡澡和蒸桑拿](#一起淋浴泡澡和蒸桑拿)）；
-其余十四种是她答应用户其余一起做的动作时由 engine 写入的插曲，除 `asleep_together` 和 `fighting_together` 是 `mid` 外都是 `short`（`having_sex_together` 和 `asleep_together` 在用户答应她的 `sleep_together` 或 `fall_asleep_together` 时也会写入，见[浪漫选择](#浪漫选择)）；
+其余十八种是她答应用户其余一起做的动作时由 engine 写入的插曲，除 `asleep_together`、`fighting_together` 和 `hiking_together` 是 `mid` 外都是 `short`（`having_sex_together` 和 `asleep_together` 在用户答应她的 `sleep_together` 或 `fall_asleep_together` 时也会写入，见[浪漫选择](#浪漫选择)）；
 `on_a_date` 是 1 或 4 小时的 `short` 插曲，她答应用户的约会邀约时由 engine 写入（见 [activities.zh.md](activities.zh.md#事件)）。
-这二十一种都没有抽取规则，调用方的 `kinds` 也拒绝它们。
+这二十五种都没有抽取规则，调用方的 `kinds` 也拒绝它们。
 
 ### 抽取
 
@@ -301,9 +301,9 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内、`just_have_sex` 在 `short` 内权重为五分之一 |
 | `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire`、`strip`、`streaking` 与 `just_have_sex` 3 倍，`false` 时三分之一；它们的门槛两种情况都照旧。只有 `true` 才会抽到 `having_sex` 和 `masturbating` |
 | `hygienic` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 3 倍，`false` 时三分之一；它也决定[一起洗澡](#一起洗澡)要 chemistry 到第几档 |
-| `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内分别为三分之一、1 倍、3 倍；`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读 |
+| `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内分别为三分之一、1 倍、3 倍；`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读。`full_time` 还表示她有事业心：部署打开 `focused` 语气时，不在上班、也没有插曲在进行的回合，有八分之一用 `focused` 语气（见[上班时](#上班时)） |
 | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | 每个类别内部：`outdoor` 时户外种类 3 倍、室内种类三分之一，`indoor` 反过来；中性种类不动（见[下文](#户外还是室内)）；其他值按 `neutral` 读 |
-| `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界（见[下文](#她的世界)）；不是 `fantasy` 的角色拒绝用户的 `fight_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）；其他值按 `modern` 读 |
+| `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界（见[下文](#她的世界)）；不是 `fantasy` 的角色拒绝用户的 `fight_together`，`fantasy` 的角色拒绝用户的 `cycle_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）；其他值按 `modern` 读 |
 | `species` | 任意词 | `"robot"` 和 `"android"` 是机器：她不会抽到 `period`、`period_scare`、`pregnancy_scare`、`using_toilet`，也拒绝用户的 `toilet_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）；其他词不影响抽取。这个词对 prompt 的作用见 [eros-character-v1.1.md](eros-character-v1.1.md) |
 | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（`false` 表示她忌口、节食）：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西、怎么对待用户请她一起抽烟、抽大麻或喝酒（见下）；`smoking`、`alcoholic`、`drug` 为 `true` 时，她才会抽到 `smoking`、`drinking`、`smoking_weed` |
 
@@ -394,7 +394,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 对象里，`allow` 不带或为 `null` 表示全部允许，`[]` 表示一种都不允许；`disallow` 不带、为 `null` 或 `[]` 都不去掉任何种类；
 两边都列了的种类不抽。只写 `{"disallow": […]}` 就能排除种类而不冻结其余种类，engine 以后新增的种类也会照常抽取。
 对象里出现未知的键，或任何地方出现未知种类，请求都会被拒绝，所以拼错的 `disallow` 不会悄悄放出本想排除的种类；
-代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together`、`sauna_together` 以及其余一起做的动作写入的十四种永远不会被抽到，
+代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together`、`sauna_together` 以及其余一起做的动作写入的十八种永远不会被抽到，
 所以在 `kinds` 的任何位置写它们，都按同样的方式被拒绝。
 
 有七种带成人题材：`sudden_desire`、`strip`、`streaking`、`having_sex`、`just_have_sex`、`masturbating`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
@@ -446,7 +446,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 
 ### 持续期间
 
-某一时刻正在进行的事件，是满足 `started_at <= 该时刻 < ends_at` 的那个背景和那件插曲。在聊天里它们到达四个读取方；
+某一时刻正在进行的事件，是满足 `started_at <= 该时刻 < ends_at` 的那个背景和那件插曲。在聊天里它们到达四个读取方，还有语气的抽取（见[下文](#上班时)）；
 开启世界系统时，故事导演和世界导演也会读到（见[聊天之外](#聊天之外)）。
 
 - **判官**得到一行 `[近期事件]`，排在 `[需求]` 之后、`[身体状态]` 之前。先列背景，再列插曲，用 `；` 连接，
@@ -479,10 +479,34 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
   载荷里没有这一段。正在开始的事件即使还没落库也算进行中：事件消息的图画的是它讲述的事件，被接受的
   [一起做的动作](#一起淋浴泡澡和蒸桑拿)所出的图画的是它写入的事件。独立的 compose 端点和改图不发这一段。见
   [合成器](model-config.zh.md#taskschat_image_prompt_compose--出图-prompt-合成器图片轮次必需)。
+  聊天请求带了 `user_gender`，且这两件里有一件是她和用户一起做的种类（`traveling_together`、`on_a_date` 或任何
+  `…_together` 种类）时，它后面再跟一段 `[对方]`，写用户的性别，图里画到用户时就按这个性别画。
 - **调用方**从 `GET …/effects` 拿到：`event` 是进行中的插曲，`background_event` 是进行中的背景。
   进行中的离线类事件和其他插曲一样作为 `event` 返回，带 `"offline": true`；客户端怎么展示由它自己决定。
 
 文字回合按自己那行用户消息的发送时间来读事件，所以被重新驱动的回合看到的是同样的事件。
+
+### 上班时
+
+部署的 [`tones.focused`](model-config.zh.md#tones--聊天语气仅限-chat-任务) 大于 0 时，有些回合用 `focused` 语气回答：
+像手上有工作的人那样回。进行中的插曲是 `temp_work`，或者背景是 `business_trip` 而没有插曲在进行时，她就是在上班。
+这两种都只限 `modern`，也都不离线，所以只有现代角色会在上班。
+
+| 这一轮 | 落在 `focused` 的机会 |
+|---|---|
+| 她在上班 | `tones.focused` 的值 |
+| 不在上班，`employed` 为 `"full_time"`（见[角色设置](#角色设置)），没有插曲在进行，背景不限 | 八分之一，不管这个键取多少 |
+| 其他 | 不掷 |
+
+只有不带用户动作的 1:1 文字回合会掷，掷出 `emotional` 的回合仍是 `emotional`。`focused` 的回复保留聊天历史、用户画像、
+记忆和关系（`[relationship]`、`[mood]`、`[inner_state]`）；去掉 `[feelings]` 和 `[emotional_context]`，限定为一句、
+不超过 40 字，`[this_turn]` 不再放掷出来的提示，只放一行：
+
+```
+- 你手上有工作，心思在工作上：回得简短利落，先顾手上的事
+```
+
+回复的行带 `metadata.tone = "focused"`。怎么掷见 [model-config.zh.md](model-config.zh.md#tones--聊天语气仅限-chat-任务)。
 
 ### 离线类
 
@@ -617,6 +641,7 @@ ghosting 开关关闭时，已经在进行的一段不会让任何轮次沉默�
 
 女性门槛读 `art_metadata.gender`，也就是 `period` 已经在用的那个键。没有任何需求系数作用在它们身上，三个 `mid` 种类
 和其他 `mid` 种类一样可以写进 `prefer_events`。五个都在住院（`hospitalized`）和术后（`post_surgery`）期间排除：她那时不在外面走动。
+`saw_bag`、`saw_clothes` 和 `out_shopping` 只限 `modern` 的角色（见[她的世界](#她的世界)）。
 
 **两个小发现。** `saw_bag` 和 `saw_clothes` 是普通的、会讲出来的插曲。亲密度档 1 时，这只是日常的一点质感，仅此而已。
 从档 2 起，她可以直说自己想要；有 `tip_personality` 的角色用那份人格的口吻说，也就是打赏动作收尾时用的同一种口吻。
@@ -665,13 +690,13 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 ### 一起淋浴、泡澡和蒸桑拿
 
 用户可以请她一起淋浴、泡澡或蒸桑拿：`shower_together`、`bath_together`、`sauna_together` 三种动作，都不带字段
-（见[发送路由](api-reference.zh.md#post-compchatsession_idmessagestream)）。另有十四种一起做的动作，同样不带字段，请她和用户一起做别的事（见下表）。
+（见[发送路由](api-reference.zh.md#post-compchatsession_idmessagestream)）。另有十八种一起做的动作，同样不带字段，请她和用户一起做别的事（见下表）。
 和任何动作一样，由判官决定。在判官之前，
 性向不相容的一对发来的淋浴或泡澡，和 `strip` 一样被判为拒绝：不管判官怎么答，也不管有没有 LLM 判官，她都拒绝。蒸桑拿没有这条规则。
 这样的一对发来的 `sex_together` 或 `streak_together` 同样如此，机器角色（见[角色设置](#角色设置)）收到的 `toilet_together` 也一样，
-世界不是 `fantasy` 的角色（见[她的世界](#她的世界)）收到的 `fight_together` 也一样；
+写入的事件不属于她那个世界（见[她的世界](#她的世界)）的动作也一样：不是 `fantasy` 的角色收到的 `fight_together`，`fantasy` 的角色收到的 `cycle_together`；
 其余一起做的动作没有这类规则，`smoke_together`、`smoke_weed_together` 和 `drink_together` 要过习惯掷骰（见下）。
-被拒时 chemistry 线降一档，什么都不写；她的世界排除掉的 `fight_together` 被拒时哪条线都不降；她自己提出的 `bathe_together`（[一起洗澡](#一起洗澡)）及其冷却，不读这些动作，这些动作也不读它们。
+被拒时 chemistry 线降一档，什么都不写；她的世界排除掉的动作被拒时哪条线都不降；她自己提出的 `bathe_together`（[一起洗澡](#一起洗澡)）及其冷却，不读这些动作，这些动作也不读它们。
 
 被接受的动作让她进入一个事件，与存下的回答在同一个事务里写入：
 
@@ -694,13 +719,17 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 | `drink_together` | `drinking_together` | 和对方一起喝酒 | 1 小时 |
 | `hot_spring_together` | `hot_spring_together` | 和对方一起泡温泉 | 1 小时 |
 | `fight_together` | `fighting_together` | 和对方并肩作战 | 1–2 小时 |
+| `workout_together` | `working_out_together` | 和对方一起健身 | 1 小时 |
+| `swim_together` | `swimming_together` | 和对方一起游泳 | 1 小时 |
+| `cycle_together` | `cycling_together` | 和对方一起骑单车 | 1 小时 |
+| `hike_together` | `hiking_together` | 和对方一起爬山 | 2–3 小时 |
 
-除 `asleep_together` 和 `fighting_together` 是 `mid` 插曲、时长按整小时抽定外，都是 `short` 插曲。
+除 `asleep_together`、`fighting_together` 和 `hiking_together` 是 `mid` 插曲、时长按整小时抽定外，都是 `short` 插曲。
 开始时结束正在进行的插曲，在途的背景照常继续，和她提出的洗澡一样。事件以用户那条消息为键，所以被重新驱动的回合只写一次。
 她的约会进行期间什么都不写：约会的 `on_a_date` 保持原样，约会继续。她不把这个事件当作事件来讲，因为她对这个动作的回复已经说了；
-它不离线，`asleep_together` 期间她也照常回复；十七种都不会被抽到。期间它就是正在进行的插曲，所以 `正在经历`、判官和画图合成器像读其他插曲一样读它。
+它不离线，`asleep_together` 期间她也照常回复；二十一种都不会被抽到。期间它就是正在进行的插曲，所以 `正在经历`、判官和画图合成器像读其他插曲一样读它。
 `showering_together`、`bathing_together`、`having_sex_together`、`streaking_together`、`using_toilet_together` 和 `asleep_together`
-不进故事导演读的事件，和她同睡请求的结果一样；其余十一种会进。
+不进故事导演读的事件，和她同睡请求的结果一样；其余十五种会进。
 
 `smoke_together`、`smoke_weed_together` 和 `drink_together` 只在三件事上算作给了她 1 份
 `cigarette`、`herb` 或 `alcohol` 的 give：习惯掷骰（见[角色设置](#角色设置)）、被接受时挪动的需求（见 [give 会改动需求](#give-会改动需求)），
@@ -719,7 +748,7 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 
 ### 日常里的小事
 
-八种会讲出来的插曲，填进她的一天。它们都是 `short`，都不让她离线，也都不带图，两种世界都适用（见[下文](#她的世界)）：
+八种会讲出来的插曲，填进她的一天。它们都是 `short`，都不让她离线，也都不带图，除 `want_to_quit_job` 外两种世界都适用（见[下文](#她的世界)）：
 
 | 种类 | 标签 | 类别 | 权重 | 冷却 | 持续 | 门槛 | 提示 |
 |---|---|---|---|---|---|---|---|
@@ -814,12 +843,13 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 
 | 适用 | 种类 |
 |---|---|
-| 只限 `modern` | `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`temp_work`、`scolded_superior`、`on_a_cruise`、`on_a_bus`、`on_a_train`、`on_a_plane`、`driving` |
+| 只限 `modern` | `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`temp_work`、`scolded_superior`、`on_a_cruise`、`on_a_bus`、`on_a_train`、`on_a_plane`、`driving`、`saw_bag`、`saw_clothes`、`out_shopping`、`want_to_quit_job`、`admiring_art`、`cycling_together` |
 | 只限 `fantasy` | `on_the_road`、`fighting_together` |
 | 两者都可 | 其余所有种类 |
 
-`on_the_road` 是唯一会被抽到的、只限 `fantasy` 的种类：现代角色改坐[交通工具](#交通工具)。现代角色的 `prefer_events` 里写了它，这一项不起作用。
-`fighting_together` 从不被抽到；写入它的 `fight_together` 只有 `fantasy` 的角色会答应（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）。
+`on_the_road` 是唯一会被抽到的、只限 `fantasy` 的种类：现代角色改坐[交通工具](#交通工具)。现代角色的 `prefer_events` 里写了它，这一项不起作用；奇幻角色的 `prefer_events` 里写了 `out_shopping` 也一样。
+`fighting_together` 和 `cycling_together` 从不被抽到：写入的事件不属于她那个世界的一起做的动作，在判官之前就判为拒绝，而且不付任何代价，
+所以 `fight_together` 只有 `fantasy` 的角色会答应，`cycle_together` 只有 `modern` 的角色会答应（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）。
 
 ### 想出门与想回家
 
@@ -1212,6 +1242,7 @@ engine 不接收性别或性取向，也不判断谁会被谁吸引。
 - `crates/eros-engine-server/src/pipeline/life_choice.rs`：冷战、各种触发与她的请求、不理会的转换、冷战的增长缩放。
 - `crates/eros-engine-core/src/relationship.rs`：关系状态、`settle`、`leading_line`、冷战的连续规则与 `sleep_ask_is_sex`。
 - `crates/eros-engine-core/src/scope.rs`：`romance_compatible`，浪漫选择读的那条判据。
+- `crates/eros-engine-core/src/tone.rs`：`at_work` 与 `focused_probability`，一轮落在 `focused` 语气的机会。
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`：需求的读取与写入（被接受的 give 的挪动走 `after_give`）、`[需求]` 与 `[近期事件]` 两行
   （`build_pde_ctx`）、判官之前的 offline 分支、掷出拒收后的改判（`apply_give_refusal`）、`body_state_frame`。
 - `crates/eros-engine-server/src/prompt.rs`：`needs_line`、`events_judge_text`、`events_reply_text`、
