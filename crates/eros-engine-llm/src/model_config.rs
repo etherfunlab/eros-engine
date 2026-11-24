@@ -779,7 +779,7 @@ pub fn apply_output_regex(
     }
 }
 
-/// Per-turn base probabilities of the chat tones (`tones` on
+/// Per-turn probabilities of the chat tones (`tones` on
 /// `[tasks.chat_companion]`). An unknown tone name fails the parse.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -789,6 +789,14 @@ pub struct Tones {
     /// by `validate_tones`; `0.0` is off.
     #[serde(default)]
     pub emotional: f64,
+    /// Probability that a 1:1 text turn is written in the `focused` tone
+    /// while she is at work; off work, a full-time persona draws it at a fixed
+    /// 1/8 once this key is above `0.0` (spec
+    /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
+    /// §5.3). Legal range `[0.0, 1.0]`, enforced by `validate_tones`; `0.0` is
+    /// off.
+    #[serde(default)]
+    pub focused: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1777,6 +1785,16 @@ impl ModelConfig {
             .get("chat_companion")
             .and_then(|t| t.tones)
             .map(|t| t.emotional)
+            .unwrap_or(0.0)
+    }
+
+    /// chat_companion task-level `tones.focused` probability while she is at
+    /// work; no tier override. Absent → 0.0, which switches the tone off.
+    pub fn tone_focused_probability(&self) -> f64 {
+        self.tasks
+            .get("chat_companion")
+            .and_then(|t| t.tones)
+            .map(|t| t.focused)
             .unwrap_or(0.0)
     }
 
@@ -2891,11 +2909,12 @@ impl ModelConfig {
             let Some(tones) = self.tasks[name].tones else {
                 continue;
             };
-            let v = tones.emotional;
-            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
-                return Err(format!(
-                    "[tasks].{name}.tones.emotional: must be in [0.0, 1.0], got {v}"
-                ));
+            for (key, v) in [("emotional", tones.emotional), ("focused", tones.focused)] {
+                if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                    return Err(format!(
+                        "[tasks].{name}.tones.{key}: must be in [0.0, 1.0], got {v}"
+                    ));
+                }
             }
         }
         Ok(())
@@ -6238,6 +6257,76 @@ temperature = 0.8
         );
     }
 
+    #[test]
+    fn tones_focused_parses_alone_and_beside_emotional() {
+        let alone = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ntones = { focused = 1.0 }\n",
+        )
+        .unwrap();
+        assert_eq!(alone.tone_focused_probability(), 1.0);
+        assert_eq!(alone.tone_emotional_probability(), 0.0);
+        alone.validate_tones().unwrap();
+
+        let both = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\n\
+             tones = { emotional = 0.05, focused = 0.5 }\n",
+        )
+        .unwrap();
+        assert_eq!(both.tone_emotional_probability(), 0.05);
+        assert_eq!(both.tone_focused_probability(), 0.5);
+        both.validate_tones().unwrap();
+
+        let emotional_only = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ntones = { emotional = 0.05 }\n",
+        )
+        .unwrap();
+        assert_eq!(emotional_only.tone_focused_probability(), 0.0);
+
+        let absent = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert_eq!(absent.tone_focused_probability(), 0.0);
+
+        assert!(
+            ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel = \"m\"\ntones = { focussed = 1.0 }\n"
+            )
+            .is_err(),
+            "a misspelled tone name fails the parse"
+        );
+    }
+
+    #[test]
+    fn tones_focused_out_of_range_is_refused() {
+        for bad in ["1.5", "-0.1", "nan"] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel = \"m\"\ntones = {{ focused = {bad} }}\n"
+            ))
+            .unwrap();
+            let err = cfg.validate_tones().unwrap_err();
+            assert!(
+                err.contains("chat_companion") && err.contains("tones.focused"),
+                "{bad}: {err}"
+            );
+        }
+        for edge in ["0.0", "1.0"] {
+            ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel = \"m\"\ntones = {{ focused = {edge} }}\n"
+            ))
+            .unwrap()
+            .validate_tones()
+            .unwrap_or_else(|e| panic!("{edge} must pass: {e}"));
+        }
+        let err = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ntones = { focused = 1.5 }\n",
+        )
+        .unwrap()
+        .validate_tones()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "[tasks].chat_companion.tones.focused: must be in [0.0, 1.0], got 1.5"
+        );
+    }
+
     /// The shipped example must pass the tones boot gate, with the key
     /// commented out: off by default.
     #[test]
@@ -6246,6 +6335,7 @@ temperature = 0.8
         let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
         cfg.validate_tones().unwrap();
         assert_eq!(cfg.tone_emotional_probability(), 0.0);
+        assert_eq!(cfg.tone_focused_probability(), 0.0);
     }
 
     #[test]

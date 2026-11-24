@@ -664,6 +664,7 @@ pub(crate) fn run_group_turn(
                 None,
                 None,
                 Some(&view),
+                false,
             )
             .await
             {
