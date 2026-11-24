@@ -264,7 +264,7 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 | `dating` | 伴侣 | はい |
 | `partner` | 伙伴 | はい |
 | `peer` | 同事 | いいえ |
-| `fwb` | 伙伴，也是情人 | はい |
+| `fwb` | 床伴 | はい |
 | `situationship` | 同事，私下在交往 | はい |
 | `engaged` | 已订婚 | はい |
 | `ex` | 前任 | いいえ |
@@ -313,15 +313,15 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 | bond \ chemistry | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
-| **1** | なし | 初识心动对象 `intriguing_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
-| **2** | 普通朋友 `casual_friend` | 暧昧对象 `budding_flame` | 迷恋对象 `friend_and_crush` | 热恋对象 `passionate_flame` | 热烈爱人 `ardent_beloved` |
-| **3** | 亲近好友 `trusted_friend` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 相依恋人 `tender_lover` | 难分难舍的人 `inseparable` |
+| **1** | なし | 眉来眼去的人 `flirtatious_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
+| **2** | 普通朋友 `casual_friend` | 暧昧搭子 `flirtatious_buddy` | 心头好 `cherished_crush` | 干柴烈火之人 `fast_burning_lover` | 神魂颠倒之人 `dizzying_blind_love` |
+| **3** | 死党 `best_buddy` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 两情相悦的人 `fond_close_sweetheart` | 难分难舍的人 `inseparable` |
 | **4** | 知音 `kindred_spirit` | 心照不宣的知己 `knowing_confidant` | 暗生情愫的知己 `smitten_confidant` | 知心爱人 `heart_lover` | 挚爱 `beloved` |
 | **5** | 莫逆之交 `lifelong_kindred_spirit` | 动了心的灵魂之交 `stirred_kindred` | 柏拉图式的爱人 `platonic_love` | 灵犀恋人 `destined_lover` | 命中注定的人 `destined` |
 
-ステータスの語(伴侣、伙伴、同事、前任、未婚)を使う名前はない。合成関係は何のゲートにもならない。イベント、生活選択、アクションのどれも読まない。
+ステータスの語(伴侣、伙伴、同事、前任、未婚、床伴)を使う名前はない。合成関係は何のゲートにもならない。イベント、生活選択、アクションのどれも読まない。
 
-- **プロンプトでは**、そのターンの `affinity_scope` が恋愛的に相容れないペアは、chemistry にかかわらず chemistry 1 の列の名前を取る(普通朋友、亲近好友、知音、莫逆之交。bond ティア1ではなし)。
+- **プロンプトでは**、そのターンの `affinity_scope` が恋愛的に相容れないペアは、chemistry にかかわらず chemistry 1 の列の名前を取る(普通朋友、死党、知音、莫逆之交。bond ティア1ではなし)。
 - **API では**、`composed_relation` は実際のティアのセルのキーであり、相性は適用しない。スナップショットは scope を持たず、ペアを相容れるとしたかどうかは呼び出し側が知っている。
 
 ### 6.6 `[relationship]`

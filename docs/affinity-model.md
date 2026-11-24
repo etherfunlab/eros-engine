@@ -460,7 +460,7 @@ prompt's status line uses it too, except for the two gendered nouns
 | `dating` | 伴侣 | yes |
 | `partner` | 伙伴 | yes |
 | `peer` | 同事 | no |
-| `fwb` | 伙伴，也是情人 | yes |
+| `fwb` | 床伴 | yes |
 | `situationship` | 同事，私下在交往 | yes |
 | `engaged` | 已订婚 | yes |
 | `ex` | 前任 | no |
@@ -547,18 +547,18 @@ serves:
 
 | bond \ chemistry | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
-| **1** | none | 初识心动对象 `intriguing_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
-| **2** | 普通朋友 `casual_friend` | 暧昧对象 `budding_flame` | 迷恋对象 `friend_and_crush` | 热恋对象 `passionate_flame` | 热烈爱人 `ardent_beloved` |
-| **3** | 亲近好友 `trusted_friend` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 相依恋人 `tender_lover` | 难分难舍的人 `inseparable` |
+| **1** | none | 眉来眼去的人 `flirtatious_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
+| **2** | 普通朋友 `casual_friend` | 暧昧搭子 `flirtatious_buddy` | 心头好 `cherished_crush` | 干柴烈火之人 `fast_burning_lover` | 神魂颠倒之人 `dizzying_blind_love` |
+| **3** | 死党 `best_buddy` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 两情相悦的人 `fond_close_sweetheart` | 难分难舍的人 `inseparable` |
 | **4** | 知音 `kindred_spirit` | 心照不宣的知己 `knowing_confidant` | 暗生情愫的知己 `smitten_confidant` | 知心爱人 `heart_lover` | 挚爱 `beloved` |
 | **5** | 莫逆之交 `lifelong_kindred_spirit` | 动了心的灵魂之交 `stirred_kindred` | 柏拉图式的爱人 `platonic_love` | 灵犀恋人 `destined_lover` | 命中注定的人 `destined` |
 
-No name uses a status word (伴侣, 伙伴, 同事, 前任, 未婚). A composed relation
+No name uses a status word (伴侣, 伙伴, 同事, 前任, 未婚, 床伴). A composed relation
 gates nothing: no event, life choice or action reads it.
 
 - **In the prompt**, a pair whose turn `affinity_scope` is not
   romance-compatible takes its name from the chemistry-1 column (普通朋友,
-  亲近好友, 知音, 莫逆之交; none at bond tier 1), whatever its chemistry.
+  死党, 知音, 莫逆之交; none at bond tier 1), whatever its chemistry.
 - **In the API**, `composed_relation` is the key of the real tiers' cell; no
   compatibility is applied. A snapshot carries no scope, and the caller knows
   whether it marked the pair compatible.
