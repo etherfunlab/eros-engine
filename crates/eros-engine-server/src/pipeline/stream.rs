@@ -5406,7 +5406,6 @@ pub(crate) fn run_stream_with(
         // 2026-11-20-together-actions-state-in-picture-and-genome-routes-
         // design.md §5, 2026-11-23-twelve-together-actions-and-propose-
         // design.md §4.1).
-        let traits = crate::prompt::persona_traits(&input.persona);
         let together_refused = pde::together_ruled_out(&input.event, traits.machine);
         // A together action her world does not have, a fight in a modern
         // one or a cycle in a fantasy one (spec 2026-11-23-hot-spring-fight-

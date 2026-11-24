@@ -966,8 +966,9 @@ async fn plan_event(
     let ever_had_sex = event_repo
         .ever(instance_id, &events::EventKind::SEX)
         .await?;
-    // Her cycle at the draw (spec 2026-11-24-period-cycle-design.md §5, §7):
-    // the rows the draw reads, and whether her period is under way.
+    // What is under way at the draw (spec 2026-11-24-period-cycle-design.md
+    // §5, §7): the cycle rows the draw reads, and the background and whether
+    // her period is under way, which her cue opens with.
     let current = event_repo
         .current(instance_id, None, now, traits.cycle_health())
         .await?;
@@ -1007,10 +1008,7 @@ async fn plan_event(
         return Ok((EventPlan::Stored, traits));
     }
 
-    let background = history
-        .iter()
-        .find(|e| e.kind.slot() == events::Slot::Background && e.ends_at > now)
-        .map(|e| e.kind);
+    let background = current.background.as_ref().map(|e| e.kind);
     let on_period = current
         .cycle
         .as_ref()

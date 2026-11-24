@@ -11,7 +11,9 @@ use crate::needs::{Habits, NeedLevel, Needs};
 const DAY: i64 = 24;
 
 /// Where a kind sits (§3.1). `Short` and `Mid` are foreground incidents;
-/// `Body` and `Trip` are background states that last days.
+/// `Body` and `Trip` are background states that last days; the slot a row
+/// under way takes is `EventKind::slot`'s, which gives `period` and
+/// `period_scare` one of their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventCategory {
