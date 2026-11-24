@@ -313,15 +313,15 @@ Chemistry: `spark` / `flirtation` / `crush` / `lover` / `beloved`
 
 | bond \ chemistry | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
-| **1** | なし | 有好感的陌生人 `fond_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
-| **2** | 普通朋友 `casual_friend` | 有点暧昧的朋友 `flirty_friend` | 暗恋的朋友 `secret_crush` | 朋友以上的情人 `friend_and_lover` | 热恋的人 `new_flame` |
-| **3** | 好朋友 `good_friend` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 亲密的情人 `close_lover` | 难分难舍的人 `inseparable` |
-| **4** | 知己 `confidant` | 心照不宣的知己 `knowing_confidant` | 暗生情愫的知己 `smitten_confidant` | 知心爱人 `heart_lover` | 挚爱 `beloved` |
-| **5** | 灵魂之交 `kindred_spirit` | 动了心的灵魂之交 `stirred_kindred` | 柏拉图式的爱人 `platonic_love` | 灵魂爱人 `soul_lover` | 命中注定的人 `destined` |
+| **1** | なし | 初识心动对象 `intriguing_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
+| **2** | 普通朋友 `casual_friend` | 暧昧对象 `budding_flame` | 迷恋对象 `friend_and_crush` | 热恋对象 `passionate_flame` | 热烈爱人 `ardent_beloved` |
+| **3** | 亲近好友 `trusted_friend` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 相依恋人 `tender_lover` | 难分难舍的人 `inseparable` |
+| **4** | 知音 `kindred_spirit` | 心照不宣的知己 `knowing_confidant` | 暗生情愫的知己 `smitten_confidant` | 知心爱人 `heart_lover` | 挚爱 `beloved` |
+| **5** | 莫逆之交 `lifelong_kindred_spirit` | 动了心的灵魂之交 `stirred_kindred` | 柏拉图式的爱人 `platonic_love` | 灵犀恋人 `destined_lover` | 命中注定的人 `destined` |
 
 ステータスの語(伴侣、伙伴、同事、前任、未婚)を使う名前はない。合成関係は何のゲートにもならない。イベント、生活選択、アクションのどれも読まない。
 
-- **プロンプトでは**、そのターンの `affinity_scope` が恋愛的に相容れないペアは、chemistry にかかわらず chemistry 1 の列の名前を取る(普通朋友、好朋友、知己、灵魂之交。bond ティア1ではなし)。
+- **プロンプトでは**、そのターンの `affinity_scope` が恋愛的に相容れないペアは、chemistry にかかわらず chemistry 1 の列の名前を取る(普通朋友、亲近好友、知音、莫逆之交。bond ティア1ではなし)。
 - **API では**、`composed_relation` は実際のティアのセルのキーであり、相性は適用しない。スナップショットは scope を持たず、ペアを相容れるとしたかどうかは呼び出し側が知っている。
 
 ### 6.6 `[relationship]`

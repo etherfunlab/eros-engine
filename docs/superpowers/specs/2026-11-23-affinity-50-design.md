@@ -113,19 +113,25 @@ Where the status lives:
 ## 5. Composed relation
 
 A pure function of `(bond_tier, chem_tier)` in
-`crates/eros-engine-core/src/affinity.rs`, beside the labels. `None` at
-`(1, 1)`. One name per cell *(owner's ruling: candidate A of three)*.
+`crates/eros-engine-core/src/relationship.rs`. `None` at `(1, 1)`. One name
+per cell *(owner's ruling: candidate A of three)*.
 
-Working copy; the owner reviews the names one by one before merge, so keep
-them in one table that is cheap to edit:
+**Naming** *(owner's ruling)*. A name is a retrieval cue for the model, not a
+label for a person: it is there to call up the part of the training data
+that holds this kind of relationship. Prefer an idiom, an allusion or a term
+that names one specific relationship (知音 over 知己), most of which come
+from romance fiction, to a phrase assembled from a modifier and a generic
+noun. The term's own meaning comes in with it, so it has to match the cell.
+
+The names *(picked by the owner)*, kept in one table that is cheap to edit:
 
 | bond \ chem | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
-| **1** | none | 有好感的陌生人 `fond_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
-| **2** | 普通朋友 `casual_friend` | 有点暧昧的朋友 `flirty_friend` | 暗恋的朋友 `secret_crush` | 朋友以上的情人 `friend_and_lover` | 热恋的人 `new_flame` |
-| **3** | 好朋友 `good_friend` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 亲密的情人 `close_lover` | 难分难舍的人 `inseparable` |
-| **4** | 知己 `confidant` | 心照不宣的知己 `knowing_confidant` | 暗生情愫的知己 `smitten_confidant` | 知心爱人 `heart_lover` | 挚爱 `beloved` |
-| **5** | 灵魂之交 `kindred_spirit` | 动了心的灵魂之交 `stirred_kindred` | 柏拉图式的爱人 `platonic_love` | 灵魂爱人 `soul_lover` | 命中注定的人 `destined` |
+| **1** | none | 初识心动对象 `intriguing_stranger` | 让你上头的陌生人 `heady_stranger` | 露水情人 `fling` | 一见倾心的人 `love_at_first_sight` |
+| **2** | 普通朋友 `casual_friend` | 暧昧对象 `budding_flame` | 迷恋对象 `friend_and_crush` | 热恋对象 `passionate_flame` | 热烈爱人 `ardent_beloved` |
+| **3** | 亲近好友 `trusted_friend` | 友达以上 `more_than_friends` | 恋人未满 `almost_lovers` | 相依恋人 `tender_lover` | 难分难舍的人 `inseparable` |
+| **4** | 知音 `kindred_spirit` | 心照不宣的知己 `knowing_confidant` | 暗生情愫的知己 `smitten_confidant` | 知心爱人 `heart_lover` | 挚爱 `beloved` |
+| **5** | 莫逆之交 `lifelong_kindred_spirit` | 动了心的灵魂之交 `stirred_kindred` | 柏拉图式的爱人 `platonic_love` | 灵犀恋人 `destined_lover` | 命中注定的人 `destined` |
 
 Names avoid the status words (伴侣, 伙伴, 同事, 前任, 未婚) so the two never
 read as the same claim.
@@ -133,7 +139,7 @@ read as the same claim.
 **Incompatible pairs** *(owner's ruling)*. Chemistry accrues for every pair,
 since scope only gates the read side. In the prompt, a pair whose scope is
 not `romance_compatible` takes its name from the chemistry-1 column
-(普通朋友, 好朋友, 知己, 灵魂之交; none at bond tier 1), the same reading as
+(普通朋友, 亲近好友, 知音, 莫逆之交; none at bond tier 1), the same reading as
 "an incompatible pair is never confessed to". The prompt builder passes the
 turn's own scope. The API reports the cell of the real tiers: a snapshot
 carries no scope, and the caller knows whether it marked the pair
