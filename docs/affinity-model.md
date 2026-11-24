@@ -450,8 +450,9 @@ the write pipeline:
 ### The statuses
 
 Eight statuses, one per session. The Chinese wording is what the judge's
-`[关系]` line reads; the prompt's status line uses it too, except for the two
-gendered nouns ([`[relationship]`](#relationship)).
+`[关系]` line reads for every status but `none`, which it never states; the
+prompt's status line uses it too, except for the two gendered nouns
+([`[relationship]`](#relationship)).
 
 | Status | Wording | Breakable |
 |---|---|---|
