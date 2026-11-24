@@ -588,8 +588,9 @@ With none of the three the block is the base pair's quadrant noun
 ([above](#the-base-pair--warmth--patience)), under the quadrant's scope gate.
 The three lines are settled conclusions about the pair, not an axis steering
 the reply, so no single axis of `affinity_scope` gates them; the block is
-omitted only with no affinity row or an empty scope. Voice and group prompts
-read no status: they keep their tier-label lines.
+omitted only with no affinity row or an empty scope. A group speaker's prompt
+carries the same block, read from that member's 1:1 session. The voice prompt
+and the group director read no status: they keep their tier-label lines.
 
 ## What reads affinity
 

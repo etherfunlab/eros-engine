@@ -398,7 +398,10 @@ director's `generation_id`. See [llm-audit.md](llm-audit.md#group-director).
 - It runs **no affinity judge**, writes **no affinity** and touches **no ghost
   streak**. No member's `companion_affinity` row is created or written.
 - Affinity is read from each member's 1:1 session: when the 1:1 relationship
-  moves, the persona sounds different in the group from the next turn on.
+  moves, the persona sounds different in the group from the next turn on. A
+  speaker's `[relationship]` block carries the pair's status, composed relation
+  and cold war as in a 1:1 reply
+  ([affinity-model.md](affinity-model.md#relationship)).
 - A relationship conducted only in a group does not warm up there, and it cools
   under the 1:1 time decay, because no write refreshes its `updated_at`.
 - A persona active only in groups does not count as active for stories.

@@ -1429,7 +1429,8 @@ refused unless the status is `dating`, `fwb` or `situationship`, and the user's 
 the status is breakable; such a refusal has no effect, and the judge is told the outcome.
 Otherwise the judge decides: an accepted `propose` makes the pair `engaged`; an accepted
 `break_up` makes them `ex` and ends a cold war, and a refused one keeps the status and starts a
-cold war if none is on. A refusal drops no line. The status moves in the transaction that stores
+cold war if none is on. A refusal drops no line. A turn whose judge failed accepts, as for any
+action, and the status moves. The status moves in the transaction that stores
 the answer, on the turn's session, or on a date on the session the invitation was sent in. On a
 BYOC instance no status moves: the user's `propose` goes to the judge from any status and moves
 nothing, and `break_up` is always refused. The user may ask again; the judge decides each time.
