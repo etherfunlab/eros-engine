@@ -993,8 +993,8 @@ model = "voyage-4-lite"                       # ≡ "voyage-4-lite@voyage"
 #model_write = "voyage-4"        # 存储路径：embed_document(s)，input_type "document"
 ```
 
-**维度固定为 512，没有配置开关。** pgvector 的四个列都是
-`VECTOR(512)`（除 `relationship_journal.embedding` 外都是 `NOT NULL`：引擎写入的纪事行要等清扫器补向量），client 在 wire 上请求的也是 512，且每次响应都会
+**维度固定为 512，没有配置开关。** pgvector 的五个列都是
+`VECTOR(512)`（除 `relationship_journal.embedding` 与 `human_facts.embedding` 外都是 `NOT NULL`：引擎写入的纪事行要等清扫器补向量，账本事实要等[事实分组](insights.zh.md#事实分组)清扫器放置），client 在 wire 上请求的也是 512，且每次响应都会
 做长度校验。以前 `[tasks.<name>]` 上有一个 `dimensions` 字段——它从未被
 消费，现已移除；已有配置里残留的 `dimensions = 512` 行，现在只是一个被
 静默忽略的未知 key（和其他过期 key 一样，serde 直接忽略）。

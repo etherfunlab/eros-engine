@@ -7,6 +7,8 @@
 No migration and no new setting. Both changes are to values a client may already handle: `event` was already an `EventView`, and both event kinds already exist.
 **Design:** [`2026-11-23-sleep-together-accept-places-event-design.md`](../superpowers/specs/2026-11-23-sleep-together-accept-places-event-design.md)
 
+The other notes for this release are [Affinity 5.0, the relationship status and the cold war](v2-8-2-affinity-5-0.md), [the focused tone, four together actions and the user's gender in a picture](v2-8-2-focused-tone-together-actions-user-gender.md), [her period on a 28-day cycle](v2-8-2-period-cycle.md) and [fact groups](v2-8-2-fact-groups.md).
+
 The rules are in [the romantic choices](../life-events-needs.md#the-romantic-choices), [a bath together](../life-events-needs.md#a-bath-together) and [the life-choice route](../api-reference.md#post-v2compsessionsession_idlife-choiceschoice_id).
 
 ## What users will notice

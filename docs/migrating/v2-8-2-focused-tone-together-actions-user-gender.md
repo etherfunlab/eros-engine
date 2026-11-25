@@ -1,4 +1,4 @@
-# Migrating to v2.9.0: the focused tone, four together actions and the user's gender in a picture
+# Migrating to v2.8.2: the focused tone, four together actions and the user's gender in a picture
 
 **Applies to:**
 - deployments that want the `focused` chat tone, or that have a custom composer `filter_prompt` or a custom judge prompt that names actions by marker;
@@ -11,7 +11,7 @@
 No migration. Every field on the wire is additive (four action types, four event kinds, one optional request field `user_gender`, one new `metadata.tone` value and one new key in the composer's audit `inputs`), but one behaviour changes: a `fantasy` persona stops drawing five kinds. One new setting, `tones.focused`, is off when absent.
 **Design:** [`2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md`](../superpowers/specs/2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md)
 
-The other notes for this release are [Affinity 5.0, the relationship status and the cold war](v2-9-0-affinity-5-0.md) and [her period on a 28-day cycle](v2-9-0-period-cycle.md).
+The other notes for this release are [her accepted bed and bath asks place their events](v2-8-2-life-choice-events.md), [Affinity 5.0, the relationship status and the cold war](v2-8-2-affinity-5-0.md), [her period on a 28-day cycle](v2-8-2-period-cycle.md) and [fact groups](v2-8-2-fact-groups.md).
 
 The rules are in [her world](../life-events-needs.md#her-world), [together actions](../life-events-needs.md#showering-bathing-and-the-sauna-together), [at work](../life-events-needs.md#at-work), [tones](../model-config.md#tones--chat-tones-chat-task-only), [the composer](../model-config.md#taskschat_image_prompt_compose--image-prompt-composer-required-for-image-turns) and [the send route](../api-reference.md#post-compchatsession_idmessagestream).
 
@@ -29,7 +29,7 @@ The rules are in [her world](../life-events-needs.md#her-world), [together actio
 
 ## Deployments
 
-Nothing to run: no migration. Deploy the image as for any release; [Affinity 5.0](v2-9-0-affinity-5-0.md) has its own deploy order.
+Nothing to run: no migration. Deploy the image as for any release; [Affinity 5.0](v2-8-2-affinity-5-0.md) has its own deploy order.
 
 - **The `focused` tone is off until you set it.** `tones = { emotional = 0.05, focused = 1.0 }` on `[tasks.chat_companion]`; either key works without the other, and a value outside `[0.0, 1.0]` refuses to boot. The key is the probability at work. It also switches on the off-work 1/8 for `full_time` personas, which it does not scale: a deployment that sets the key for turns at work gets that too. The assistant rows of a turn that made either draw carry `metadata.tone`, now `"emotional"`, `"focused"` or `"default"`.
 - **`employed = full_time` has a second reading.** It still weighs the work kinds three times; with `tones.focused` on, it also makes the persona career-minded. Review the cards that set it before you turn the tone on.
@@ -39,7 +39,7 @@ Nothing to run: no migration. Deploy the image as for any release; [Affinity 5.0
 
 ### Rollback
 
-These changes need no database change; roll the release back as [Affinity 5.0](v2-9-0-affinity-5-0.md#rollback) says. On the previous image:
+These changes need no database change; roll the release back as [Affinity 5.0](v2-8-2-affinity-5-0.md#rollback) says. On the previous image:
 - a `tones` table that names `focused` refuses to boot: remove the key first;
 - an event of one of the four new kinds reads as no event, as any kind the build does not know;
 - an action of a new type on a stored row reads as no action, and a request that sends one answers `422`;

@@ -1,4 +1,4 @@
-# Migrating to v2.9.0: Affinity 5.0, the relationship status and the cold war
+# Migrating to v2.8.2: Affinity 5.0, the relationship status and the cold war
 
 **Applies to:**
 - deployments (one migration, and an image swap that must follow it at once);
@@ -8,7 +8,7 @@
 Migration `0088` must run before the new image serves, and every machine still on the previous image must be replaced right after it. Every field on the wire is additive, but two behaviours change: her ask for space (`ask_for_space`) is retired, and the user's `propose` is refused unless the pair's status allows it.
 **Design:** [`2026-11-23-affinity-50-design.md`](../superpowers/specs/2026-11-23-affinity-50-design.md)
 
-The other notes for this release are [the focused tone, four together actions and the user's gender in a picture](v2-9-0-focused-tone-together-actions-user-gender.md) and [her period on a 28-day cycle](v2-9-0-period-cycle.md).
+The other notes for this release are [her accepted bed and bath asks place their events](v2-8-2-life-choice-events.md), [the focused tone, four together actions and the user's gender in a picture](v2-8-2-focused-tone-together-actions-user-gender.md), [her period on a 28-day cycle](v2-8-2-period-cycle.md) and [fact groups](v2-8-2-fact-groups.md).
 
 Each session now stores a relationship status, moved only by answered asks, with a cold war that can sit on top of it. The rules are in:
 - [the relationship status](../affinity-model.md#relationship-status) and [the composed relation](../affinity-model.md#the-composed-relation);

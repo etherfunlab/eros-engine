@@ -1234,9 +1234,10 @@ model = "voyage-4-lite"                       # ≡ "voyage-4-lite@voyage"
 #model_write = "voyage-4"        # storage path: embed_document(s), input_type "document"
 ```
 
-**Dimensions are fixed at 512, with no config knob.** The four pgvector
+**Dimensions are fixed at 512, with no config knob.** The five pgvector
 columns are `VECTOR(512)` (`NOT NULL` except `relationship_journal.embedding`,
-whose engine-written rows wait for the sweeper), the clients request 512 on the wire, and
+whose engine-written rows wait for the sweeper, and `human_facts.embedding`,
+empty until the [fact-group](insights.md#fact-groups) sweeper places the fact), the clients request 512 on the wire, and
 every response is length-checked. There used to be a `dimensions` field on
 `[tasks.<name>]` — it was never consumed and has been removed; a leftover
 `dimensions = 512` line in an existing config is now an inert unknown key

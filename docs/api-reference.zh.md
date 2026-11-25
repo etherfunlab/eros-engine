@@ -1922,14 +1922,48 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
       "session_count": 2,
       "recurrence": "repeated_across_sessions",
       "first_seen_at": "2026-10-13T12:00:00.123456Z",
-      "last_seen_at": "2026-10-20T09:30:00.654321Z"
+      "last_seen_at": "2026-10-20T09:30:00.654321Z",
+      "group_id": "9d41…"
     }
   ],
   "next": { "first_seen_at": "2026-10-13T12:00:00.123456Z", "id": "5b7e…" }
 }
 ```
 
-每行的字段与 [`GET /svc/v1/facts/changes`](#get-svcv1factschanges) 相同，只是不带 `user_id`。行按 `(first_seen_at, id)` 降序排列；`first_seen_at` 不会变，所以一次遍历中始终存在的行既不会重复也不会漏掉。页满时才有 `next`；把它的两个字段原样传回 `before` 与 `before_id`，保留微秒精度，直到 `next` 为 `null`。`before` 与 `before_id` 只传其中一个时回 `400 bad_request`。
+每行的字段与 [`GET /svc/v1/facts/changes`](#get-svcv1factschanges) 相同，只是不带 `user_id`，另加 `group_id`，即该行所属的[事实分组](insights.zh.md#事实分组)。尚未放置的行自成一组，它之后加入别的组时 `group_id` 会变。行按 `(first_seen_at, id)` 降序排列；`first_seen_at` 不会变，所以一次遍历中始终存在的行既不会重复也不会漏掉。页满时才有 `next`；把它的两个字段原样传回 `before` 与 `before_id`，保留微秒精度，直到 `next` 为 `null`。`before` 与 `before_id` 只传其中一个时回 `400 bad_request`。
+
+### `GET /v2/comp/user/{user_id}/fact-groups`
+
+这个用户的账本事实，按[事实分组](insights.zh.md#事实分组)列出：讲同一件事的事实每组一项，附带组里的各条事实，让客户端每件事只显示一次。query 参数与 `user_id` 等值检查都与事实列表相同。
+
+```json
+{
+  "groups": [
+    {
+      "group_id": "9d41…",
+      "content": "用户养了一只猫",
+      "roleplay": false,
+      "occurrences": 4,
+      "session_count": 3,
+      "recurrence": "repeated_across_sessions",
+      "first_seen_at": "2026-10-13T12:00:00.123456Z",
+      "last_seen_at": "2026-10-22T18:05:00.000001Z",
+      "facts": [
+        { "id": "5b7e…", "content": "用户养了一只猫", "occurrences": 3, "group_id": "9d41…", "…": "…" },
+        { "id": "a210…", "content": "用户家里有只猫", "occurrences": 1, "group_id": "9d41…", "…": "…" }
+      ]
+    }
+  ],
+  "next": { "first_seen_at": "2026-10-13T12:00:00.123456Z", "group_id": "9d41…" }
+}
+```
+
+- `facts` 按事实列表的形状列出每个成员，代表文本排第一：出现次数最多的成员，并列时取最早的。`content` 就是代表文本。
+- `occurrences` 与 `session_count` 是成员之和，`recurrence` 由这两个和派生。`first_seen_at` 取最早成员的，`last_seen_at` 取最晚成员的。
+- `roleplay` 为 true 表示这一组是角色扮演表达；一组从不把它们和真实事实混在一起。
+- 清扫器还没放置的事实自成一组。
+
+各组按 `(first_seen_at, group_id)` 降序排列。页满时才有 `next`；把 `next.first_seen_at` 传回 `before`、`next.group_id` 传回 `before_id`。单独删掉一组最早的那条事实，会让这一组在这个顺序里挪位置，正好在那时遍历可能跳过或重复它。
 
 ### `GET /v2/comp/user/{user_id}/memories`
 
@@ -1955,6 +1989,12 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 删除一条账本事实。删掉了回 `204`；这个用户没有这条事实时回 `404 not_found`（未知 id、别人的事实，或已经删过的，所以重复删除也是 `404`）。`user_id` 等值检查同上。
 
 删除会在 [`GET /svc/v1/rows/deletions`](#get-svcv1rowsdeletions) 写一条墓碑，并把用户的画像标为到期：下一次画像重建清扫（默认每五分钟）会在没有这条事实的情况下重建画像，剩下的事实不再支持任何画像时则清空它。事实的原文仍留在抽取审计与每日快照里，直到用户被抹除。之后再次抽取出同一句话，会作为新 id 的新行回来。见[洞察 → 逐条删除事实或记忆](insights.zh.md#逐条删除事实或记忆)。
+
+### `DELETE /v2/comp/user/{user_id}/fact-groups/{group_id}`
+
+删除一个事实分组：调用那一刻组里的每一条事实，包括客户端读取列表之后才放进来的。删掉了回 `204`；这个用户没有任何事实属于这个组 id 时回 `404 not_found`（未知 id、别人的组、已经删过的组，或单行组里的那条事实已加入别的组：重新读取列表，就能在那里找到它）。`user_id` 等值检查同上。
+
+每条被删的事实在 [`GET /svc/v1/rows/deletions`](#get-svcv1rowsdeletions) 各有一条 `fact` 墓碑，画像只被标为到期一次，与删除单条事实相同。见[洞察 → 逐条删除事实或记忆](insights.zh.md#逐条删除事实或记忆)。
 
 ### `DELETE /v2/comp/user/{user_id}/memories/{memory_id}`
 
