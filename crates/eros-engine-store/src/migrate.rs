@@ -207,7 +207,7 @@ mod tests {
         let versions: Vec<i64> = rows.iter().map(|r| r.0).collect();
         assert_eq!(
             versions,
-            [0, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89],
+            [0, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90],
             "collapsed + increments"
         );
         let baseline = MIGRATOR.iter().find(|m| m.version == 0).unwrap();
@@ -240,7 +240,7 @@ mod tests {
         let versions: Vec<i64> = bookkeeping(&pool).await.iter().map(|r| r.0).collect();
         assert_eq!(
             versions,
-            [0, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89]
+            [0, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90]
         );
         let phrases: i32 = sqlx::query_scalar(
             "SELECT jsonb_array_length(payload) FROM engine.error_handling_config \
