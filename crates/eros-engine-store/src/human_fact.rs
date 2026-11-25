@@ -536,6 +536,11 @@ impl HumanFactRepo<'_> {
     /// `group_id` descending, strictly before the `before` keyset tuple
     /// `(group first_seen_at, group_id)` when given, at most `limit` groups.
     /// An unplaced row is a one-row group.
+    ///
+    /// One statement, so the page and its rows come from one snapshot: a
+    /// placement or a delete landing mid-read can neither empty a group on
+    /// the page (which would cut the page short and end a client's walk) nor
+    /// move a group's sort key away from the cursor built from it.
     pub async fn list_groups_owned(
         &self,
         user_id: Uuid,
@@ -543,44 +548,37 @@ impl HumanFactRepo<'_> {
         limit: i64,
     ) -> Result<Vec<FactGroup>, sqlx::Error> {
         let (at, id) = before.unzip();
-        let group_ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT group_id FROM ( \
-                 SELECT group_id, min(first_seen_at) AS first_seen_at \
-                 FROM engine.human_facts WHERE user_id = $1 GROUP BY group_id \
-             ) AS g \
-             WHERE $2::timestamptz IS NULL OR (first_seen_at, group_id) < ($2, $3) \
-             ORDER BY first_seen_at DESC, group_id DESC \
-             LIMIT $4",
-        )
+        let rows = sqlx::query_as::<_, HumanFactRow>(&format!(
+            "WITH page AS ( \
+                 SELECT group_id AS page_group, min(first_seen_at) AS page_first_seen \
+                 FROM engine.human_facts WHERE user_id = $1 \
+                 GROUP BY group_id \
+                 HAVING $2::timestamptz IS NULL \
+                        OR (min(first_seen_at), group_id) < ($2, $3) \
+                 ORDER BY page_first_seen DESC, page_group DESC \
+                 LIMIT $4) \
+             SELECT {COLUMNS} FROM page \
+             JOIN engine.human_facts ON user_id = $1 AND group_id = page.page_group \
+             ORDER BY page_first_seen DESC, page_group DESC, \
+                      occurrences DESC, first_seen_at, id"
+        ))
         .bind(user_id)
         .bind(at)
         .bind(id)
         .bind(limit)
         .fetch_all(self.pool)
         .await?;
-        let rows = sqlx::query_as::<_, HumanFactRow>(&format!(
-            "SELECT {COLUMNS} FROM engine.human_facts \
-             WHERE user_id = $1 AND group_id = ANY($2) \
-             ORDER BY occurrences DESC, first_seen_at, id"
-        ))
-        .bind(user_id)
-        .bind(&group_ids)
-        .fetch_all(self.pool)
-        .await?;
-        let mut groups: Vec<FactGroup> = group_ids
-            .into_iter()
-            .map(|group_id| FactGroup {
-                group_id,
-                facts: Vec::new(),
-            })
-            .collect();
+        // Rows arrive group by group, in page order.
+        let mut groups: Vec<FactGroup> = Vec::new();
         for row in rows {
-            if let Some(g) = groups.iter_mut().find(|g| g.group_id == row.group_id) {
-                g.facts.push(row);
+            match groups.last_mut() {
+                Some(g) if g.group_id == row.group_id => g.facts.push(row),
+                _ => groups.push(FactGroup {
+                    group_id: row.group_id,
+                    facts: vec![row],
+                }),
             }
         }
-        // A group deleted between the two reads has no rows left.
-        groups.retain(|g| !g.facts.is_empty());
         Ok(groups)
     }
 
