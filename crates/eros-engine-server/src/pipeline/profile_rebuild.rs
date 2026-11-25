@@ -468,6 +468,7 @@ mod tests {
             session_count: if occurrences > 1 { 2 } else { 1 },
             first_seen_at: seen,
             last_seen_at: seen,
+            group_id: Uuid::new_v4(),
         }
     }
 

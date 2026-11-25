@@ -243,6 +243,11 @@ async fn run_server() -> Result<()> {
     // new facts have sat idle. Inert when PROFILE_REBUILD_DISABLED=1 or tick=0.
     tokio::spawn(crate::pipeline::profile_rebuild::sweeper(state.clone()));
 
+    // Fact-group sweeper: embeds new ledger facts and places each into the
+    // group of an earlier fact it restates. Inert when FACT_GROUPING_DISABLED=1
+    // or tick=0.
+    tokio::spawn(crate::pipeline::fact_groups::sweeper(state.clone()));
+
     let app: Router = open_router
         .with_state(state)
         .merge(Scalar::with_url("/docs", api))

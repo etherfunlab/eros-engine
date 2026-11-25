@@ -6,6 +6,7 @@
 pub mod activity;
 pub mod chat_queue;
 pub mod dreaming;
+pub mod fact_groups;
 pub mod group;
 pub mod group_director;
 pub mod handlers;

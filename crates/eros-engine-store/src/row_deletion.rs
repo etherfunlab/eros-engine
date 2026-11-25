@@ -39,6 +39,21 @@ impl RowDeletionRepo<'_> {
         Ok(())
     }
 
+    /// Record several deleted rows of one kind inside the transaction that
+    /// deletes them.
+    pub async fn insert_many_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        kind: &str,
+        ids: &[Uuid],
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO engine.row_deletions (kind, id) SELECT $1, unnest($2::uuid[])")
+            .bind(kind)
+            .bind(ids)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     /// Tombstones strictly after the `(since, after_id)` keyset tuple, in
     /// `(deleted_at, id)` order, at most `limit`. Uses
     /// `idx_row_deletions_export`.

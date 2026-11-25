@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The owner's ledger facts and extracted profile memories: list them, and
 //! delete one at a time (spec
-//! 2026-11-10-row-deletion-and-deletion-stream-design.md §3).
+//! 2026-11-10-row-deletion-and-deletion-stream-design.md §3); and the facts
+//! as fact groups, listed and deleted a group at a time (spec
+//! 2026-11-25-fact-groups-design.md §5.4–5.5).
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
@@ -12,7 +14,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use eros_engine_store::human_fact::{HumanFactRepo, HumanFactRow};
+use eros_engine_store::human_fact::{FactGroup, HumanFactRepo, HumanFactRow};
 use eros_engine_store::memory::{MemoryRepo, ProfileMemoryChange};
 
 use crate::auth::middleware::AuthUser;
@@ -76,6 +78,10 @@ pub struct OwnedFact {
     pub recurrence: String,
     pub first_seen_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
+    /// The fact's group, shared with the user's facts that state the same
+    /// thing. A fact not grouped yet is a group of its own, whose id changes
+    /// if it later joins another group.
+    pub group_id: Uuid,
 }
 
 impl From<HumanFactRow> for OwnedFact {
@@ -95,8 +101,64 @@ impl From<HumanFactRow> for OwnedFact {
             recurrence,
             first_seen_at: r.first_seen_at,
             last_seen_at: r.last_seen_at,
+            group_id: r.group_id,
         }
     }
+}
+
+/// One fact group: the user's facts that state the same thing, as one item.
+#[derive(Serialize, ToSchema)]
+pub struct OwnedFactGroup {
+    pub group_id: Uuid,
+    /// The representative's text: the member seen most often, ties going to
+    /// the earliest.
+    pub content: String,
+    /// Whether the group's facts are roleplay expressions; a group never
+    /// mixes roleplay with real facts.
+    pub roleplay: bool,
+    /// Summed over the members.
+    pub occurrences: i32,
+    /// Summed over the members, so a session that saw two of them counts twice.
+    pub session_count: i32,
+    /// `once`, `repeated_in_session` or `repeated_across_sessions`, from the
+    /// summed counters.
+    pub recurrence: String,
+    /// The earliest member's.
+    pub first_seen_at: DateTime<Utc>,
+    /// The latest member's.
+    pub last_seen_at: DateTime<Utc>,
+    /// Every member, the representative first.
+    pub facts: Vec<OwnedFact>,
+}
+
+impl From<FactGroup> for OwnedFactGroup {
+    fn from(g: FactGroup) -> Self {
+        Self {
+            group_id: g.group_id,
+            content: g.facts[0].content.clone(),
+            roleplay: g.roleplay(),
+            occurrences: g.occurrences(),
+            session_count: g.session_count(),
+            recurrence: g.recurrence().as_str().to_string(),
+            first_seen_at: g.first_seen_at(),
+            last_seen_at: g.last_seen_at(),
+            facts: g.facts.into_iter().map(OwnedFact::from).collect(),
+        }
+    }
+}
+
+/// Pass `first_seen_at` back as `before` and `group_id` as `before_id`.
+#[derive(Serialize, ToSchema)]
+pub struct OwnedFactGroupsCursor {
+    pub first_seen_at: DateTime<Utc>,
+    pub group_id: Uuid,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct OwnedFactGroupsResponse {
+    pub groups: Vec<OwnedFactGroup>,
+    /// Present iff the page is full; `null` means the walk is complete.
+    pub next: Option<OwnedFactGroupsCursor>,
 }
 
 /// Pass both fields back as `before` + `before_id`.
@@ -192,6 +254,50 @@ async fn list_facts(
     }))
 }
 
+/// The user's ledger facts as fact groups, one item per group with the facts
+/// behind it, newest first by the group's earliest fact. A group's
+/// representative is the member seen most often (ties to the earliest), and
+/// its counters are sums over the members. A fact not grouped yet is a group
+/// of its own. Page with `before` = `next.first_seen_at` and `before_id` =
+/// `next.group_id`.
+#[utoipa::path(
+    get,
+    path = "/v2/comp/user/{user_id}/fact-groups",
+    tag = "companion",
+    params(("user_id" = Uuid, Path, description = "Owner user id (must equal JWT sub)"), OwnedRowsQuery),
+    responses(
+        (status = 200, body = OwnedFactGroupsResponse),
+        (status = 400, description = "`before` without `before_id`, or the reverse"),
+        (status = 401, description = "missing or invalid bearer"),
+        (status = 403, description = "user_id does not match JWT")
+    ),
+    security(("bearer" = []))
+)]
+async fn list_fact_groups(
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    Extension(AuthUser(jwt_user)): Extension<AuthUser>,
+    Query(q): Query<OwnedRowsQuery>,
+) -> Result<Json<OwnedFactGroupsResponse>, AppError> {
+    owner_only(user_id, jwt_user)?;
+    let (limit, before) = q.page()?;
+    let groups = HumanFactRepo { pool: &state.pool }
+        .list_groups_owned(user_id, before, limit)
+        .await?;
+    let next = if groups.len() as i64 == limit {
+        groups.last().map(|g| OwnedFactGroupsCursor {
+            first_seen_at: g.first_seen_at(),
+            group_id: g.group_id,
+        })
+    } else {
+        None
+    };
+    Ok(Json(OwnedFactGroupsResponse {
+        groups: groups.into_iter().map(OwnedFactGroup::from).collect(),
+        next,
+    }))
+}
+
 /// The user's extracted profile memories, newest first. These are the rows
 /// `GET /svc/v1/memories/changes` exports.
 #[utoipa::path(
@@ -268,6 +374,43 @@ async fn delete_fact(
     }
 }
 
+/// Delete a fact group: every fact in it as the call runs, including one
+/// grouped after the listing was read. Each fact's tombstone goes to
+/// `GET /svc/v1/rows/deletions`, and the derived profile is rebuilt without
+/// them on the next sweep, as for a single fact.
+#[utoipa::path(
+    delete,
+    path = "/v2/comp/user/{user_id}/fact-groups/{group_id}",
+    tag = "companion",
+    params(
+        ("user_id" = Uuid, Path, description = "Owner user id (must equal JWT sub)"),
+        ("group_id" = Uuid, Path, description = "The group's id")
+    ),
+    responses(
+        (status = 204, description = "deleted"),
+        (status = 401, description = "missing or invalid bearer"),
+        (status = 403, description = "user_id does not match JWT"),
+        (status = 404, description = "no fact of this user has this group id (including a group \
+            already deleted, or a one-fact group whose fact has since joined another group)")
+    ),
+    security(("bearer" = []))
+)]
+async fn delete_fact_group(
+    State(state): State<AppState>,
+    Path((user_id, group_id)): Path<(Uuid, Uuid)>,
+    Extension(AuthUser(jwt_user)): Extension<AuthUser>,
+) -> Result<StatusCode, AppError> {
+    owner_only(user_id, jwt_user)?;
+    if (HumanFactRepo { pool: &state.pool })
+        .delete_group_owned(user_id, group_id)
+        .await?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound("fact group not found".into()))
+    }
+}
+
 /// Delete one extracted profile memory. Its tombstone goes to
 /// `GET /svc/v1/rows/deletions`.
 #[utoipa::path(
@@ -306,8 +449,10 @@ async fn delete_memory(
 pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(list_facts))
+        .routes(routes!(list_fact_groups))
         .routes(routes!(list_memories))
         .routes(routes!(delete_fact))
+        .routes(routes!(delete_fact_group))
         .routes(routes!(delete_memory))
 }
 
@@ -489,7 +634,7 @@ mod tests {
     async fn lists_refuse_another_user_and_half_a_cursor(pool: PgPool) {
         let user = Uuid::new_v4();
         let app = build_router(test_state(pool.clone()));
-        for kind in ["facts", "memories"] {
+        for kind in ["facts", "memories", "fact-groups"] {
             let (status, _) = call(
                 &app,
                 Method::GET,
@@ -560,5 +705,130 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tombs, 2);
+    }
+
+    /// Put `ids` into one fact group and return its id.
+    async fn group_up(pool: &PgPool, ids: &[Uuid]) -> Uuid {
+        let group = Uuid::new_v4();
+        sqlx::query("UPDATE engine.human_facts SET group_id = $2 WHERE id = ANY($1)")
+            .bind(ids)
+            .bind(group)
+            .execute(pool)
+            .await
+            .unwrap();
+        group
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn fact_groups_list_one_item_per_group_with_members(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let a = seed_fact(&pool, user, "是工程师", t(1)).await;
+        let b = seed_fact(&pool, user, "是一名工程师", t(2)).await;
+        seed_fact(&pool, user, "喜欢爬山", t(3)).await;
+        let group = group_up(&pool, &[a, b]).await;
+        let app = build_router(test_state(pool.clone()));
+
+        let (status, body) = call(
+            &app,
+            Method::GET,
+            &format!("/v2/comp/user/{user}/fact-groups"),
+            user,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let groups = body["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        let g = &groups[1];
+        assert_eq!(g["group_id"], group.to_string());
+        assert_eq!(g["facts"].as_array().unwrap().len(), 2);
+        assert_eq!(g["content"], g["facts"][0]["content"]);
+        assert_eq!(g["content"], "是工程师", "ties go to the earliest");
+        assert_eq!(g["occurrences"], 2);
+        assert_eq!(g["session_count"], 2);
+        assert_eq!(g["recurrence"], "repeated_across_sessions");
+        assert_eq!(g["roleplay"], false);
+        assert_eq!(g["facts"][1]["group_id"], group.to_string());
+        assert!(!body.to_string().contains("user_id"));
+        assert!(body["next"].is_null());
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn fact_groups_list_pages_with_a_group_cursor(pool: PgPool) {
+        let user = Uuid::new_v4();
+        for (i, content) in ["是工程师", "喜欢爬山", "养了一只猫"].iter().enumerate() {
+            seed_fact(&pool, user, content, t(i as u32 + 1)).await;
+        }
+        let app = build_router(test_state(pool.clone()));
+
+        let mut seen = Vec::new();
+        let mut uri = format!("/v2/comp/user/{user}/fact-groups?limit=1");
+        loop {
+            let (status, body) = call(&app, Method::GET, &uri, user).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            for g in body["groups"].as_array().unwrap() {
+                seen.push(g["content"].as_str().unwrap().to_string());
+            }
+            let next = &body["next"];
+            if next.is_null() {
+                break;
+            }
+            uri = format!(
+                "/v2/comp/user/{user}/fact-groups?limit=1&before={}&before_id={}",
+                urlencoding(next["first_seen_at"].as_str().unwrap()),
+                next["group_id"].as_str().unwrap()
+            );
+        }
+        assert_eq!(seen, vec!["养了一只猫", "喜欢爬山", "是工程师"]);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn fact_group_delete_is_204_then_404_and_owner_only(pool: PgPool) {
+        let (user, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let a = seed_fact(&pool, user, "是工程师", t(1)).await;
+        let b = seed_fact(&pool, user, "是一名工程师", t(2)).await;
+        seed_fact(&pool, user, "喜欢爬山", t(3)).await;
+        let group = group_up(&pool, &[a, b]).await;
+        let app = build_router(test_state(pool.clone()));
+        let uri = format!("/v2/comp/user/{user}/fact-groups/{group}");
+
+        let (status, _) = call(&app, Method::DELETE, &uri, other).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = call(&app, Method::DELETE, &uri, user).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(&app, Method::DELETE, &uri, user).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "already gone");
+
+        let (_, body) = call(
+            &app,
+            Method::GET,
+            &format!("/v2/comp/user/{user}/fact-groups"),
+            user,
+        )
+        .await;
+        let groups = body["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["content"], "喜欢爬山");
+        let tombs: i64 = sqlx::query_scalar("SELECT count(*) FROM engine.row_deletions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tombs, 2, "one tombstone per member");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn flat_facts_list_carries_group_id(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let a = seed_fact(&pool, user, "是工程师", t(1)).await;
+        let group = group_up(&pool, &[a]).await;
+        let app = build_router(test_state(pool.clone()));
+        let (status, body) = call(
+            &app,
+            Method::GET,
+            &format!("/v2/comp/user/{user}/facts"),
+            user,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["facts"][0]["group_id"], group.to_string());
     }
 }

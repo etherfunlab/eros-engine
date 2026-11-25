@@ -421,6 +421,8 @@ mod migration_tests {
     /// would silently exempt a future `run_id` that really does reference
     /// something. `human_facts.first_run_id` / `last_run_id` are the same
     /// token, naming the extraction run that first and last emitted the fact.
+    /// `human_facts.group_id` is a grouping token shared by the rows of one
+    /// fact group, again with no table behind it.
     ///
     /// Covers `relkind` `'r'` and `'p'` — a partitioned table can carry an FK
     /// and must not slip through. Materialized views cannot, so they are out.
@@ -442,7 +444,7 @@ mod migration_tests {
                AND NOT (a.attname = 'run_id' AND c.relname IN ( \
                      'human_insights_events', 'companion_decision_events', \
                      'character_insights_events', 'user_insights_events')) \
-               AND NOT (a.attname IN ('first_run_id', 'last_run_id') \
+               AND NOT (a.attname IN ('first_run_id', 'last_run_id', 'group_id') \
                         AND c.relname = 'human_facts') \
                AND NOT EXISTS ( \
                      SELECT 1 FROM pg_constraint fk \

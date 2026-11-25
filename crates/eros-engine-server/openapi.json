@@ -3457,6 +3457,133 @@
         ]
       }
     },
+    "/v2/comp/user/{user_id}/fact-groups": {
+      "get": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "The user's ledger facts as fact groups, one item per group with the facts\nbehind it, newest first by the group's earliest fact. A group's\nrepresentative is the member seen most often (ties to the earliest), and\nits counters are sums over the members. A fact not grouped yet is a group\nof its own. Page with `before` = `next.first_seen_at` and `before_id` =\n`next.group_id`.",
+        "operationId": "list_fact_groups",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Default 100, clamped to 1..=500.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "description": "RFC 3339; with `before_id`, the `next` of the previous page. Absent:\nstart at the newest row.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "before_id",
+            "in": "query",
+            "description": "Comes with `before`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnedFactGroupsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`before` without `before_id`, or the reverse"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v2/comp/user/{user_id}/fact-groups/{group_id}": {
+      "delete": {
+        "tags": [
+          "companion"
+        ],
+        "summary": "Delete a fact group: every fact in it as the call runs, including one\ngrouped after the listing was read. Each fact's tombstone goes to\n`GET /svc/v1/rows/deletions`, and the derived profile is rebuilt without\nthem on the next sweep, as for a single fact.",
+        "operationId": "delete_fact_group",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "Owner user id (must equal JWT sub)",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "group_id",
+            "in": "path",
+            "description": "The group's id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "deleted"
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "user_id does not match JWT"
+          },
+          "404": {
+            "description": "no fact of this user has this group id (including a group already deleted, or a one-fact group whose fact has since joined another group)"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v2/comp/user/{user_id}/facts": {
       "get": {
         "tags": [
@@ -7442,7 +7569,8 @@
           "session_count",
           "recurrence",
           "first_seen_at",
-          "last_seen_at"
+          "last_seen_at",
+          "group_id"
         ],
         "properties": {
           "category": {
@@ -7463,6 +7591,11 @@
           "first_seen_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "group_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The fact's group, shared with the user's facts that state the same\nthing. A fact not grouped yet is a group of its own, whose id changes\nif it later joins another group."
           },
           "id": {
             "type": "string",
@@ -7489,6 +7622,109 @@
           },
           "temporality": {
             "type": "string"
+          }
+        }
+      },
+      "OwnedFactGroup": {
+        "type": "object",
+        "description": "One fact group: the user's facts that state the same thing, as one item.",
+        "required": [
+          "group_id",
+          "content",
+          "roleplay",
+          "occurrences",
+          "session_count",
+          "recurrence",
+          "first_seen_at",
+          "last_seen_at",
+          "facts"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The representative's text: the member seen most often, ties going to\nthe earliest."
+          },
+          "facts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OwnedFact"
+            },
+            "description": "Every member, the representative first."
+          },
+          "first_seen_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The earliest member's."
+          },
+          "group_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The latest member's."
+          },
+          "occurrences": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Summed over the members."
+          },
+          "recurrence": {
+            "type": "string",
+            "description": "`once`, `repeated_in_session` or `repeated_across_sessions`, from the\nsummed counters."
+          },
+          "roleplay": {
+            "type": "boolean",
+            "description": "Whether the group's facts are roleplay expressions; a group never\nmixes roleplay with real facts."
+          },
+          "session_count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Summed over the members, so a session that saw two of them counts twice."
+          }
+        }
+      },
+      "OwnedFactGroupsCursor": {
+        "type": "object",
+        "description": "Pass `first_seen_at` back as `before` and `group_id` as `before_id`.",
+        "required": [
+          "first_seen_at",
+          "group_id"
+        ],
+        "properties": {
+          "first_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "group_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "OwnedFactGroupsResponse": {
+        "type": "object",
+        "required": [
+          "groups"
+        ],
+        "properties": {
+          "groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OwnedFactGroup"
+            }
+          },
+          "next": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OwnedFactGroupsCursor",
+                "description": "Present iff the page is full; `null` means the walk is complete."
+              }
+            ]
           }
         }
       },
