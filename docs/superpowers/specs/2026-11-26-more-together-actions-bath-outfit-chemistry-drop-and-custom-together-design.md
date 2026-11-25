@@ -1,7 +1,7 @@
 # More together actions, what she wears in the water, a chemistry drop that ends the event, and a custom together action — Design
 
 - **Date:** 2026-11-26
-- **Status:** Draft
+- **Status:** Approved
 - **Type:** Engine change. No migration. Additive wire change: seven new
   action types, seven new event kinds (placed, never drawn), one new field on
   the event view. One behaviour change on the wire: five kinds can end before
