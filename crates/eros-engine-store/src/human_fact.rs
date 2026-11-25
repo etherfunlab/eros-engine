@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 pub const DOMAINS: &[&str] = &[
@@ -172,6 +172,39 @@ impl HumanFactRow {
     }
 }
 
+/// A ledger row the fact-group sweeper has not placed yet (`embedding IS NULL`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UnplacedFact {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub roleplay: bool,
+    pub content: String,
+}
+
+/// What placing one row did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// It took the group of an earlier fact it restates.
+    Joined,
+    /// It restates no earlier fact closely enough and stays its own group.
+    Alone,
+    /// The row was gone or already placed; nothing was written.
+    Skipped,
+}
+
+/// Serialise every change to one user's fact groups: placement and the group
+/// delete take this lock first, inside their transaction.
+pub(crate) async fn lock_user_groups(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('fact_groups:' || $1::text, 0))")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 const COLUMNS: &str = "id, user_id, content, category, domain, evidence_type, temporality, \
                        persistence, confidence, occurrences, session_count, \
                        first_seen_at, last_seen_at, group_id";
@@ -297,6 +330,74 @@ impl HumanFactRepo<'_> {
         .bind(limit)
         .fetch_all(self.pool)
         .await
+    }
+
+    /// Up to `limit` unplaced rows across all users, oldest first by
+    /// `(first_seen_at, id)`: the fact-group sweeper's queue (spec
+    /// 2026-11-25-fact-groups §5.2). Uses `idx_human_facts_unplaced`.
+    pub async fn unplaced(&self, limit: i64) -> Result<Vec<UnplacedFact>, sqlx::Error> {
+        sqlx::query_as::<_, UnplacedFact>(
+            "SELECT id, user_id, roleplay, content FROM engine.human_facts \
+             WHERE embedding IS NULL \
+             ORDER BY first_seen_at, id \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await
+    }
+
+    /// Place one row with its vector (spec 2026-11-25-fact-groups §5.2), in
+    /// its own transaction under the user's group lock. A group's anchor is
+    /// its earliest placed member by `(first_seen_at, id)`; the row takes the
+    /// group of the nearest anchor among the user's placed rows of the same
+    /// realm when their cosine similarity is at least `threshold`, and keeps
+    /// its own group otherwise. Comparing with anchors only keeps a group from
+    /// growing by chains of near neighbours. The vector and the group are
+    /// written together, and only while the row is still unplaced.
+    pub async fn place(
+        &self,
+        fact: &UnplacedFact,
+        embedding: &[f32],
+        threshold: f64,
+    ) -> Result<Placement, sqlx::Error> {
+        let vector = crate::memory::format_vector(embedding);
+        let mut tx = self.pool.begin().await?;
+        lock_user_groups(&mut tx, fact.user_id).await?;
+        let nearest: Option<(Uuid, f64)> = sqlx::query_as(
+            "SELECT group_id, 1 - (embedding <=> $3::vector) \
+             FROM (SELECT DISTINCT ON (group_id) group_id, embedding \
+                   FROM engine.human_facts \
+                   WHERE user_id = $1 AND roleplay = $2 AND embedding IS NOT NULL \
+                   ORDER BY group_id, first_seen_at, id) AS anchors \
+             ORDER BY embedding <=> $3::vector \
+             LIMIT 1",
+        )
+        .bind(fact.user_id)
+        .bind(fact.roleplay)
+        .bind(&vector)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let joined = nearest
+            .filter(|(_, similarity)| *similarity >= threshold)
+            .map(|(group_id, _)| group_id);
+        let written = sqlx::query(
+            "UPDATE engine.human_facts \
+             SET embedding = $2::vector, group_id = COALESCE($3, group_id) \
+             WHERE id = $1 AND embedding IS NULL",
+        )
+        .bind(fact.id)
+        .bind(&vector)
+        .bind(joined)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(match (written, joined) {
+            (0, _) => Placement::Skipped,
+            (_, Some(_)) => Placement::Joined,
+            (_, None) => Placement::Alone,
+        })
     }
 
     /// The user's facts, newest first by `first_seen_at` (which never
@@ -1014,5 +1115,203 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(unplaced, 2);
+    }
+
+    const T: f64 = 0.96;
+
+    /// A 512-dimension unit vector at `deg` degrees in the first plane: the
+    /// cosine similarity of `unit(a)` and `unit(b)` is `cos(a − b)`.
+    fn unit(deg: f64) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 512];
+        v[0] = deg.to_radians().cos() as f32;
+        v[1] = deg.to_radians().sin() as f32;
+        v
+    }
+
+    fn h(hour: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 25, hour, 0, 0).unwrap()
+    }
+
+    async fn seed_unplaced(
+        pool: &PgPool,
+        user: Uuid,
+        content: &str,
+        evidence_type: &str,
+        first_seen: DateTime<Utc>,
+    ) -> UnplacedFact {
+        let id = sqlx::query_scalar(
+            "INSERT INTO engine.human_facts \
+               (user_id, content, category, domain, evidence_type, temporality, \
+                persistence, confidence, first_seen_at, last_seen_at) \
+             VALUES ($1, $2, 'other', 'other', $3, 'current', 'stable', 'high', $4, $4) \
+             RETURNING id",
+        )
+        .bind(user)
+        .bind(content)
+        .bind(evidence_type)
+        .bind(first_seen)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        UnplacedFact {
+            id,
+            user_id: user,
+            roleplay: evidence_type == "roleplay_expression",
+            content: content.into(),
+        }
+    }
+
+    async fn group_of(pool: &PgPool, id: Uuid) -> Uuid {
+        sqlx::query_scalar("SELECT group_id FROM engine.human_facts WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn joins_at_or_above_the_threshold(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let a = seed_unplaced(&pool, user, "用户喜欢爬山", "explicit_statement", h(1)).await;
+        let b = seed_unplaced(&pool, user, "用户很喜欢爬山", "explicit_statement", h(2)).await;
+        assert_eq!(repo.place(&a, &unit(0.0), T).await.unwrap(), Placement::Alone);
+        assert_eq!(repo.place(&b, &unit(10.0), T).await.unwrap(), Placement::Joined);
+        assert_eq!(group_of(&pool, b.id).await, group_of(&pool, a.id).await);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn stays_alone_below_the_threshold(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let a = seed_unplaced(&pool, user, "用户喜欢爬山", "explicit_statement", h(1)).await;
+        let b = seed_unplaced(&pool, user, "用户喜欢露营", "explicit_statement", h(2)).await;
+        let b_group = group_of(&pool, b.id).await;
+        assert_eq!(repo.place(&a, &unit(0.0), T).await.unwrap(), Placement::Alone);
+        assert_eq!(repo.place(&b, &unit(20.0), T).await.unwrap(), Placement::Alone);
+        assert_ne!(group_of(&pool, b.id).await, group_of(&pool, a.id).await);
+        assert_eq!(group_of(&pool, b.id).await, b_group, "alone keeps its own id");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn matches_anchors_only(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let a = seed_unplaced(&pool, user, "a", "explicit_statement", h(1)).await;
+        let b = seed_unplaced(&pool, user, "b", "explicit_statement", h(2)).await;
+        let c = seed_unplaced(&pool, user, "c", "explicit_statement", h(3)).await;
+        repo.place(&a, &unit(0.0), T).await.unwrap();
+        assert_eq!(repo.place(&b, &unit(12.0), T).await.unwrap(), Placement::Joined);
+        // cos 12° = 0.978 to B, but cos 24° = 0.914 to the group's first fact.
+        assert_eq!(repo.place(&c, &unit(24.0), T).await.unwrap(), Placement::Alone);
+        assert_ne!(group_of(&pool, c.id).await, group_of(&pool, a.id).await);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn never_joins_across_roleplay(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let a = seed_unplaced(&pool, user, "用户是医生", "explicit_statement", h(1)).await;
+        let b = seed_unplaced(&pool, user, "用户是医生", "roleplay_expression", h(2)).await;
+        repo.place(&a, &unit(0.0), T).await.unwrap();
+        assert_eq!(repo.place(&b, &unit(0.0), T).await.unwrap(), Placement::Alone);
+        assert_ne!(group_of(&pool, b.id).await, group_of(&pool, a.id).await);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn never_joins_across_users(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let a = seed_unplaced(&pool, Uuid::new_v4(), "用户是医生", "explicit_statement", h(1)).await;
+        let b = seed_unplaced(&pool, Uuid::new_v4(), "用户是医生", "explicit_statement", h(2)).await;
+        repo.place(&a, &unit(0.0), T).await.unwrap();
+        assert_eq!(repo.place(&b, &unit(0.0), T).await.unwrap(), Placement::Alone);
+        assert_ne!(group_of(&pool, b.id).await, group_of(&pool, a.id).await);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unplaced_lists_oldest_first(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let late = seed_unplaced(&pool, user, "c", "explicit_statement", h(3)).await;
+        let early = seed_unplaced(&pool, user, "a", "explicit_statement", h(1)).await;
+        let mid = seed_unplaced(&pool, user, "b", "explicit_statement", h(2)).await;
+        let placed = seed_unplaced(&pool, user, "z", "explicit_statement", h(0)).await;
+        repo.place(&placed, &unit(90.0), T).await.unwrap();
+
+        let all = repo.unplaced(10).await.unwrap();
+        assert_eq!(
+            all.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![early.id, mid.id, late.id]
+        );
+        assert_eq!(all[0].user_id, user);
+        assert_eq!(all[0].content, "a");
+        assert!(!all[0].roleplay);
+        assert_eq!(repo.unplaced(2).await.unwrap().len(), 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn skips_a_row_deleted_or_already_placed(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let a = seed_unplaced(&pool, user, "a", "explicit_statement", h(1)).await;
+        let b = seed_unplaced(&pool, user, "b", "explicit_statement", h(2)).await;
+        let gone = seed_unplaced(&pool, user, "gone", "explicit_statement", h(3)).await;
+        sqlx::query("DELETE FROM engine.human_facts WHERE id = $1")
+            .bind(gone.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(repo.place(&gone, &unit(0.0), T).await.unwrap(), Placement::Skipped);
+
+        repo.place(&a, &unit(0.0), T).await.unwrap();
+        let b_group = group_of(&pool, b.id).await;
+        assert_eq!(repo.place(&b, &unit(45.0), T).await.unwrap(), Placement::Alone);
+        // A second placement at a vector that would join A changes nothing.
+        assert_eq!(repo.place(&b, &unit(0.0), T).await.unwrap(), Placement::Skipped);
+        assert_eq!(group_of(&pool, b.id).await, b_group);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_recurrence_keeps_its_group(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let a = seed_unplaced(&pool, user, "用户喜欢爬山", "explicit_statement", h(1)).await;
+        repo.place(&a, &unit(0.0), T).await.unwrap();
+        let b_fact = [fact("用户很喜欢爬山", "explicit_statement", "stable")];
+        repo.upsert_run(user, &b_fact, &src(None, None, None))
+            .await
+            .unwrap();
+        let b = repo.unplaced(10).await.unwrap().remove(0);
+        assert_eq!(repo.place(&b, &unit(10.0), T).await.unwrap(), Placement::Joined);
+
+        repo.upsert_run(user, &b_fact, &src(None, None, None))
+            .await
+            .unwrap();
+        let (occurrences, group, placed): (i32, Uuid, bool) = sqlx::query_as(
+            "SELECT occurrences, group_id, embedding IS NOT NULL \
+             FROM engine.human_facts WHERE id = $1",
+        )
+        .bind(b.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(occurrences, 2);
+        assert_eq!(group, group_of(&pool, a.id).await);
+        assert!(placed, "a recurrence keeps the vector");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_next_member_anchors_after_the_anchor_is_deleted(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let a = seed_unplaced(&pool, user, "a", "explicit_statement", h(1)).await;
+        let b = seed_unplaced(&pool, user, "b", "explicit_statement", h(2)).await;
+        let c = seed_unplaced(&pool, user, "c", "explicit_statement", h(3)).await;
+        repo.place(&a, &unit(0.0), T).await.unwrap();
+        assert_eq!(repo.place(&b, &unit(10.0), T).await.unwrap(), Placement::Joined);
+        assert!(repo.delete_owned(user, a.id).await.unwrap());
+        // cos 8° = 0.990 to B, now the group's first fact; cos 18° = 0.951 to A.
+        assert_eq!(repo.place(&c, &unit(18.0), T).await.unwrap(), Placement::Joined);
+        assert_eq!(group_of(&pool, c.id).await, group_of(&pool, b.id).await);
     }
 }
