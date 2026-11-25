@@ -138,6 +138,8 @@ pub struct HumanFactRow {
     pub session_count: i32,
     pub first_seen_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
+    /// The fact's group: shared by the user's rows that state the same thing.
+    pub group_id: Uuid,
 }
 
 /// How often a fact has come up.
@@ -172,7 +174,7 @@ impl HumanFactRow {
 
 const COLUMNS: &str = "id, user_id, content, category, domain, evidence_type, temporality, \
                        persistence, confidence, occurrences, session_count, \
-                       first_seen_at, last_seen_at";
+                       first_seen_at, last_seen_at, group_id";
 
 pub struct HumanFactRepo<'a> {
     pub pool: &'a PgPool,
@@ -421,6 +423,7 @@ mod tests {
             session_count,
             first_seen_at: at(0),
             last_seen_at: at(0),
+            group_id: Uuid::new_v4(),
         }
     }
 
@@ -982,5 +985,34 @@ mod tests {
         assert_eq!(again.len(), 1);
         assert_ne!(again[0].id, first);
         assert_eq!(again[0].occurrences, 1, "a fresh count");
+    }
+
+    // ── Fact groups (spec 2026-11-25-fact-groups) ──
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_new_row_is_its_own_unplaced_group(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        repo.upsert_run(
+            user,
+            &[
+                fact("用户喜欢爬山", "explicit_statement", "stable"),
+                fact("用户在深圳工作", "explicit_statement", "stable"),
+            ],
+            &src(None, None, None),
+        )
+        .await
+        .unwrap();
+        let rows = repo.list_for_user(user).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].group_id, rows[1].group_id, "each row starts alone");
+        let unplaced: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM engine.human_facts WHERE user_id = $1 AND embedding IS NULL",
+        )
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unplaced, 2);
     }
 }
