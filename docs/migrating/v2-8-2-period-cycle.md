@@ -1,4 +1,4 @@
-# Migrating to v2.9.0: her period on a 28-day cycle
+# Migrating to v2.8.2: her period on a 28-day cycle
 
 **Applies to:**
 - deployments (one index-only migration, run before the new image starts);
@@ -9,7 +9,7 @@
 Migration `0089` adds one index and changes no data; run it before the new image starts. One field on the wire is additive (`cycle_event` on the effects response), but three behaviours change: a `period` under way is no longer `background_event`, `period_scare` lasts days and no longer stops the draw, and a female persona that is not human stops having a period unless her card says so. One card key, `period`, joins the 1.1 card.
 **Design:** [`2026-11-24-period-cycle-design.md`](../superpowers/specs/2026-11-24-period-cycle-design.md)
 
-The other notes for this release are [Affinity 5.0, the relationship status and the cold war](v2-9-0-affinity-5-0.md) and [the focused tone, four together actions and the user's gender in a picture](v2-9-0-focused-tone-together-actions-user-gender.md).
+The other notes for this release are [her accepted bed and bath asks place their events](v2-8-2-life-choice-events.md), [Affinity 5.0, the relationship status and the cold war](v2-8-2-affinity-5-0.md), [the focused tone, four together actions and the user's gender in a picture](v2-8-2-focused-tone-together-actions-user-gender.md) and [fact groups](v2-8-2-fact-groups.md).
 
 The rules are in [her cycle](../life-events-needs.md#her-cycle), [false alarms](../life-events-needs.md#false-alarms), [persona settings](../life-events-needs.md#persona-settings), [together actions](../life-events-needs.md#showering-bathing-and-the-sauna-together), [the romantic choices](../life-events-needs.md#the-romantic-choices), [the card](../eros-character-v1.1.md#art_metadata) and [the effects route](../api-reference.md#get-v2compsessionsession_ideffects).
 
@@ -30,7 +30,7 @@ The rules are in [her cycle](../life-events-needs.md#her-cycle), [false alarms](
 
 `0089` creates one partial index, `persona_events_cycle_idx`, on `engine.persona_events (instance_id, kind, started_at DESC) WHERE kind IN ('period', 'period_scare')`. It adds no column and rewrites no row. Every turn reads an instance's newest `period` and `period_scare` rows however old they are; without the index that read walks the instance's whole event history. The index is built with a plain `CREATE INDEX`, which holds back writes to `engine.persona_events` while it builds.
 
-1. **Run `migrate`.** The previous image ignores the index. On a database without `0088`, `migrate` applies it first, so the window that [Affinity 5.0](v2-9-0-affinity-5-0.md#migration-0088-and-deploy-order) asks to keep short includes this build.
+1. **Run `migrate`.** The previous image ignores the index. On a database without `0088`, `migrate` applies it first, so the window that [Affinity 5.0](v2-8-2-affinity-5-0.md#migration-0088-and-deploy-order) asks to keep short includes this build.
 2. **Start the new image.**
 
 ### What the upgrade does to existing data

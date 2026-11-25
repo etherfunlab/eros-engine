@@ -2,7 +2,7 @@
 
 [English](insights.md) · [中文](insights.zh.md)
 
-洞察流水线从对话里建立引擎对真人用户的了解，分两层。**事实账本**（`engine.human_facts`）记录抽取调用从每一轮挖出的原子事实，每条不同的事实一行，附复现计数器。**画像**（`engine.human_insights`，每个用户一行）按计划从账本派生，不是逐轮更新；聊天 prompt、语音开场、画像端点和画像导出都读它。每次 LLM 调用都在 `engine.human_insights_events` 留一行审计。用户本人可以逐条删除事实或抽取出的记忆，用户的数据也可以一次调用抹除，导出会把这两种删除都传达给下游镜像。
+洞察流水线从对话里建立引擎对真人用户的了解，分两层。**事实账本**（`engine.human_facts`）记录抽取调用从每一轮挖出的原子事实，每条不同的事实一行，附复现计数器；**事实分组**把换了说法、讲的是同一件事的行归到一起。**画像**（`engine.human_insights`，每个用户一行）按计划从账本派生，不是逐轮更新；聊天 prompt、语音开场、画像端点和画像导出都读它。每次 LLM 调用都在 `engine.human_insights_events` 留一行审计。用户本人可以逐条删除事实、事实分组或抽取出的记忆，用户的数据也可以一次调用抹除，导出会把这两种删除都传达给下游镜像。
 
 按关系分开的 `character_insights` 与 `user_insights` 两条链是另外的流水线，各有自己的表，见 [llm-audit.zh.md](llm-audit.zh.md#角色画像与用户画像实验特性)。从 v2.3.1 或更早版本升级的部署，升级步骤见 [migrating/v2-4-0-insights-2-0.md](migrating/v2-4-0-insights-2-0.md) 与 [migrating/v2-4-1-insights-cleanup.md](migrating/v2-4-1-insights-cleanup.md)（仅英文）。
 
@@ -13,7 +13,9 @@
    │   → {"facts": [{content, category, domain, …}]}      审计行  stage='facts'
    │
    ├─ 账本写入             engine.human_facts   （精确匹配去重，复现计数）
-   │   └─ pending_facts += N      engine.human_profile_state
+   │   ├─ pending_facts += N      engine.human_profile_state
+   │   └─ 事实分组清扫器（默认每分钟）：给新行算向量，放进它所复述的
+   │        那条更早事实的组                                     group_id
    │
    └─ pending_facts ≥ 20，或闲置满闲置时长（清扫器；默认一小时）
         └─ profile_rebuild   用户消息 = 整个账本 + 引擎自有的 schema
@@ -36,8 +38,10 @@
 | `first_session_id`、`first_message_id`、`last_session_id`、`last_message_id` | 首次与最近一次出现的来源。外键，`ON DELETE SET NULL`。 |
 | `first_run_id`、`last_run_id` | 抽取运行的关联 id（即审计行的 `run_id`）。不是引用。 |
 | `roleplay`、`content_hash` | 生成列：`evidence_type = 'roleplay_expression'`，以及 `md5(engine.fact_norm(content))`。 |
+| `group_id` | 该行所属的[事实分组](#事实分组)。每行起初自成一组。没有外键：共用同一个 id 的行就是一组。 |
+| `embedding` | 该事实的向量，事实分组清扫器放置这一行之前为 `NULL`。 |
 
-**去重。** 用户、证据类别和归一化后的文本三者相同才算同一条事实：在 `(user_id, roleplay, content_hash)` 上建唯一索引。`engine.fact_norm` 做 NFKC、转小写、去掉空白与标点（ASCII 和常见的 CJK 符号）。去重只做精确匹配，不做 embedding 或改写合并，所以否定、含糊、带条件或换了说法的变体各占一行。`roleplay_expression` 事实绝不与其他证据类型合并。
+**去重。** 用户、证据类别和归一化后的文本三者相同才算同一条事实：在 `(user_id, roleplay, content_hash)` 上建唯一索引。`engine.fact_norm` 做 NFKC、转小写、去掉空白与标点（ASCII 和常见的 CJK 符号）。去重只做精确匹配，不做 embedding 或改写合并，所以否定、含糊、带条件或换了说法的变体各占一行。`roleplay_expression` 事实绝不与其他证据类型合并。换了说法的行改由[事实分组](#事实分组)归到一组，不合并任何一行。
 
 **一次出现 = 一次输出过该事实的抽取运行。** 1:1 一轮产出多条助手消息，每条消息各跑一次；群聊每轮跑一次。同一次运行的数组里的重复项只算一次，先出现的那条胜出。
 
@@ -52,6 +56,24 @@
 | `repeated_across_sessions` | `session_count > 1` |
 
 档位与 `persistence` 标签并用，不取代它：`persistence` 能区分「此刻在地铁上」和长期特质，计数器做不到。
+
+## 事实分组
+
+事实分组是同一个用户账本里换了说法、讲的是同一件事的那些行：「用户喜欢爬山」和「用户很喜欢爬山」是同一组里的两行。行从不合并也不改写；分组只是这些行之上的一个视图，让用户按「一件事」而不是按「一种说法」来查看和删除引擎对自己的了解。真实事实和角色扮演表达从不同组。
+
+**放置。** 新行起初自成一组，没有向量。`serve` 里的一个清扫器负责放置：每隔 `FACT_GROUPING_TICK_SECS`（默认 60 秒）取最旧的未放置行，每批 `FACT_GROUPING_BATCH` 行（默认 500），用[写入用的 embedding 模型](model-config.zh.md)一次调用算出向量，再逐行放置：
+
+- 每组的**首条事实**是组里最早的那一行。在同一用户、同一证据类别（是否角色扮演）的已放置行里，清扫器找出离新行最近的首条事实。
+- 两者的余弦相似度不低于 `FACT_GROUPING_THRESHOLD` 时，新行加入那一组；否则自成一组，并成为这一组的首条事实。
+- 新行只跟首条事实比，从不跟组里后来的成员比，所以一组不会顺着一串近邻越长越大：每个成员与本组首条事实的相似度都达到阈值。
+
+一批满了就立刻开始下一批，积压几分钟就能消化；某一批里有放置失败，或者一行都没放成，就等下一个 tick。放置失败还会让同一用户在这批里更晚的行也等到那时，所以每个用户的行总是从旧到新放置。分组上线时账本里已有的行，走的也是同一个队列。
+
+**阈值。** 默认 `0.96`，是对引擎默认写入模型 voyage-4-lite 实测得到的门槛。在一个生产部署的账本上实测，voyage-4-large 在 `0.94` 达到同样的质量：两位独立判官都认定是重复的每一对，它都归到了一组；而它归到一起的配对里，约九分之一相差一个细节（一方多说了点什么），也没有任何阈值能把这类配对和真正的同义改写分开。voyage-4-large 用 `0.96` 时，这类配对少一半，但约每二十对重复会漏掉一对。其他模型没有实测。
+
+**一组显示什么。** 代表文本是出现次数最多的成员，并列时取最早的。`occurrences` 与 `session_count` 是成员之和，所以同时见到两个成员的一次运行或一个 session 会算两次；`recurrence` 由这两个和派生；`first_seen_at` 取最早成员的，`last_seen_at` 取最晚成员的。
+
+**谁用分组。** 只有用户本人的[分组路由](#逐条删除事实或记忆)，以及用户本人事实列表上的 `group_id`。派生画像读的是行；事实导出不带 `group_id`（一行在导出流里首次出现之后才被放置，而放置不会推进 `last_seen_at`）；抹除照旧连同向量一起删除行。
 
 ## 事实抽取
 
@@ -276,9 +298,14 @@ genome 写入子树创建、覆盖角色 genome，不导出任何东西；本节
 - `GET /v2/comp/user/{user_id}/facts` 与 `GET /v2/comp/user/{user_id}/memories` 列出 `facts/changes` 与 `memories/changes` 导出的那些行，分别按 `first_seen_at` 与 `created_at` 从新到旧。
 - `DELETE /v2/comp/user/{user_id}/facts/{fact_id}` 与 `DELETE /v2/comp/user/{user_id}/memories/{memory_id}` 删除一行：`204`；id 不是该用户的这类行时 `404`，重复删除也是。
 
-形状见 [api-reference.zh.md](api-reference.zh.md#get-v2compuseruser_idfacts)。每次删除在一个事务里删掉该行，并往 `engine.row_deletions` 写一条墓碑（`kind`、该行原来的 `id`、`deleted_at`；没有 `user_id`，抹除也不碰这张表）。之后再次抽取出同一句话，是一条新 id 的新行。
+另有两条路由按[事实分组](#事实分组)列出和删除：
 
-删除事实还会把画像交给下一次重建，自己不调用模型。在同一个事务里、删掉账本行之前，它先 upsert 该用户的 `human_profile_state` 行：清空 `claimed_at`，让读过旧账本、仍在进行中的重建[什么都写不进去](#状态与触发)；`pending_facts` 加一；`last_fact_at = now`；`rebuild_failures = 0`；`rebuild_due = true`。清扫器在下一个 tick（默认每五分钟）重建这个用户，这之前的多次删除只花一次重建。剩下的事实若不再支持任何画像，重建会[清空它](#结果)。
+- `GET /v2/comp/user/{user_id}/fact-groups` 每组列一项，附带组里的各行，按组内最早事实从新到旧排列。尚未放置的行自成一组。
+- `DELETE /v2/comp/user/{user_id}/fact-groups/{group_id}` 删除调用那一刻组里的每一行，包括读取列表之后才放进来的行：`204`；该用户没有任何事实属于这个组 id 时 `404`。单行组里的那条事实如果之后加入了别的组，这个单行组就不存在了，删除它会得到 `404`；重新读取列表，就能在新的组里找到那条事实。
+
+形状见 [api-reference.zh.md](api-reference.zh.md#get-v2compuseruser_idfacts)。每次删除在一个事务里删掉这些行，并为每一行往 `engine.row_deletions` 写一条墓碑（`kind`、该行原来的 `id`、`deleted_at`；没有 `user_id`，抹除也不碰这张表），所以删除一组会以每个成员一条 `fact` 墓碑的形式传到镜像。删除事实和删除分组都先拿该用户的事实分组锁，所以一组在删除过程中不会有行被放进来。之后再次抽取出同一句话，是一条新 id 的新行。
+
+删除事实或分组还会把画像交给下一次重建，自己不调用模型。在同一个事务里、删掉账本行之前，它先 upsert 该用户的 `human_profile_state` 行：清空 `claimed_at`，让读过旧账本、仍在进行中的重建[什么都写不进去](#状态与触发)；`pending_facts` 加一；`last_fact_at = now`；`rebuild_failures = 0`；`rebuild_due = true`。清扫器在下一个 tick（默认每五分钟）重建这个用户，这之前的多次删除只花一次重建。剩下的事实若不再支持任何画像，重建会[清空它](#结果)。
 
 删除记忆不需要更多动作：召回直接读表，也没有从它派生出的东西。
 
@@ -384,6 +411,10 @@ ORDER BY e.created_at DESC, e.stage;
 | `PROFILE_REBUILD_TICK_SECS` | `300` | 清扫间隔。`0` 同样停掉清扫器；无法解析的值保持默认。 |
 | `PROFILE_REBUILD_IDLE_SECS` | `3600` | 用户最后一条新事实要放多久，清扫器才重建。 |
 | `PROFILE_REBUILD_BATCH` | `20` | 每个 tick 重建的用户数，至少为 1。 |
+| `FACT_GROUPING_DISABLED` | 未设 | `1` 或 `true` 停掉[事实分组](#事实分组)清扫器。什么都不放置，每行都作为自成一组列出。 |
+| `FACT_GROUPING_TICK_SECS` | `60` | 清扫间隔。`0` 同样停掉清扫器；无法解析的值保持默认。 |
+| `FACT_GROUPING_BATCH` | `500` | 每批、每次 embedding 调用的行数，限定在 1..=1000。embedding 后端单次请求能收的条数更少时，要设成不超过它的上限，否则每一批都会失败。 |
+| `FACT_GROUPING_THRESHOLD` | `0.96` | 一行与组的首条事实之间要达到的余弦相似度，达到才加入该组。超出 (0, 1] 的值保持默认。写入用 voyage-4-large 的部署设 `0.94`。 |
 | `INSIGHTS_EXPORT_SECRET`、`FACTS_EXPORT_SECRET`、`USER_ERASE_SECRET`、`GENOME_WRITE_SECRET` | 未设置 | 挂载各自的子树，见[上文](#导出与删除)。 |
 | `SNAPSHOT_DISABLED`、`SNAPSHOT_CRON`、`SNAPSHOT_TZ` | | 每日快照。 |
 
@@ -395,10 +426,19 @@ ORDER BY e.created_at DESC, e.stage;
 - **重建排空的成本是每个排队用户一次 LLM 调用**，所以部署之后预计有 `pending` 次调用，由闲置清扫器按每 `PROFILE_REBUILD_TICK_SECS` 处理 `PROFILE_REBUILD_BATCH` 个用户的节奏排空。在用户首次重建之前，他原来的画像行继续服务注入。清扫器关闭时，每个排队用户会在他下一次抽取运行时被重建，因为队列是按计数阈值播下的。请在部署前为 `[tasks.profile_rebuild]` 定好规格：抽取已关闭且没有 `[tasks.profile_rebuild]` 块时，排空会跑在全局默认模型上。`PROFILE_REBUILD_DISABLED=1` 可以阻止排空运行，而抽取关闭时再没有别的东西会触发重建。
 - **领域重分类归部署负责。** 回填的行保留旧的 `sexuality` 与 `health` 领域；拆出 `kink` 与 `mental_health` 只作用于新事实。引擎不带重分类器：想把旧行拆开的运维方，自己跑一遍离线流程去更新 `engine.human_facts.domain`，除 `UPDATE` 权限外不需要别的。重新打标签不会排队重建；更正后的领域会在该用户下一次重建时被读到。要手动排一次，把该用户 `human_profile_state` 行的 `pending_facts` 设为大于 0，并把 `last_fact_at` 设成早于闲置时长。
 - **镜像画像、记忆或事实的部署必须消费两条删除流**，并且在删除用户的 session 之前先调用抹除。
+- **升级到事实分组时，已有账本会整体算一次向量来放置。** 迁移 `0090` 之后，每一条已有的行都未放置、自成一组；清扫器从旧到新一批接一批地放置。4 万行短事实的账本大约要 80 次 embedding 调用、约 60 万 token。一行放置之前，它都作为自成一组列出。
+- **换写入用的 embedding 模型就要重新分组。** 不同模型的向量不能互相比较。要用新模型从头重新分组，执行 `UPDATE engine.human_facts SET embedding = NULL, group_id = gen_random_uuid();`，让清扫器重新放置所有行。组 id 会变，手里拿着旧 id 的客户端会得到 `404`。
 
 ## 已知限制
 
-- 账本把改写后的说法保留为不同的行。计数以抽取运行为单位，而一轮产出多条助手消息时，会针对同一条用户消息按每条消息各跑一次抽取，所以一句话可能被计多次、读成 `repeated_in_session`。
+- 一个事实分组里可能有相差一个细节的事实（在实测阈值下约九对里有一对），删除一组会删掉每个成员；分组列表会先把它们都列出来。
+- 与组里某个后来成员相近、但与首条事实不够相近的说法，会自成一组。
+- 新事实在下一次清扫之前自成一组。
+- 一条插入如果在同一用户更晚的事实已被放置之后才提交，可能成为所在组的首条事实，让之后的一条事实经由它加入。
+- 删除一组时，若同一瞬间有一次抽取运行同时更新这组里的两条事实，可能死锁；PostgreSQL 会中止其中一方，于是要么删除失败，要么那次运行的事实没有记下。
+- 单独删掉一组最早的那条事实，会让这一组在从新到旧的顺序里挪位置，正好在那时翻页可能跳过或重复这一组。
+- 多个实例都开着事实分组清扫器时，可能各自为队列最前面的行算向量：分组结果相同，embedding 的花费不同。
+- 计数以抽取运行为单位，而一轮产出多条助手消息时，会针对同一条用户消息按每条消息各跑一次抽取，所以一句话可能被计多次、读成 `repeated_in_session`。
 - `session_count` 在事实于两个 session 之间交替出现时可能多计。
 - 一条事实始终保留首次出现时的标签，即使之后的出现会给它打别的标签。
 - 画像的新鲜度等于它上一次重建：最后一条新事实之后，最长可滞后一个闲置时长。

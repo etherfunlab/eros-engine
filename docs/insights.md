@@ -2,7 +2,7 @@
 
 [English](insights.md) · [中文](insights.zh.md)
 
-The insights pipeline builds what the engine knows about the real user from conversation, in two layers. A **fact ledger** (`engine.human_facts`) records atomic facts the extraction call mines from each turn, one row per distinct fact with recurrence counters. A **profile** (`engine.human_insights`, one row per user) is derived from the ledger on a schedule, not per turn; the chat prompt, the voice opener, the profile route and the profile export read it. Every LLM call leaves an audit row in `engine.human_insights_events`. The owner can delete one fact or one extracted memory at a time, a user's data can be erased in one call, and exports carry both kinds of deletion to downstream mirrors.
+The insights pipeline builds what the engine knows about the real user from conversation, in two layers. A **fact ledger** (`engine.human_facts`) records atomic facts the extraction call mines from each turn, one row per distinct fact with recurrence counters; **fact groups** gather the rows that say the same thing in other words. A **profile** (`engine.human_insights`, one row per user) is derived from the ledger on a schedule, not per turn; the chat prompt, the voice opener, the profile route and the profile export read it. Every LLM call leaves an audit row in `engine.human_insights_events`. The owner can delete one fact, one fact group or one extracted memory at a time, a user's data can be erased in one call, and exports carry both kinds of deletion to downstream mirrors.
 
 The per-relationship chains `character_insights` and `user_insights` are separate pipelines with their own tables; see [llm-audit.md](llm-audit.md#character-and-user-insights-experimental). Upgrade steps for deployments coming from v2.3.1 or earlier are in [migrating/v2-4-0-insights-2-0.md](migrating/v2-4-0-insights-2-0.md) and [migrating/v2-4-1-insights-cleanup.md](migrating/v2-4-1-insights-cleanup.md).
 
@@ -13,7 +13,9 @@ user message + assistant message
    │   → {"facts": [{content, category, domain, …}]}      audit row  stage='facts'
    │
    ├─ ledger upsert        engine.human_facts   (exact-match dedup, recurrence counters)
-   │   └─ pending_facts += N      engine.human_profile_state
+   │   ├─ pending_facts += N      engine.human_profile_state
+   │   └─ fact-group sweeper (a minute by default): embed the new rows, put each
+   │        into the group of an earlier fact it restates           group_id
    │
    └─ pending_facts ≥ 20, or untouched for the idle period (sweeper; an hour by default)
         └─ profile_rebuild   user = the whole ledger + the engine-owned schema
@@ -36,8 +38,10 @@ user message + assistant message
 | `first_session_id`, `first_message_id`, `last_session_id`, `last_message_id` | Where the first and latest occurrence came from. Foreign keys, `ON DELETE SET NULL`. |
 | `first_run_id`, `last_run_id` | Correlation ids of the extraction runs (the `run_id` of the audit rows). Not references. |
 | `roleplay`, `content_hash` | Generated: `evidence_type = 'roleplay_expression'`, and `md5(engine.fact_norm(content))`. |
+| `group_id` | The row's [fact group](#fact-groups). Every row starts as a group of its own. No foreign key: a group is the set of rows sharing the id. |
+| `embedding` | The fact's vector, `NULL` until the fact-group sweeper places the row. |
 
-**Dedup.** A fact is the same fact when the user, the evidence class and the normalized text match: a unique index on `(user_id, roleplay, content_hash)`. `engine.fact_norm` applies NFKC, lower-cases, and removes whitespace and punctuation (ASCII and the common CJK marks). Dedup is exact-match only, with no embedding or paraphrase merging, so a negated, hedged, conditional or reworded variant is its own row. `roleplay_expression` facts never merge with any other evidence type.
+**Dedup.** A fact is the same fact when the user, the evidence class and the normalized text match: a unique index on `(user_id, roleplay, content_hash)`. `engine.fact_norm` applies NFKC, lower-cases, and removes whitespace and punctuation (ASCII and the common CJK marks). Dedup is exact-match only, with no embedding or paraphrase merging, so a negated, hedged, conditional or reworded variant is its own row. `roleplay_expression` facts never merge with any other evidence type. Rewordings are put in one [fact group](#fact-groups) instead, which merges nothing.
 
 **One occurrence is one extraction run** that emitted the fact. A 1:1 turn that produces several assistant messages makes one run per message; a group turn makes one run. Duplicates inside a single run's array count once, the first of them winning.
 
@@ -52,6 +56,24 @@ user message + assistant message
 | `repeated_across_sessions` | `session_count > 1` |
 
 The tier is used alongside the `persistence` label, never instead of it: `persistence` separates "on the subway right now" from a durable trait, which the counters cannot.
+
+## Fact groups
+
+A fact group is a user's ledger rows that state the same thing in other words: "用户喜欢爬山" and "用户很喜欢爬山" are two rows in one group. Rows are never merged or rewritten; the group is a view over them, for listing and deleting what the engine knows about a user one fact at a time instead of one wording at a time. Real facts and roleplay expressions never share a group.
+
+**Placement.** A new row starts as a group of its own, with no vector. A sweeper in `serve` places the rows: every `FACT_GROUPING_TICK_SECS` (60 by default) it takes the oldest unplaced rows, `FACT_GROUPING_BATCH` at a time (500 by default), embeds them in one call with the [write embedder](model-config.md#tasksembedding--active), and places each in turn:
+
+- Each group's **first fact** is its earliest member. Among the same user's placed rows of the same evidence class (roleplay or not), the sweeper finds the first fact nearest to the new row.
+- If their cosine similarity is at least `FACT_GROUPING_THRESHOLD`, the row joins that group. Otherwise it stays a group of its own and becomes the first fact of that group.
+- A row is compared with first facts only, never with later members, so a group cannot grow by a chain of near neighbours: every member is within the threshold of the group's first fact.
+
+A full batch starts the next one at once, so a backlog drains in minutes; a batch in which a placement failed, or that placed nothing, waits for the next tick. A failed placement also holds back the same user's later rows until then, so each user's rows are always placed oldest first. Rows already in the ledger when grouping arrived go through the same queue.
+
+**The threshold.** `0.96`, the default, is the measured bar for voyage-4-lite, the engine's default write model. Measured on a production deployment's ledger, voyage-4-large reaches the same quality at `0.94`: there it caught every pair two independent judges both called a duplicate, while about one in nine of the pairs it joins differ in a detail (one side says more), and no threshold separates those pairs from true paraphrases. At `0.96`, voyage-4-large joins half as many such pairs and misses about one duplicate in twenty. Other models are unmeasured.
+
+**What a group shows.** The representative is the member seen most often, ties going to the earliest. `occurrences` and `session_count` are sums over the members, so a run or a session that saw two of them counts twice; `recurrence` is derived from the sums; `first_seen_at` is the earliest member's, `last_seen_at` the latest's.
+
+**What uses groups.** Only the owner's [group routes](#deleting-one-fact-or-memory) and the `group_id` on the owner's fact list. The derived profile reads rows, the facts export carries no `group_id` (a row is placed after it first appears in that stream, and placement does not move `last_seen_at`), and erasure removes rows with their vectors as before.
 
 ## Fact extraction
 
@@ -276,9 +298,14 @@ The owner can list and delete their ledger facts and their extracted profile mem
 - `GET /v2/comp/user/{user_id}/facts` and `GET /v2/comp/user/{user_id}/memories` list the rows that `facts/changes` and `memories/changes` export, newest first by `first_seen_at` and `created_at`.
 - `DELETE /v2/comp/user/{user_id}/facts/{fact_id}` and `DELETE /v2/comp/user/{user_id}/memories/{memory_id}` delete one row: `204`, or `404` for an id that is not such a row of this user, a repeat included.
 
-Shapes are in [api-reference.md](api-reference.md#get-v2compuseruser_idfacts). Each delete runs in one transaction that removes the row and writes its tombstone to `engine.row_deletions` (`kind`, the row's old `id`, `deleted_at`; no `user_id`, and erasure leaves the table alone). The same statement extracted again later is a new row with a new id.
+Two more list and delete [fact groups](#fact-groups):
 
-A fact deletion also hands the profile to the next rebuild, without calling the model itself. In the same transaction, before the ledger row goes, it upserts the user's `human_profile_state` row: `claimed_at` cleared, so a rebuild in flight that read the old ledger [writes nothing](#state-and-triggers); `pending_facts` up by one; `last_fact_at = now`; `rebuild_failures = 0`; `rebuild_due = true`. The sweeper rebuilds the user on its next tick (every five minutes by default), and several deletes before that tick cost one rebuild. If what is left supports no profile, the rebuild [clears it](#outcomes).
+- `GET /v2/comp/user/{user_id}/fact-groups` lists one item per group, with the rows behind it, newest first by the group's earliest fact. A row not placed yet is a group of its own.
+- `DELETE /v2/comp/user/{user_id}/fact-groups/{group_id}` deletes every row in the group as the call runs, including a row placed into it after the listing was read: `204`, or `404` when no fact of this user has that group id. A one-row group whose fact has since joined another group no longer exists, so its delete is a `404`; reload the list to find the fact in its new group.
+
+Shapes are in [api-reference.md](api-reference.md#get-v2compuseruser_idfacts). Each delete runs in one transaction that removes the rows and writes one tombstone per row to `engine.row_deletions` (`kind`, the row's old `id`, `deleted_at`; no `user_id`, and erasure leaves the table alone), so a group delete reaches mirrors as one `fact` tombstone per member. A fact delete and a group delete take the user's fact-group lock first, so no row is placed into a group while it is being deleted. The same statement extracted again later is a new row with a new id.
+
+A fact or group deletion also hands the profile to the next rebuild, without calling the model itself. In the same transaction, before the ledger row goes, it upserts the user's `human_profile_state` row: `claimed_at` cleared, so a rebuild in flight that read the old ledger [writes nothing](#state-and-triggers); `pending_facts` up by one; `last_fact_at = now`; `rebuild_failures = 0`; `rebuild_due = true`. The sweeper rebuilds the user on its next tick (every five minutes by default), and several deletes before that tick cost one rebuild. If what is left supports no profile, the rebuild [clears it](#outcomes).
 
 Deleting a memory needs nothing more: recall reads the table, and nothing is derived from it.
 
@@ -384,6 +411,10 @@ See [llm-audit.md](llm-audit.md#llm-generations-ledger). Payloads hold extracted
 | `PROFILE_REBUILD_TICK_SECS` | `300` | Sweeper interval. `0` also stops the sweeper; an unparseable value keeps the default. |
 | `PROFILE_REBUILD_IDLE_SECS` | `3600` | How long a user's last new fact must have sat before the sweeper rebuilds. |
 | `PROFILE_REBUILD_BATCH` | `20` | Users rebuilt per tick, at least 1. |
+| `FACT_GROUPING_DISABLED` | unset | `1` or `true` stops the [fact-group](#fact-groups) sweeper. Nothing is placed, and every row lists as a group of its own. |
+| `FACT_GROUPING_TICK_SECS` | `60` | Sweeper interval. `0` also stops it; an unparseable value keeps the default. |
+| `FACT_GROUPING_BATCH` | `500` | Rows per batch and per embedding call, clamped to 1..=1000. Set it at or under the cap of an embedding backend that takes fewer inputs per request, or every batch fails. |
+| `FACT_GROUPING_THRESHOLD` | `0.96` | Cosine similarity a row needs to its group's first fact to join it. A value outside (0, 1] keeps the default. `0.94` for a deployment that writes with voyage-4-large. |
 | `INSIGHTS_EXPORT_SECRET`, `FACTS_EXPORT_SECRET`, `USER_ERASE_SECRET`, `GENOME_WRITE_SECRET` | unset | Mount their sub-trees, [above](#exports-and-deletions). |
 | `SNAPSHOT_DISABLED`, `SNAPSHOT_CRON`, `SNAPSHOT_TZ` | | The daily snapshot. |
 
@@ -395,10 +426,19 @@ The count (20) and the 600-second claim staleness are constants, not settings. S
 - **The rebuild drain costs one LLM call per queued user**, so expect `pending` calls after the deploy, drained by the idle sweeper at `PROFILE_REBUILD_BATCH` users per `PROFILE_REBUILD_TICK_SECS`. Until a user's first rebuild their previous profile row keeps serving injection. With the sweeper off, each queued user is rebuilt at their next extraction run, since the queue is seeded at the count threshold. Size `[tasks.profile_rebuild]` before the deploy: with extraction turned off and no `[tasks.profile_rebuild]` block, the drain runs on the global default model. `PROFILE_REBUILD_DISABLED=1` keeps the drain from running, and with extraction off nothing else triggers a rebuild.
 - **Domain reclassification is the deployment's.** Backfilled rows keep the old `sexuality` and `health` domains; the split into `kink` and `mental_health` applies to new facts. The engine ships no reclassifier: an operator who wants old rows split runs an offline pass that updates `engine.human_facts.domain`, which needs nothing beyond `UPDATE` access. A relabel does not queue a rebuild; the corrected domains are read at the user's next rebuild. To queue one by hand, set `pending_facts` above 0 and `last_fact_at` older than the idle period on the user's `human_profile_state` row.
 - **A deployment that mirrors profiles, memories or facts must consume both deletion streams**, and call erase before deleting a user's sessions.
+- **The upgrade to fact groups places the existing ledger by embedding it once.** After migration `0090` every existing row is unplaced and a group of its own; the sweeper places them oldest first, batch after batch. A ledger of 40,000 short rows takes about 80 embedding calls and roughly 0.6M tokens. Until a row is placed, it lists as a group of its own.
+- **Changing the write embedding model means regrouping.** Vectors from another model are not comparable. To regroup every fact from scratch with the new model, run `UPDATE engine.human_facts SET embedding = NULL, group_id = gen_random_uuid();` and let the sweeper place the rows again. Group ids change, so a client holding an old one gets `404`.
 
 ## Known limits
 
-- The ledger keeps paraphrases as separate rows. Counts are per extraction run, and a turn that produces several assistant messages runs extraction once per message over the same user message, so one statement can count more than once and read as `repeated_in_session`.
+- Counts are per extraction run, and a turn that produces several assistant messages runs extraction once per message over the same user message, so one statement can count more than once and read as `repeated_in_session`.
+- A fact group can hold facts that differ in a detail (about one pair in nine at the measured thresholds), and a group delete removes every member; the group list shows them first.
+- A rewording close to a later member of a group but not to its first fact starts a group of its own.
+- A new fact is a group of its own until the next sweep.
+- An insert that commits after a younger fact of the same user was already placed can become its group's first fact, letting one later fact join through it.
+- A group delete and an extraction run that bumps two of that group's facts at the same instant can deadlock; PostgreSQL aborts one, so either the delete fails or that run's facts are not recorded.
+- Deleting a group's earliest fact alone moves the group in the newest-first order, so a page walk at that moment can skip or repeat it.
+- Several instances with the fact-group sweeper on can each embed the front of the queue: the groups come out the same, the embedding spend does not.
 - `session_count` can overcount a fact that alternates between two sessions.
 - A fact keeps the first occurrence's labels even when a later occurrence would label it differently.
 - The profile is as fresh as its last rebuild: after the last new fact, up to the idle period.

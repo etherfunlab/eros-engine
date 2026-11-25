@@ -2455,14 +2455,48 @@ The user's ledger facts ([Insights](insights.md#the-fact-ledger)), newest first,
       "session_count": 2,
       "recurrence": "repeated_across_sessions",
       "first_seen_at": "2026-10-13T12:00:00.123456Z",
-      "last_seen_at": "2026-10-20T09:30:00.654321Z"
+      "last_seen_at": "2026-10-20T09:30:00.654321Z",
+      "group_id": "9d41…"
     }
   ],
   "next": { "first_seen_at": "2026-10-13T12:00:00.123456Z", "id": "5b7e…" }
 }
 ```
 
-A row has the fields of [`GET /svc/v1/facts/changes`](#get-svcv1factschanges) without `user_id`. Rows are ordered by `(first_seen_at, id)` descending; `first_seen_at` never changes, so a walk neither repeats nor skips a row that exists throughout it. `next` is present iff the page is full; pass both fields back verbatim as `before` and `before_id`, at full microsecond precision, until `next` is `null`. Sending one of `before` and `before_id` without the other is `400 bad_request`.
+A row has the fields of [`GET /svc/v1/facts/changes`](#get-svcv1factschanges) without `user_id`, plus `group_id`, the row's [fact group](insights.md#fact-groups). A row not placed yet is a group of its own, and its `group_id` changes if it later joins another group. Rows are ordered by `(first_seen_at, id)` descending; `first_seen_at` never changes, so a walk neither repeats nor skips a row that exists throughout it. `next` is present iff the page is full; pass both fields back verbatim as `before` and `before_id`, at full microsecond precision, until `next` is `null`. Sending one of `before` and `before_id` without the other is `400 bad_request`.
+
+### `GET /v2/comp/user/{user_id}/fact-groups`
+
+The user's ledger facts as [fact groups](insights.md#fact-groups): one item per group of facts that state the same thing, with the facts behind it, so a client can show each fact once. Same query parameters and `user_id` equality check as the facts list.
+
+```json
+{
+  "groups": [
+    {
+      "group_id": "9d41…",
+      "content": "用户养了一只猫",
+      "roleplay": false,
+      "occurrences": 4,
+      "session_count": 3,
+      "recurrence": "repeated_across_sessions",
+      "first_seen_at": "2026-10-13T12:00:00.123456Z",
+      "last_seen_at": "2026-10-22T18:05:00.000001Z",
+      "facts": [
+        { "id": "5b7e…", "content": "用户养了一只猫", "occurrences": 3, "group_id": "9d41…", "…": "…" },
+        { "id": "a210…", "content": "用户家里有只猫", "occurrences": 1, "group_id": "9d41…", "…": "…" }
+      ]
+    }
+  ],
+  "next": { "first_seen_at": "2026-10-13T12:00:00.123456Z", "group_id": "9d41…" }
+}
+```
+
+- `facts` holds every member as the facts list returns it, the representative first: the member seen most often, ties going to the earliest. `content` is the representative's.
+- `occurrences` and `session_count` are sums over the members, and `recurrence` is derived from the sums. `first_seen_at` is the earliest member's, `last_seen_at` the latest's.
+- `roleplay` is true for a group of roleplay expressions; a group never mixes them with real facts.
+- A fact the sweeper has not placed yet is a group of its own.
+
+Groups are ordered by `(first_seen_at, group_id)` descending. `next` is present iff the page is full; pass `next.first_seen_at` back as `before` and `next.group_id` as `before_id`. A group whose earliest fact is deleted alone moves in that order, so a walk at that moment can skip or repeat it.
 
 ### `GET /v2/comp/user/{user_id}/memories`
 
@@ -2488,6 +2522,12 @@ The user's extracted profile-layer memories: the rows [`GET /svc/v1/memories/cha
 Delete one ledger fact. `204` when it went; `404 not_found` when no such fact belongs to the user (an unknown id, another user's fact, or one already deleted, so a repeat is `404`). Same `user_id` equality check as above.
 
 The delete writes a tombstone to [`GET /svc/v1/rows/deletions`](#get-svcv1rowsdeletions) and marks the user's profile due: the next profile-rebuild sweep (every five minutes by default) rebuilds it without the fact, and clears it when what is left supports no profile. The fact's wording stays in the extraction audit and the daily snapshots until the user is erased. If the same statement is extracted again later, it comes back as a new row with a new id. See [Insights → Deleting one fact or memory](insights.md#deleting-one-fact-or-memory).
+
+### `DELETE /v2/comp/user/{user_id}/fact-groups/{group_id}`
+
+Delete a fact group: every fact in it as the call runs, including one placed into it after the client read the list. `204` when it went; `404 not_found` when no fact of this user has that group id (an unknown id, another user's group, one already deleted, or a one-fact group whose fact has since joined another group: reload the list to find it there). Same `user_id` equality check as above.
+
+Each deleted fact gets its own `fact` tombstone on [`GET /svc/v1/rows/deletions`](#get-svcv1rowsdeletions), and the profile is marked due once, as for a single fact delete. See [Insights → Deleting one fact or memory](insights.md#deleting-one-fact-or-memory).
 
 ### `DELETE /v2/comp/user/{user_id}/memories/{memory_id}`
 
