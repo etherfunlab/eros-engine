@@ -151,6 +151,18 @@ pub enum Recurrence {
 }
 
 impl Recurrence {
+    /// The tier of a fact (or a group) seen `occurrences` times in
+    /// `session_count` sessions.
+    pub fn from_counts(occurrences: i32, session_count: i32) -> Recurrence {
+        if session_count >= 2 {
+            Recurrence::RepeatedAcrossSessions
+        } else if occurrences >= 2 {
+            Recurrence::RepeatedInSession
+        } else {
+            Recurrence::Once
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Recurrence::Once => "once",
@@ -162,14 +174,72 @@ impl Recurrence {
 
 impl HumanFactRow {
     pub fn recurrence(&self) -> Recurrence {
-        if self.session_count >= 2 {
-            Recurrence::RepeatedAcrossSessions
-        } else if self.occurrences >= 2 {
-            Recurrence::RepeatedInSession
-        } else {
-            Recurrence::Once
-        }
+        Recurrence::from_counts(self.occurrences, self.session_count)
     }
+}
+
+/// One fact group of a user: the rows sharing a `group_id`, representative
+/// first. Every group attribute is derived from the rows here; none is
+/// stored.
+#[derive(Debug, Clone)]
+pub struct FactGroup {
+    pub group_id: Uuid,
+    /// Non-empty. Ordered by occurrences (most first), then `first_seen_at`,
+    /// then `id`, so `facts[0]` is the representative.
+    pub facts: Vec<HumanFactRow>,
+}
+
+impl FactGroup {
+    /// Every member shares it: placement never crosses the realm.
+    pub fn roleplay(&self) -> bool {
+        self.facts[0].evidence_type == "roleplay_expression"
+    }
+
+    /// Summed over members, so a run that emitted two members counts twice.
+    pub fn occurrences(&self) -> i32 {
+        self.facts.iter().map(|f| f.occurrences).sum()
+    }
+
+    /// Summed over members, so a session that saw two members counts twice.
+    pub fn session_count(&self) -> i32 {
+        self.facts.iter().map(|f| f.session_count).sum()
+    }
+
+    pub fn recurrence(&self) -> Recurrence {
+        Recurrence::from_counts(self.occurrences(), self.session_count())
+    }
+
+    pub fn first_seen_at(&self) -> DateTime<Utc> {
+        self.facts.iter().map(|f| f.first_seen_at).min().expect("non-empty")
+    }
+
+    pub fn last_seen_at(&self) -> DateTime<Utc> {
+        self.facts.iter().map(|f| f.last_seen_at).max().expect("non-empty")
+    }
+}
+
+/// Hand the user's profile to the next rebuild after a deletion (spec
+/// 2026-11-10-row-deletion §5.2): the state row is upserted so it exists and
+/// is locked, any in-flight rebuild loses its claim, and the profile is due.
+async fn mark_profile_due(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO engine.human_profile_state \
+            (user_id, pending_facts, last_fact_at, rebuild_due) \
+         VALUES ($1, 1, now(), true) \
+         ON CONFLICT (user_id) DO UPDATE SET \
+            claimed_at = NULL, \
+            pending_facts = human_profile_state.pending_facts + 1, \
+            last_fact_at = now(), \
+            rebuild_failures = 0, \
+            rebuild_due = true",
+    )
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// A ledger row the fact-group sweeper has not placed yet (`embedding IS NULL`).
@@ -432,20 +502,7 @@ impl HumanFactRepo<'_> {
     /// fact; nothing is written then.
     pub async fn delete_owned(&self, user_id: Uuid, fact_id: Uuid) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO engine.human_profile_state \
-                (user_id, pending_facts, last_fact_at, rebuild_due) \
-             VALUES ($1, 1, now(), true) \
-             ON CONFLICT (user_id) DO UPDATE SET \
-                claimed_at = NULL, \
-                pending_facts = human_profile_state.pending_facts + 1, \
-                last_fact_at = now(), \
-                rebuild_failures = 0, \
-                rebuild_due = true",
-        )
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
+        mark_profile_due(&mut tx, user_id).await?;
         let deleted = sqlx::query("DELETE FROM engine.human_facts WHERE id = $1 AND user_id = $2")
             .bind(fact_id)
             .bind(user_id)
@@ -460,6 +517,94 @@ impl HumanFactRepo<'_> {
             &mut tx,
             crate::row_deletion::KIND_FACT,
             fact_id,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// The user's fact groups (spec 2026-11-25-fact-groups §5.4), newest
+    /// first by the group's `first_seen_at` (its earliest member's), then
+    /// `group_id` descending, strictly before the `before` keyset tuple
+    /// `(group first_seen_at, group_id)` when given, at most `limit` groups.
+    /// An unplaced row is a one-row group.
+    pub async fn list_groups_owned(
+        &self,
+        user_id: Uuid,
+        before: Option<(DateTime<Utc>, Uuid)>,
+        limit: i64,
+    ) -> Result<Vec<FactGroup>, sqlx::Error> {
+        let (at, id) = before.unzip();
+        let group_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT group_id FROM ( \
+                 SELECT group_id, min(first_seen_at) AS first_seen_at \
+                 FROM engine.human_facts WHERE user_id = $1 GROUP BY group_id \
+             ) AS g \
+             WHERE $2::timestamptz IS NULL OR (first_seen_at, group_id) < ($2, $3) \
+             ORDER BY first_seen_at DESC, group_id DESC \
+             LIMIT $4",
+        )
+        .bind(user_id)
+        .bind(at)
+        .bind(id)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        let rows = sqlx::query_as::<_, HumanFactRow>(&format!(
+            "SELECT {COLUMNS} FROM engine.human_facts \
+             WHERE user_id = $1 AND group_id = ANY($2) \
+             ORDER BY occurrences DESC, first_seen_at, id"
+        ))
+        .bind(user_id)
+        .bind(&group_ids)
+        .fetch_all(self.pool)
+        .await?;
+        let mut groups: Vec<FactGroup> = group_ids
+            .into_iter()
+            .map(|group_id| FactGroup {
+                group_id,
+                facts: Vec::new(),
+            })
+            .collect();
+        for row in rows {
+            if let Some(g) = groups.iter_mut().find(|g| g.group_id == row.group_id) {
+                g.facts.push(row);
+            }
+        }
+        // A group deleted between the two reads has no rows left.
+        groups.retain(|g| !g.facts.is_empty());
+        Ok(groups)
+    }
+
+    /// Delete one of the user's fact groups as it stands (spec
+    /// 2026-11-25-fact-groups §5.5). One transaction: the user's group lock
+    /// first, so no row joins the group mid-delete; then the profile state,
+    /// as the single-fact delete marks it; then the rows; then one tombstone
+    /// per row. `false` when no fact of this user has that group id; nothing
+    /// is written then.
+    pub async fn delete_group_owned(
+        &self,
+        user_id: Uuid,
+        group_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_user_groups(&mut tx, user_id).await?;
+        mark_profile_due(&mut tx, user_id).await?;
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "DELETE FROM engine.human_facts WHERE user_id = $1 AND group_id = $2 RETURNING id",
+        )
+        .bind(user_id)
+        .bind(group_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if ids.is_empty() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        crate::row_deletion::RowDeletionRepo::insert_many_in_tx(
+            &mut tx,
+            crate::row_deletion::KIND_FACT,
+            &ids,
         )
         .await?;
         tx.commit().await?;
@@ -1313,5 +1458,157 @@ mod tests {
         // cos 8° = 0.990 to B, now the group's first fact; cos 18° = 0.951 to A.
         assert_eq!(repo.place(&c, &unit(18.0), T).await.unwrap(), Placement::Joined);
         assert_eq!(group_of(&pool, c.id).await, group_of(&pool, b.id).await);
+    }
+
+    /// Put `ids` into one group and return its id.
+    async fn group_up(pool: &PgPool, ids: &[Uuid]) -> Uuid {
+        let group = Uuid::new_v4();
+        sqlx::query("UPDATE engine.human_facts SET group_id = $2 WHERE id = ANY($1)")
+            .bind(ids)
+            .bind(group)
+            .execute(pool)
+            .await
+            .unwrap();
+        group
+    }
+
+    async fn set_counts(pool: &PgPool, id: Uuid, occurrences: i32, sessions: i32) {
+        sqlx::query(
+            "UPDATE engine.human_facts SET occurrences = $2, session_count = $3 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(occurrences)
+        .bind(sessions)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_groups_derives_representative_and_counters(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        let a = seed_unplaced(&pool, user, "a", "explicit_statement", h(1)).await;
+        let b = seed_unplaced(&pool, user, "b", "explicit_statement", h(2)).await;
+        let c = seed_unplaced(&pool, user, "c", "explicit_statement", h(3)).await;
+        let d = seed_unplaced(&pool, user, "d", "explicit_statement", h(4)).await;
+        set_counts(&pool, b.id, 3, 2).await;
+        set_counts(&pool, c.id, 3, 1).await;
+        sqlx::query("UPDATE engine.human_facts SET last_seen_at = $2 WHERE id = $1")
+            .bind(c.id)
+            .bind(h(9))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let group = group_up(&pool, &[a.id, b.id, c.id]).await;
+
+        let groups = repo.list_groups_owned(user, None, 10).await.unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].facts.iter().map(|f| f.id).collect::<Vec<_>>(), vec![d.id]);
+        let g = &groups[1];
+        assert_eq!(g.group_id, group);
+        assert_eq!(
+            g.facts.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![b.id, c.id, a.id],
+            "most occurrences first, ties to the earliest"
+        );
+        assert_eq!(g.occurrences(), 7);
+        assert_eq!(g.session_count(), 4);
+        assert_eq!(g.recurrence(), Recurrence::RepeatedAcrossSessions);
+        assert_eq!(g.first_seen_at(), h(1));
+        assert_eq!(g.last_seen_at(), h(9));
+        assert!(!g.roleplay());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_groups_shows_unplaced_rows_alone(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        seed_unplaced(&pool, user, "用户是医生", "roleplay_expression", h(1)).await;
+        seed_unplaced(&pool, user, "用户是医生啊", "roleplay_expression", h(2)).await;
+        let groups = repo.list_groups_owned(user, None, 10).await.unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|g| g.facts.len() == 1 && g.roleplay()));
+        assert_eq!(groups[0].recurrence(), Recurrence::Once);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_groups_pages_ties_by_group_id(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let user = Uuid::new_v4();
+        for content in ["a", "b", "c"] {
+            seed_unplaced(&pool, user, content, "explicit_statement", h(1)).await;
+        }
+        let first = repo.list_groups_owned(user, None, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        let last = first.last().unwrap();
+        let rest = repo
+            .list_groups_owned(user, Some((last.first_seen_at(), last.group_id)), 2)
+            .await
+            .unwrap();
+        assert_eq!(rest.len(), 1);
+        let mut seen: Vec<Uuid> = first.iter().chain(&rest).map(|g| g.group_id).collect();
+        assert!(seen.windows(2).all(|w| w[0] > w[1]), "group_id descending");
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "each group once");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn list_groups_is_owner_scoped(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let (user, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let mine = seed_unplaced(&pool, user, "a", "explicit_statement", h(1)).await;
+        let theirs = seed_unplaced(&pool, other, "b", "explicit_statement", h(2)).await;
+        // Even a shared group id never shows another user's row.
+        group_up(&pool, &[mine.id, theirs.id]).await;
+        let groups = repo.list_groups_owned(user, None, 10).await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].facts.iter().map(|f| f.id).collect::<Vec<_>>(), vec![mine.id]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_group_removes_members_tombstones_each_and_marks_due(pool: PgPool) {
+        let repo = HumanFactRepo { pool: &pool };
+        let (user, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let a = seed_unplaced(&pool, user, "a", "explicit_statement", h(1)).await;
+        let b = seed_unplaced(&pool, user, "b", "explicit_statement", h(2)).await;
+        let c = seed_unplaced(&pool, user, "c", "explicit_statement", h(3)).await;
+        let kept = seed_unplaced(&pool, user, "d", "explicit_statement", h(4)).await;
+        let group = group_up(&pool, &[a.id, b.id, c.id]).await;
+        let states = crate::profile_state::ProfileStateRepo { pool: &pool };
+        states.bump(user, 2).await.unwrap();
+        states
+            .claim(user, std::time::Duration::from_secs(600))
+            .await
+            .unwrap()
+            .expect("an in-flight rebuild");
+
+        assert!(
+            !repo.delete_group_owned(other, group).await.unwrap(),
+            "not the other user's group"
+        );
+        assert!(repo.delete_group_owned(user, group).await.unwrap());
+        assert!(!repo.delete_group_owned(user, group).await.unwrap(), "already gone");
+
+        let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM engine.human_facts")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, vec![kept.id]);
+        let mut tombs: Vec<(String, Uuid)> =
+            sqlx::query_as("SELECT kind, id FROM engine.row_deletions ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let mut expected: Vec<(String, Uuid)> =
+            [a.id, b.id, c.id].iter().map(|id| ("fact".to_string(), *id)).collect();
+        expected.sort_by_key(|(_, id)| *id);
+        tombs.sort_by_key(|(_, id)| *id);
+        assert_eq!(tombs, expected);
+
+        let s = states.load(user).await.unwrap().unwrap();
+        assert_eq!(s.claimed_at, None, "the in-flight rebuild lost its claim");
+        assert_eq!(s.pending_facts, 3, "one deletion, whatever the group's size");
+        assert!(s.rebuild_due);
     }
 }
