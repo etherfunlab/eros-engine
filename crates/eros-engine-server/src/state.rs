@@ -1471,8 +1471,14 @@ mod tests {
             parse_fact_grouping_config(None, None, Some("5000"), None).batch,
             1000
         );
-        assert_eq!(parse_fact_grouping_config(None, None, Some("0"), None).batch, 1);
-        assert_eq!(parse_fact_grouping_config(None, None, Some("x"), None).batch, 500);
+        assert_eq!(
+            parse_fact_grouping_config(None, None, Some("0"), None).batch,
+            1
+        );
+        assert_eq!(
+            parse_fact_grouping_config(None, None, Some("x"), None).batch,
+            500
+        );
         assert_eq!(
             parse_fact_grouping_config(None, None, None, Some("0.94")).threshold,
             0.94

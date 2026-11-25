@@ -210,11 +210,19 @@ impl FactGroup {
     }
 
     pub fn first_seen_at(&self) -> DateTime<Utc> {
-        self.facts.iter().map(|f| f.first_seen_at).min().expect("non-empty")
+        self.facts
+            .iter()
+            .map(|f| f.first_seen_at)
+            .min()
+            .expect("non-empty")
     }
 
     pub fn last_seen_at(&self) -> DateTime<Utc> {
-        self.facts.iter().map(|f| f.last_seen_at).max().expect("non-empty")
+        self.facts
+            .iter()
+            .map(|f| f.last_seen_at)
+            .max()
+            .expect("non-empty")
     }
 }
 
@@ -1320,8 +1328,14 @@ mod tests {
         let user = Uuid::new_v4();
         let a = seed_unplaced(&pool, user, "用户喜欢爬山", "explicit_statement", h(1)).await;
         let b = seed_unplaced(&pool, user, "用户很喜欢爬山", "explicit_statement", h(2)).await;
-        assert_eq!(repo.place(&a, &unit(0.0), T).await.unwrap(), Placement::Alone);
-        assert_eq!(repo.place(&b, &unit(10.0), T).await.unwrap(), Placement::Joined);
+        assert_eq!(
+            repo.place(&a, &unit(0.0), T).await.unwrap(),
+            Placement::Alone
+        );
+        assert_eq!(
+            repo.place(&b, &unit(10.0), T).await.unwrap(),
+            Placement::Joined
+        );
         assert_eq!(group_of(&pool, b.id).await, group_of(&pool, a.id).await);
     }
 
@@ -1332,10 +1346,20 @@ mod tests {
         let a = seed_unplaced(&pool, user, "用户喜欢爬山", "explicit_statement", h(1)).await;
         let b = seed_unplaced(&pool, user, "用户喜欢露营", "explicit_statement", h(2)).await;
         let b_group = group_of(&pool, b.id).await;
-        assert_eq!(repo.place(&a, &unit(0.0), T).await.unwrap(), Placement::Alone);
-        assert_eq!(repo.place(&b, &unit(20.0), T).await.unwrap(), Placement::Alone);
+        assert_eq!(
+            repo.place(&a, &unit(0.0), T).await.unwrap(),
+            Placement::Alone
+        );
+        assert_eq!(
+            repo.place(&b, &unit(20.0), T).await.unwrap(),
+            Placement::Alone
+        );
         assert_ne!(group_of(&pool, b.id).await, group_of(&pool, a.id).await);
-        assert_eq!(group_of(&pool, b.id).await, b_group, "alone keeps its own id");
+        assert_eq!(
+            group_of(&pool, b.id).await,
+            b_group,
+            "alone keeps its own id"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1346,9 +1370,15 @@ mod tests {
         let b = seed_unplaced(&pool, user, "b", "explicit_statement", h(2)).await;
         let c = seed_unplaced(&pool, user, "c", "explicit_statement", h(3)).await;
         repo.place(&a, &unit(0.0), T).await.unwrap();
-        assert_eq!(repo.place(&b, &unit(12.0), T).await.unwrap(), Placement::Joined);
+        assert_eq!(
+            repo.place(&b, &unit(12.0), T).await.unwrap(),
+            Placement::Joined
+        );
         // cos 12° = 0.978 to B, but cos 24° = 0.914 to the group's first fact.
-        assert_eq!(repo.place(&c, &unit(24.0), T).await.unwrap(), Placement::Alone);
+        assert_eq!(
+            repo.place(&c, &unit(24.0), T).await.unwrap(),
+            Placement::Alone
+        );
         assert_ne!(group_of(&pool, c.id).await, group_of(&pool, a.id).await);
     }
 
@@ -1359,17 +1389,37 @@ mod tests {
         let a = seed_unplaced(&pool, user, "用户是医生", "explicit_statement", h(1)).await;
         let b = seed_unplaced(&pool, user, "用户是医生", "roleplay_expression", h(2)).await;
         repo.place(&a, &unit(0.0), T).await.unwrap();
-        assert_eq!(repo.place(&b, &unit(0.0), T).await.unwrap(), Placement::Alone);
+        assert_eq!(
+            repo.place(&b, &unit(0.0), T).await.unwrap(),
+            Placement::Alone
+        );
         assert_ne!(group_of(&pool, b.id).await, group_of(&pool, a.id).await);
     }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn never_joins_across_users(pool: PgPool) {
         let repo = HumanFactRepo { pool: &pool };
-        let a = seed_unplaced(&pool, Uuid::new_v4(), "用户是医生", "explicit_statement", h(1)).await;
-        let b = seed_unplaced(&pool, Uuid::new_v4(), "用户是医生", "explicit_statement", h(2)).await;
+        let a = seed_unplaced(
+            &pool,
+            Uuid::new_v4(),
+            "用户是医生",
+            "explicit_statement",
+            h(1),
+        )
+        .await;
+        let b = seed_unplaced(
+            &pool,
+            Uuid::new_v4(),
+            "用户是医生",
+            "explicit_statement",
+            h(2),
+        )
+        .await;
         repo.place(&a, &unit(0.0), T).await.unwrap();
-        assert_eq!(repo.place(&b, &unit(0.0), T).await.unwrap(), Placement::Alone);
+        assert_eq!(
+            repo.place(&b, &unit(0.0), T).await.unwrap(),
+            Placement::Alone
+        );
         assert_ne!(group_of(&pool, b.id).await, group_of(&pool, a.id).await);
     }
 
@@ -1406,13 +1456,22 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(repo.place(&gone, &unit(0.0), T).await.unwrap(), Placement::Skipped);
+        assert_eq!(
+            repo.place(&gone, &unit(0.0), T).await.unwrap(),
+            Placement::Skipped
+        );
 
         repo.place(&a, &unit(0.0), T).await.unwrap();
         let b_group = group_of(&pool, b.id).await;
-        assert_eq!(repo.place(&b, &unit(45.0), T).await.unwrap(), Placement::Alone);
+        assert_eq!(
+            repo.place(&b, &unit(45.0), T).await.unwrap(),
+            Placement::Alone
+        );
         // A second placement at a vector that would join A changes nothing.
-        assert_eq!(repo.place(&b, &unit(0.0), T).await.unwrap(), Placement::Skipped);
+        assert_eq!(
+            repo.place(&b, &unit(0.0), T).await.unwrap(),
+            Placement::Skipped
+        );
         assert_eq!(group_of(&pool, b.id).await, b_group);
     }
 
@@ -1427,7 +1486,10 @@ mod tests {
             .await
             .unwrap();
         let b = repo.unplaced(10).await.unwrap().remove(0);
-        assert_eq!(repo.place(&b, &unit(10.0), T).await.unwrap(), Placement::Joined);
+        assert_eq!(
+            repo.place(&b, &unit(10.0), T).await.unwrap(),
+            Placement::Joined
+        );
 
         repo.upsert_run(user, &b_fact, &src(None, None, None))
             .await
@@ -1453,10 +1515,16 @@ mod tests {
         let b = seed_unplaced(&pool, user, "b", "explicit_statement", h(2)).await;
         let c = seed_unplaced(&pool, user, "c", "explicit_statement", h(3)).await;
         repo.place(&a, &unit(0.0), T).await.unwrap();
-        assert_eq!(repo.place(&b, &unit(10.0), T).await.unwrap(), Placement::Joined);
+        assert_eq!(
+            repo.place(&b, &unit(10.0), T).await.unwrap(),
+            Placement::Joined
+        );
         assert!(repo.delete_owned(user, a.id).await.unwrap());
         // cos 8° = 0.990 to B, now the group's first fact; cos 18° = 0.951 to A.
-        assert_eq!(repo.place(&c, &unit(18.0), T).await.unwrap(), Placement::Joined);
+        assert_eq!(
+            repo.place(&c, &unit(18.0), T).await.unwrap(),
+            Placement::Joined
+        );
         assert_eq!(group_of(&pool, c.id).await, group_of(&pool, b.id).await);
     }
 
@@ -1504,7 +1572,10 @@ mod tests {
 
         let groups = repo.list_groups_owned(user, None, 10).await.unwrap();
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].facts.iter().map(|f| f.id).collect::<Vec<_>>(), vec![d.id]);
+        assert_eq!(
+            groups[0].facts.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![d.id]
+        );
         let g = &groups[1];
         assert_eq!(g.group_id, group);
         assert_eq!(
@@ -1563,7 +1634,10 @@ mod tests {
         group_up(&pool, &[mine.id, theirs.id]).await;
         let groups = repo.list_groups_owned(user, None, 10).await.unwrap();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].facts.iter().map(|f| f.id).collect::<Vec<_>>(), vec![mine.id]);
+        assert_eq!(
+            groups[0].facts.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![mine.id]
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1588,7 +1662,10 @@ mod tests {
             "not the other user's group"
         );
         assert!(repo.delete_group_owned(user, group).await.unwrap());
-        assert!(!repo.delete_group_owned(user, group).await.unwrap(), "already gone");
+        assert!(
+            !repo.delete_group_owned(user, group).await.unwrap(),
+            "already gone"
+        );
 
         let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM engine.human_facts")
             .fetch_all(&pool)
@@ -1600,15 +1677,20 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        let mut expected: Vec<(String, Uuid)> =
-            [a.id, b.id, c.id].iter().map(|id| ("fact".to_string(), *id)).collect();
+        let mut expected: Vec<(String, Uuid)> = [a.id, b.id, c.id]
+            .iter()
+            .map(|id| ("fact".to_string(), *id))
+            .collect();
         expected.sort_by_key(|(_, id)| *id);
         tombs.sort_by_key(|(_, id)| *id);
         assert_eq!(tombs, expected);
 
         let s = states.load(user).await.unwrap().unwrap();
         assert_eq!(s.claimed_at, None, "the in-flight rebuild lost its claim");
-        assert_eq!(s.pending_facts, 3, "one deletion, whatever the group's size");
+        assert_eq!(
+            s.pending_facts, 3,
+            "one deletion, whatever the group's size"
+        );
         assert!(s.rebuild_due);
     }
 }

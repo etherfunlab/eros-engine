@@ -170,11 +170,13 @@ mod tests {
     }
 
     async fn placement(pool: &PgPool, id: Uuid) -> (Uuid, bool) {
-        sqlx::query_as("SELECT group_id, embedding IS NOT NULL FROM engine.human_facts WHERE id = $1")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        sqlx::query_as(
+            "SELECT group_id, embedding IS NOT NULL FROM engine.human_facts WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
