@@ -503,13 +503,16 @@ impl HumanFactRepo<'_> {
     }
 
     /// Delete one of the user's facts (spec 2026-11-10-row-deletion §3.2,
-    /// §5.2). One transaction, in the lock order user erasure uses: the
-    /// user's profile state row first, upserted so it exists and is locked
-    /// (any in-flight rebuild loses its claim; the profile is marked due),
-    /// then the fact, then its tombstone. `false` when the user has no such
-    /// fact; nothing is written then.
+    /// §5.2). One transaction: the user's fact-group lock first, so a
+    /// placement never joins a group through an anchor this delete removes
+    /// mid-placement; then, in the lock order user erasure uses, the user's
+    /// profile state row, upserted so it exists and is locked (any in-flight
+    /// rebuild loses its claim; the profile is marked due), then the fact,
+    /// then its tombstone. `false` when the user has no such fact; nothing is
+    /// written then.
     pub async fn delete_owned(&self, user_id: Uuid, fact_id: Uuid) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        lock_user_groups(&mut tx, user_id).await?;
         mark_profile_due(&mut tx, user_id).await?;
         let deleted = sqlx::query("DELETE FROM engine.human_facts WHERE id = $1 AND user_id = $2")
             .bind(fact_id)
@@ -1524,6 +1527,25 @@ mod tests {
             Placement::Joined
         );
         assert_eq!(group_of(&pool, c.id).await, group_of(&pool, b.id).await);
+    }
+
+    /// A single-fact delete serialises with placement on the user's group
+    /// lock, so a placement never picks an anchor that is deleted before its
+    /// own write lands.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_owned_waits_for_the_users_group_lock(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let a = seed_unplaced(&pool, user, "a", "explicit_statement", h(1)).await;
+        let mut holder = pool.begin().await.unwrap();
+        lock_user_groups(&mut holder, user).await.unwrap();
+
+        let p = pool.clone();
+        let delete =
+            tokio::spawn(async move { HumanFactRepo { pool: &p }.delete_owned(user, a.id).await });
+        crate::testutil::wait_for_lock_wait(&pool).await;
+        assert!(!delete.is_finished(), "the delete waits for the lock");
+        holder.commit().await.unwrap();
+        assert!(delete.await.unwrap().unwrap());
     }
 
     /// Put `ids` into one group and return its id.

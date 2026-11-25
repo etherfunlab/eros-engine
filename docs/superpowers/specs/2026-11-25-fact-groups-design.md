@@ -150,9 +150,15 @@ A new sweeper in `crates/eros-engine-server/src/pipeline/`, spawned from
    with `upsert_run` bumping several rows. Rows committed earlier in the batch
    are visible to later ones, so two paraphrases arriving in one batch group
    with each other.
-4. Log the tick's counts (placed, joined a group, skipped).
-5. A full batch starts the next one at once instead of waiting for the tick,
-   so a backlog (the existing rows after the migration) drains in minutes.
+   A placement that fails is logged, and the batch goes on without that
+   user's later rows, so a user's facts are always placed oldest first.
+4. Log the tick's counts (joined a group, alone, skipped, failed).
+5. A full batch that placed at least one row and had no failure starts the
+   next one at once instead of waiting for the tick, so a backlog (the
+   existing rows after the migration) drains in minutes. A batch with a
+   failure, or one that placed nothing (another instance is placing those
+   rows), ends the tick, so no failure can make the sweeper embed the same
+   rows again and again.
 
 The batch is the oldest unplaced rows across all users, so it holds every
 unplaced row of a user that is older than that user's newest row in it.
@@ -262,7 +268,9 @@ finds the fact in its new group.
 
 - `upsert_run`: a new row gets a fresh `group_id` by default and no vector; a
   dedup hit keeps the row's group.
-- The single-fact delete. When it removes a group's anchor, the next earliest
+- The single-fact delete, except that it now takes the user's fact-group lock
+  first, so a placement never joins a group through an anchor deleted while
+  it was being placed. When it removes a group's anchor, the next earliest
   member becomes the anchor.
 - Erasure: rows go as before, their vectors with them.
 - The profile rebuild, the facts export, the deletion streams, fact extraction.
@@ -316,6 +324,14 @@ ids change, so a client holding an old one gets 404.
   newest-first order; a page walk at that moment can skip or repeat that
   group.
 - The export does not carry the group id.
+- An insert that commits after a younger fact of the same user was already
+  placed can become its group's earliest member, so one later fact can join
+  through it (one step of chaining, at most).
+- A group delete and an extraction run that bumps two of that group's facts
+  at the same instant can deadlock; PostgreSQL aborts one, so either the
+  delete fails or that run's facts are not recorded.
+- Several instances with the sweeper on can each embed the front of the
+  queue; the result is the same, the embedding spend is not.
 - An embedding error holds back the whole batch until a later tick succeeds.
   A backend that caps inputs per request below `FACT_GROUPING_BATCH` fails
   every batch; set the batch at or under its cap.

@@ -17,15 +17,17 @@ pub(crate) struct PlaceTally {
     pub alone: usize,
     /// Rows gone or placed elsewhere meanwhile.
     pub skipped: usize,
-    /// Rows whose placement failed; they stay unplaced.
+    /// Rows whose placement failed, and the same user's later rows held back
+    /// behind them; all stay unplaced.
     pub failed: usize,
 }
 
 /// Place one batch: the oldest unplaced rows, embedded in one call (none when
 /// there are none), then placed one at a time in order. `Err` when the read
 /// or the embedding call fails; nothing is placed then and the rows wait for
-/// the next batch. A single placement that fails is logged and counted as
-/// failed, and the batch goes on.
+/// the next batch. A placement that fails is logged and counted as failed,
+/// and the batch goes on without that user's later rows, so a user's facts
+/// are always placed oldest first and a group's first fact is its earliest.
 pub(crate) async fn place_batch(state: &AppState) -> Result<PlaceTally, String> {
     let cfg = &state.config.fact_grouping;
     let repo = HumanFactRepo { pool: &state.pool };
@@ -46,7 +48,12 @@ pub(crate) async fn place_batch(state: &AppState) -> Result<PlaceTally, String> 
         .embed_documents(&texts)
         .await
         .map_err(|e| format!("embedding failed: {e}"))?;
+    let mut held_back = std::collections::HashSet::new();
     for (fact, vector) in facts.iter().zip(&vectors) {
+        if held_back.contains(&fact.user_id) {
+            tally.failed += 1;
+            continue;
+        }
         match repo.place(fact, vector, cfg.threshold).await {
             Ok(Placement::Joined) => tally.joined += 1,
             Ok(Placement::Alone) => tally.alone += 1,
@@ -54,23 +61,27 @@ pub(crate) async fn place_batch(state: &AppState) -> Result<PlaceTally, String> 
             Err(e) => {
                 tracing::warn!(fact_id = %fact.id, "fact groups: placing a fact failed: {e}");
                 tally.failed += 1;
+                held_back.insert(fact.user_id);
             }
         }
     }
     Ok(tally)
 }
 
-/// One tick's work: batches back to back while each comes back full, so a
-/// backlog drains without waiting for the tick. A batch with a failed
-/// placement ends the tick: its rows are still unplaced, and the next batch
-/// would embed them again for nothing. Returns the summed tally.
+/// One tick's work: batches back to back while each comes back full and
+/// placed something, so a backlog drains without waiting for the tick. A
+/// batch with a failed placement ends the tick, since its rows are still
+/// unplaced and the next batch would embed them again for nothing; so does
+/// a batch that placed nothing, whose rows another instance is placing.
+/// Returns the summed tally.
 pub(crate) async fn drain(state: &AppState) -> PlaceTally {
     let batch = state.config.fact_grouping.batch;
     let mut total = PlaceTally::default();
     loop {
         match place_batch(state).await {
             Ok(t) => {
-                let go_on = t.read as i64 == batch && t.failed == 0;
+                let placed = t.joined + t.alone;
+                let go_on = t.read as i64 == batch && t.failed == 0 && placed > 0;
                 total.read += t.read;
                 total.joined += t.joined;
                 total.alone += t.alone;
@@ -309,5 +320,75 @@ mod tests {
             .expect("the drain stops after a batch whose placements all failed");
         assert_eq!((total.read, total.failed), (1, 1));
         assert!(!placement(&pool, a).await.1, "still unplaced");
+    }
+
+    /// A batch that placed nothing (here every write is silently dropped, so
+    /// every row comes back skipped and stays in the queue) ends the drain:
+    /// another batch would embed the same rows again.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn drain_stops_after_a_batch_that_placed_nothing(pool: PgPool) {
+        let user = Uuid::new_v4();
+        seed(&pool, user, "用户喜欢爬山", h(1)).await;
+        seed(&pool, user, "用户很喜欢爬山", h(2)).await;
+        sqlx::raw_sql(
+            "CREATE FUNCTION public.drop_fact_update() RETURNS trigger \
+               LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; \
+             CREATE TRIGGER drop_update BEFORE UPDATE ON engine.human_facts \
+               FOR EACH ROW EXECUTE FUNCTION public.drop_fact_update();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let server = one_vector_embedder(1).await;
+        let mut state = state_with(pool.clone(), &server);
+        state.config.fact_grouping.batch = 1;
+
+        let total = tokio::time::timeout(std::time::Duration::from_secs(5), drain(&state))
+            .await
+            .expect("the drain stops after a batch that placed nothing");
+        assert_eq!((total.read, total.skipped), (1, 1));
+    }
+
+    /// A failed placement holds back the same user's later rows in the batch,
+    /// so an older fact is never placed after a younger one of the same user;
+    /// other users' rows go on.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_failed_placement_holds_back_the_users_later_rows(pool: PgPool) {
+        let (user, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let a = seed(&pool, user, "用户喜欢爬山", h(1)).await;
+        let b = seed(&pool, user, "用户很喜欢爬山", h(2)).await;
+        let c = seed(&pool, other, "用户养了一只猫", h(3)).await;
+        sqlx::raw_sql(&format!(
+            "CREATE FUNCTION public.refuse_one() RETURNS trigger LANGUAGE plpgsql AS $$ \
+               BEGIN IF OLD.id = '{a}' THEN RAISE EXCEPTION 'refused'; END IF; \
+               RETURN NEW; END $$; \
+             CREATE TRIGGER refuse_one BEFORE UPDATE ON engine.human_facts \
+               FOR EACH ROW EXECUTE FUNCTION public.refuse_one();"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    { "embedding": unit(0.0), "index": 0 },
+                    { "embedding": unit(5.0), "index": 1 },
+                    { "embedding": unit(90.0), "index": 2 }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let state = state_with(pool.clone(), &server);
+
+        let tally = place_batch(&state).await.unwrap();
+        assert_eq!((tally.read, tally.failed, tally.alone), (3, 2, 1));
+        assert!(!placement(&pool, a).await.1);
+        assert!(
+            !placement(&pool, b).await.1,
+            "held back behind the failed row"
+        );
+        assert!(placement(&pool, c).await.1, "another user goes on");
     }
 }
