@@ -343,6 +343,46 @@ pub(crate) fn parse_profile_rebuild_config(
     }
 }
 
+/// Knobs for the fact-group sweeper, which places new ledger facts into
+/// groups by embedding similarity (spec 2026-11-25-fact-groups §5.3).
+#[derive(Clone, Debug)]
+pub struct FactGroupingConfig {
+    /// Sweep interval; `Duration::ZERO` keeps the sweeper from starting.
+    pub tick: Duration,
+    /// Rows per batch, and per embedding call.
+    pub batch: i64,
+    /// Cosine similarity a fact needs to its group's first fact to join it.
+    pub threshold: f64,
+}
+
+/// Pure parser for the `FACT_GROUPING_*` env vars; unparseable values keep
+/// their defaults. A truthy `FACT_GROUPING_DISABLED` or a zero tick disables
+/// the sweeper; `batch` is clamped to 1..=1000; a threshold outside (0, 1]
+/// keeps the default. `0.96` is the measured bar for voyage-4-lite, the
+/// default write model; `0.94` is the one for voyage-4-large.
+pub(crate) fn parse_fact_grouping_config(
+    disabled: Option<&str>,
+    tick_secs: Option<&str>,
+    batch: Option<&str>,
+    threshold: Option<&str>,
+) -> FactGroupingConfig {
+    FactGroupingConfig {
+        tick: if parse_bool_flag(disabled) {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(tick_secs.and_then(|v| v.parse().ok()).unwrap_or(60))
+        },
+        batch: batch
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(500)
+            .clamp(1, 1000),
+        threshold: threshold
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|t| *t > 0.0 && *t <= 1.0)
+            .unwrap_or(0.96),
+    }
+}
+
 /// Per-user in-flight SSE stream counter. Used by the
 /// `send_message_stream` handler to enforce spec §1.9 (≤3 concurrent
 /// active streams per user, returning HTTP 429 over the cap).
@@ -803,6 +843,8 @@ pub struct ServerConfig {
     pub masters: MasterSecrets,
     /// Profile-rebuild idle-flush sweeper (`PROFILE_REBUILD_*` env vars).
     pub profile_rebuild: ProfileRebuildConfig,
+    /// Fact-group sweeper (`FACT_GROUPING_*` env vars).
+    pub fact_grouping: FactGroupingConfig,
 }
 
 impl ServerConfig {
@@ -943,6 +985,12 @@ impl ServerConfig {
                 std::env::var("PROFILE_REBUILD_TICK_SECS").ok().as_deref(),
                 std::env::var("PROFILE_REBUILD_IDLE_SECS").ok().as_deref(),
                 std::env::var("PROFILE_REBUILD_BATCH").ok().as_deref(),
+            ),
+            fact_grouping: parse_fact_grouping_config(
+                std::env::var("FACT_GROUPING_DISABLED").ok().as_deref(),
+                std::env::var("FACT_GROUPING_TICK_SECS").ok().as_deref(),
+                std::env::var("FACT_GROUPING_BATCH").ok().as_deref(),
+                std::env::var("FACT_GROUPING_THRESHOLD").ok().as_deref(),
             ),
         })
     }
@@ -1398,6 +1446,47 @@ mod tests {
         for raw in ["0", "-3"] {
             let c = parse_profile_rebuild_config(None, None, None, Some(raw));
             assert_eq!(c.batch, 1, "batch {raw} clamps to 1");
+        }
+    }
+
+    #[test]
+    fn parse_fact_grouping_config_defaults_clamps_and_disabled() {
+        let d = parse_fact_grouping_config(None, None, None, None);
+        assert_eq!(
+            (d.tick, d.batch, d.threshold),
+            (Duration::from_secs(60), 500, 0.96)
+        );
+        for flag in ["1", "true"] {
+            let off = parse_fact_grouping_config(Some(flag), Some("30"), None, None);
+            assert!(off.tick.is_zero(), "{flag} disables the sweeper");
+        }
+        assert!(parse_fact_grouping_config(None, Some("0"), None, None)
+            .tick
+            .is_zero());
+        assert_eq!(
+            parse_fact_grouping_config(None, Some("abc"), None, None).tick,
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            parse_fact_grouping_config(None, None, Some("5000"), None).batch,
+            1000
+        );
+        assert_eq!(parse_fact_grouping_config(None, None, Some("0"), None).batch, 1);
+        assert_eq!(parse_fact_grouping_config(None, None, Some("x"), None).batch, 500);
+        assert_eq!(
+            parse_fact_grouping_config(None, None, None, Some("0.94")).threshold,
+            0.94
+        );
+        assert_eq!(
+            parse_fact_grouping_config(None, None, None, Some("1")).threshold,
+            1.0
+        );
+        for bad in ["0", "1.5", "-0.2", "x", "NaN"] {
+            assert_eq!(
+                parse_fact_grouping_config(None, None, None, Some(bad)).threshold,
+                0.96,
+                "{bad} keeps the default"
+            );
         }
     }
 

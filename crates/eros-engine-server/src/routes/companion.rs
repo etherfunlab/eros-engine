@@ -1230,6 +1230,7 @@ pub(crate) fn test_config() -> crate::state::ServerConfig {
         genome_write: crate::state::GenomeWriteConfig::default(),
         masters: crate::state::MasterSecrets::default(),
         profile_rebuild: crate::state::parse_profile_rebuild_config(None, None, None, None),
+        fact_grouping: crate::state::parse_fact_grouping_config(None, None, None, None),
     }
 }
 
