@@ -15,15 +15,17 @@ pub(crate) struct PlaceTally {
     pub read: usize,
     pub joined: usize,
     pub alone: usize,
-    /// Rows gone or placed elsewhere meanwhile, or whose placement failed.
+    /// Rows gone or placed elsewhere meanwhile.
     pub skipped: usize,
+    /// Rows whose placement failed; they stay unplaced.
+    pub failed: usize,
 }
 
 /// Place one batch: the oldest unplaced rows, embedded in one call (none when
 /// there are none), then placed one at a time in order. `Err` when the read
 /// or the embedding call fails; nothing is placed then and the rows wait for
 /// the next batch. A single placement that fails is logged and counted as
-/// skipped, and the batch goes on.
+/// failed, and the batch goes on.
 pub(crate) async fn place_batch(state: &AppState) -> Result<PlaceTally, String> {
     let cfg = &state.config.fact_grouping;
     let repo = HumanFactRepo { pool: &state.pool };
@@ -51,11 +53,39 @@ pub(crate) async fn place_batch(state: &AppState) -> Result<PlaceTally, String> 
             Ok(Placement::Skipped) => tally.skipped += 1,
             Err(e) => {
                 tracing::warn!(fact_id = %fact.id, "fact groups: placing a fact failed: {e}");
-                tally.skipped += 1;
+                tally.failed += 1;
             }
         }
     }
     Ok(tally)
+}
+
+/// One tick's work: batches back to back while each comes back full, so a
+/// backlog drains without waiting for the tick. A batch with a failed
+/// placement ends the tick: its rows are still unplaced, and the next batch
+/// would embed them again for nothing. Returns the summed tally.
+pub(crate) async fn drain(state: &AppState) -> PlaceTally {
+    let batch = state.config.fact_grouping.batch;
+    let mut total = PlaceTally::default();
+    loop {
+        match place_batch(state).await {
+            Ok(t) => {
+                let go_on = t.read as i64 == batch && t.failed == 0;
+                total.read += t.read;
+                total.joined += t.joined;
+                total.alone += t.alone;
+                total.skipped += t.skipped;
+                total.failed += t.failed;
+                if !go_on {
+                    return total;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("fact groups: {e}");
+                return total;
+            }
+        }
+    }
 }
 
 /// Run forever, placing new ledger facts into groups. Spawn once at server
@@ -79,31 +109,14 @@ pub async fn sweeper(state: AppState) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        let mut total = PlaceTally::default();
-        loop {
-            match place_batch(&state).await {
-                Ok(t) => {
-                    let full = t.read as i64 == cfg.batch;
-                    total.read += t.read;
-                    total.joined += t.joined;
-                    total.alone += t.alone;
-                    total.skipped += t.skipped;
-                    if !full {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("fact groups: {e}");
-                    break;
-                }
-            }
-        }
+        let total = drain(&state).await;
         if total.read > 0 {
             tracing::info!(
                 read = total.read,
                 joined = total.joined,
                 alone = total.alone,
                 skipped = total.skipped,
+                failed = total.failed,
                 "fact groups: facts placed"
             );
         }
@@ -204,7 +217,8 @@ mod tests {
                 read: 2,
                 joined: 1,
                 alone: 1,
-                skipped: 0
+                skipped: 0,
+                failed: 0
             }
         );
         let (ga, pa) = placement(&pool, a).await;
@@ -240,5 +254,60 @@ mod tests {
             .await;
         let state = state_with(pool, &server);
         assert_eq!(place_batch(&state).await.unwrap(), PlaceTally::default());
+    }
+
+    /// A mock embedder answering every call with one `unit(0)` vector.
+    async fn one_vector_embedder(calls: u64) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [ { "embedding": unit(0.0), "index": 0 } ]
+            })))
+            .expect(calls)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn drain_runs_full_batches_back_to_back(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let a = seed(&pool, user, "用户喜欢爬山", h(1)).await;
+        let b = seed(&pool, user, "用户很喜欢爬山", h(2)).await;
+        let server = one_vector_embedder(2).await;
+        let mut state = state_with(pool.clone(), &server);
+        state.config.fact_grouping.batch = 1;
+
+        let total = drain(&state).await;
+        assert_eq!((total.read, total.joined, total.alone), (2, 1, 1));
+        assert_eq!(placement(&pool, a).await.0, placement(&pool, b).await.0);
+    }
+
+    /// The database takes reads but refuses writes (a read-only failover, a
+    /// full disk): every placement fails and the rows stay unplaced. The drain
+    /// must stop rather than embed the same full batch again and again.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn drain_stops_when_placements_fail(pool: PgPool) {
+        let user = Uuid::new_v4();
+        let a = seed(&pool, user, "用户喜欢爬山", h(1)).await;
+        seed(&pool, user, "用户很喜欢爬山", h(2)).await;
+        sqlx::raw_sql(
+            "CREATE FUNCTION public.refuse_fact_update() RETURNS trigger \
+               LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'read-only'; END $$; \
+             CREATE TRIGGER refuse BEFORE UPDATE ON engine.human_facts \
+               FOR EACH ROW EXECUTE FUNCTION public.refuse_fact_update();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let server = one_vector_embedder(1).await;
+        let mut state = state_with(pool.clone(), &server);
+        state.config.fact_grouping.batch = 1;
+
+        let total = tokio::time::timeout(std::time::Duration::from_secs(5), drain(&state))
+            .await
+            .expect("the drain stops after a batch whose placements all failed");
+        assert_eq!((total.read, total.failed), (1, 1));
+        assert!(!placement(&pool, a).await.1, "still unplaced");
     }
 }
