@@ -191,6 +191,12 @@ pub enum UserActionKind {
     SwimTogether,
     CycleTogether,
     HikeTogether,
+    DanceTogether,
+    AdventureTogether,
+    PlayWithFireTogether,
+    SingTogether,
+    SkinnyDipTogether,
+    CommitCrimeTogether,
     Challenge,
     Bet,
     Custom,
@@ -341,8 +347,8 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
-/// the line the action touches (`give` and `gift` → bond, every physical or custom action →
-/// chemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `break_up`,
+/// the line the action touches (`give`, `gift` and `commit_crime_together` →
+/// bond, every physical or custom action → chemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `break_up`,
 /// `challenge` or `bet` costs nothing.
 /// An accepted `gift` joins the persona's items or wardrobe. A `date` asks her
 /// out; accepted, it runs in a session of its own for its `duration`, and
@@ -369,7 +375,15 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// `swimming_together` and `cycle_together` → `cycling_together` (one hour
 /// each); `hike_together` → `hiking_together` (two to three hours). A
 /// `cycle_together` to a persona whose `setting` is `fantasy` is refused and
-/// costs nothing. `propose` asks her to marry the user and starts no event: it
+/// costs nothing. Six more together actions start an event the same way:
+/// `dance_together` → `dancing_together`, `play_with_fire_together` →
+/// `playing_with_fire_together`, `sing_together` → `singing_together`,
+/// `skinny_dip_together` → `skinny_dipping_together` and
+/// `commit_crime_together` → `committing_crime_together` (one hour each);
+/// `adventure_together` → `adventuring_together` (two to three hours). A
+/// `skinny_dip_together` to a pair whose scopes are not romance-compatible is
+/// refused.
+/// `propose` asks her to marry the user and starts no event: it
 /// is refused unless the pair is `dating`, `fwb` or `situationship`, and
 /// accepted, the pair is `engaged`. `break_up` ends the relationship and
 /// starts no event: it is refused unless the pair's status is breakable
@@ -497,6 +511,12 @@ impl UserActionDto {
             UserActionKind::SwimTogether => UserAction::SwimTogether,
             UserActionKind::CycleTogether => UserAction::CycleTogether,
             UserActionKind::HikeTogether => UserAction::HikeTogether,
+            UserActionKind::DanceTogether => UserAction::DanceTogether,
+            UserActionKind::AdventureTogether => UserAction::AdventureTogether,
+            UserActionKind::PlayWithFireTogether => UserAction::PlayWithFireTogether,
+            UserActionKind::SingTogether => UserAction::SingTogether,
+            UserActionKind::SkinnyDipTogether => UserAction::SkinnyDipTogether,
+            UserActionKind::CommitCrimeTogether => UserAction::CommitCrimeTogether,
             UserActionKind::Challenge => UserAction::Challenge,
             UserActionKind::Bet => UserAction::Bet,
             UserActionKind::Custom => UserAction::Custom {
@@ -5113,6 +5133,54 @@ mod validate_payload_tests {
                 UserAction::Challenge,
             ),
             ("bet", UserActionKind::Bet, UserAction::Bet),
+        ] {
+            let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
+                .unwrap_or_else(|e| panic!("{wire}: {e}"));
+            assert_eq!(dto.to_core().unwrap(), want, "{wire}");
+            let view = UserActionView::from_metadata_action(
+                &serde_json::json!({"type": wire, "response": "refuse"}),
+            )
+            .unwrap_or_else(|| panic!("history parses a stored {wire}"));
+            assert_eq!(view.response, Some(ActionResponseDto::Refuse));
+            assert_eq!(view.action.kind, kind);
+        }
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §4.
+    #[test]
+    fn six_more_together_actions_map_one_to_one() {
+        for (wire, kind, want) in [
+            (
+                "dance_together",
+                UserActionKind::DanceTogether,
+                UserAction::DanceTogether,
+            ),
+            (
+                "adventure_together",
+                UserActionKind::AdventureTogether,
+                UserAction::AdventureTogether,
+            ),
+            (
+                "play_with_fire_together",
+                UserActionKind::PlayWithFireTogether,
+                UserAction::PlayWithFireTogether,
+            ),
+            (
+                "sing_together",
+                UserActionKind::SingTogether,
+                UserAction::SingTogether,
+            ),
+            (
+                "skinny_dip_together",
+                UserActionKind::SkinnyDipTogether,
+                UserAction::SkinnyDipTogether,
+            ),
+            (
+                "commit_crime_together",
+                UserActionKind::CommitCrimeTogether,
+                UserAction::CommitCrimeTogether,
+            ),
         ] {
             let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
                 .unwrap_or_else(|e| panic!("{wire}: {e}"));

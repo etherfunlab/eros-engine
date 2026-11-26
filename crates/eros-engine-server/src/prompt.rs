@@ -7156,6 +7156,43 @@ mod tests {
         );
     }
 
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §4.
+    #[test]
+    fn six_more_together_actions_read_their_markers_and_labels() {
+        for (a, marker, label) in [
+            (
+                UserAction::DanceTogether,
+                "想和你一起跳舞",
+                "和对方一起跳舞",
+            ),
+            (
+                UserAction::AdventureTogether,
+                "想和你一起去冒险",
+                "和对方一起冒险",
+            ),
+            (
+                UserAction::PlayWithFireTogether,
+                "想和你一起玩火",
+                "和对方一起玩火",
+            ),
+            (UserAction::SingTogether, "想和你一起唱歌", "和对方一起唱歌"),
+            (
+                UserAction::SkinnyDipTogether,
+                "想和你一起裸泳",
+                "和对方一起裸泳",
+            ),
+            (
+                UserAction::CommitCrimeTogether,
+                "想和你一起去犯罪",
+                "和对方一起犯罪",
+            ),
+        ] {
+            assert_eq!(action_marker(&a), format!("（{marker}）"), "{a:?}");
+            assert_eq!(event_label(a.together_kind().unwrap()), label, "{a:?}");
+        }
+    }
+
     /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
     /// design.md §6.
     #[test]

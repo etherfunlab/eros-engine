@@ -53,9 +53,11 @@ const MAX_EVENT_KEY_CHARS: usize = 128;
 /// `bathing_together`, `on_a_date`, `showering_together`, `sauna_together`
 /// the twelve kinds from `using_toilet_together` to `drinking_together`,
 /// `hot_spring_together`, `fighting_together`, `working_out_together`,
-/// `swimming_together`, `cycling_together` and `hiking_together` are placed by
-/// the engine, never drawn: they appear in responses only, and
-/// a `kinds` filter that lists one is rejected.
+/// `swimming_together`, `cycling_together`, `hiking_together`,
+/// `dancing_together`, `adventuring_together`, `playing_with_fire_together`,
+/// `singing_together`, `skinny_dipping_together` and
+/// `committing_crime_together` are placed by the engine, never drawn: they
+/// appear in responses only, and a `kinds` filter that lists one is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKindDto {
@@ -2910,6 +2912,37 @@ mod tests {
             (EventKind::SwimmingTogether, "swimming_together"),
             (EventKind::CyclingTogether, "cycling_together"),
             (EventKind::HikingTogether, "hiking_together"),
+        ] {
+            let dto = EventKindDto::from(kind);
+            assert_eq!(serde_json::to_value(dto).unwrap(), json!(wire));
+            assert_eq!(EventKind::from(dto), kind);
+            assert!(
+                serde_json::from_value::<DrawEventRequest>(
+                    json!({"event_key": "k", "kinds": [wire]})
+                )
+                .is_err(),
+                "{wire}"
+            );
+        }
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §4.
+    #[test]
+    fn the_six_new_together_kinds_are_placed_kinds_on_the_wire() {
+        for (kind, wire) in [
+            (EventKind::DancingTogether, "dancing_together"),
+            (EventKind::AdventuringTogether, "adventuring_together"),
+            (
+                EventKind::PlayingWithFireTogether,
+                "playing_with_fire_together",
+            ),
+            (EventKind::SingingTogether, "singing_together"),
+            (EventKind::SkinnyDippingTogether, "skinny_dipping_together"),
+            (
+                EventKind::CommittingCrimeTogether,
+                "committing_crime_together",
+            ),
         ] {
             let dto = EventKindDto::from(kind);
             assert_eq!(serde_json::to_value(dto).unwrap(), json!(wire));

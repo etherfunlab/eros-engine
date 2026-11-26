@@ -418,13 +418,15 @@ impl<'a> StoryRepo<'a> {
             .collect();
         // Romantic outcomes and the private together kinds stay in the
         // conversation (spec 2026-11-23-twelve-together-actions-and-propose-
-        // design.md §4.3).
+        // design.md §4.3; spec 2026-11-26-more-together-actions-bath-outfit-
+        // chemistry-drop-and-custom-together-design.md §4).
         let kept_out: Vec<&str> = [
             EventKind::BathingTogether,
             EventKind::ShoweringTogether,
             EventKind::OnADate,
             EventKind::HavingSexTogether,
             EventKind::StreakingTogether,
+            EventKind::SkinnyDippingTogether,
             EventKind::UsingToiletTogether,
             EventKind::AsleepTogether,
         ]
@@ -1666,6 +1668,56 @@ mod tests {
                 "hiking_together",
                 "swimming_together",
                 "working_out_together",
+            ]
+        );
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §4: a naked swim stays in the conversation as
+    /// streaking does; the other five reach her story.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_keep_skinny_dipping_out_and_take_the_other_five(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let kinds = [
+            EventKind::DancingTogether,
+            EventKind::AdventuringTogether,
+            EventKind::PlayingWithFireTogether,
+            EventKind::SingingTogether,
+            EventKind::SkinnyDippingTogether,
+            EventKind::CommittingCrimeTogether,
+        ];
+        for (i, k) in kinds.iter().enumerate() {
+            let from = now - chrono::Duration::hours(2 * (i as i64 + 1));
+            seed_event(
+                &pool,
+                inst,
+                Some(s),
+                k.as_str(),
+                k.as_str(),
+                from,
+                from + chrono::Duration::hours(1),
+                None,
+            )
+            .await;
+        }
+        let got = repo
+            .life_events(inst, now - chrono::Duration::days(7), now, 30)
+            .await
+            .unwrap();
+        let mut got: Vec<&str> = got.iter().map(|e| e.event.kind.as_str()).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                "adventuring_together",
+                "committing_crime_together",
+                "dancing_together",
+                "playing_with_fire_together",
+                "singing_together",
             ]
         );
     }
