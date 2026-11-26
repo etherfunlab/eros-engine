@@ -961,8 +961,10 @@ const AFFINITY_EVAL_MIN_CHARS: usize = 4;
 /// request timeout of its own, and the affinity write (incl. the already-
 /// computed rule deltas) waits on this call — so an unbounded stall would
 /// delay or lose the turn's affinity event. On elapse we fall back to
-/// rule-only deltas (the spec §4.5 "timeout → default" path).
-const AFFINITY_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// rule-only deltas (the spec §4.5 "timeout → default" path). Post-process
+/// does not hold up the reply, so the limit leaves room for a model that
+/// reasons by default.
+const AFFINITY_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The text the affinity evaluator scores as "what the assistant said".
 ///
@@ -1129,7 +1131,9 @@ fn affinity_eval_messages(
 }
 
 const SUMMARY_TASK: &str = "affinity_summary";
-const AFFINITY_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Upper bound on the feeling-clause summarizer call; as for the evaluator,
+/// it runs after the reply, so it can wait for a reasoning model.
+const AFFINITY_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Judge reasons fed to the summarizer, newest-first (spec §5).
 const SUMMARY_REASONS_LIMIT: i64 = 5;
 
