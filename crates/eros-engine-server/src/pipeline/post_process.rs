@@ -1039,8 +1039,9 @@ fn eval_skip_reason(
     }
 }
 
-/// The line a refused action drops this turn (spec 2026-10-05 §6.3); `None`
-/// on every other turn, on a refused tip, which drops nothing (spec
+/// The lines a refused action drops this turn (spec 2026-10-05 §6.3; spec
+/// 2026-11-27-together-action-groups-design.md §5.3); empty on every other
+/// turn, on a refused tip, which drops nothing (spec
 /// 2026-10-11 §6), and on an action the persona's `setting` rules out (spec
 /// 2026-11-23-hot-spring-fight-challenge-bet-design.md §4; spec
 /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §6),

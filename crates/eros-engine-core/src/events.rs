@@ -58,7 +58,6 @@ fn category_rule(category: EventCategory) -> CategoryRule {
     }
 }
 
-/// What happens to the persona.
 /// The group a together action and the kind it places belong to (spec
 /// 2026-11-27-together-action-groups-design.md §4.1): what the engine does
 /// with it follows from the group and from whether it is wet.
@@ -68,6 +67,8 @@ pub enum TogetherGroup {
     Nude,
     Thrill,
 }
+
+/// What happens to the persona.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -769,45 +770,8 @@ impl EventKind {
     /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
     /// §7.2).
     pub fn is_shared(self) -> bool {
-        use EventKind::*;
-        matches!(
-            self,
-            TravelingTogether
-                | OnADate
-                | BathingTogether
-                | ShoweringTogether
-                | SaunaTogether
-                | UsingToiletTogether
-                | SmokingTogether
-                | AsleepTogether
-                | HavingSexTogether
-                | WalkingTogether
-                | SmokingWeedTogether
-                | JoggingTogether
-                | YogaTogether
-                | StargazingTogether
-                | HorseRidingTogether
-                | StreakingTogether
-                | DrinkingTogether
-                | HotSpringTogether
-                | FightingTogether
-                | WorkingOutTogether
-                | SwimmingTogether
-                | CyclingTogether
-                | HikingTogether
-                | DancingTogether
-                | AdventuringTogether
-                | PlayingWithFireTogether
-                | SingingTogether
-                | SkinnyDippingTogether
-                | CommittingCrimeTogether
-                | FishingTogether
-                | NakedHorseRidingTogether
-                | NakedYogaTogether
-                | NakedHikingTogether
-                | NakedHotSpringTogether
-                | CustomTogether
-        )
+        matches!(self, EventKind::TravelingTogether | EventKind::OnADate)
+            || self.together_group().is_some()
     }
 
     /// Offline kinds make the persona unreachable while they last

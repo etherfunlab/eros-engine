@@ -2894,9 +2894,10 @@ fn picture_action(
     (!stands).then_some(target)
 }
 
-/// An action refused before the judge (a give the habit roll refused, a strip,
-/// shower or bath together an incompatible pair cannot have, a date the gate
-/// turns down) is refused, whatever the judge or the rule engine settled on.
+/// An action refused before the judge (a give the habit roll refused, a strip
+/// an incompatible pair cannot have, a machine's toilet together, a date the
+/// gate turns down) is refused, whatever the judge or the rule engine settled
+/// on.
 fn apply_forced_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: bool) {
     if refused && plan.action_response.is_some() {
         plan.action_response = Some(eros_engine_core::types::ActionResponse::Refuse);
@@ -3108,9 +3109,10 @@ fn build_pde_ctx(
     // action refused before the judge (a give the habit roll refused, spec
     // 2026-10-28-outing-indulgence-needs-and-habits-design.md §3.1; a strip an
     // incompatible pair cannot have, spec 2026-11-08-strip-and-world-setting-
-    // design.md §2.1, and so is a together action, spec 2026-11-20-
-    // together-actions-state-in-picture-and-genome-routes-design.md §5 and
-    // 2026-11-23-twelve-together-actions-and-propose-design.md §4.1, §5;
+    // design.md §2.1; a machine's toilet together, spec 2026-11-23-twelve-
+    // together-actions-and-propose-design.md §4.1, §5 — no together action is
+    // ruled out for compatibility, spec 2026-11-27-together-action-groups-
+    // design.md §5.1;
     // sex or water her period's roll refused, spec 2026-11-24-period-cycle-
     // design.md §8; a date the gate turns down, spec 2026-11-12-activity-sub-
     // session-design.md §4.3; a proposal or break-up the status does not
@@ -5465,10 +5467,10 @@ pub(crate) fn run_stream_with(
         // world-setting-design.md §2.1): decided here too, so the judge writes
         // for the outcome.
         let strip_refused = pde::strip_ruled_out(&input.event);
-        // So is a together action the pair or the persona cannot have (spec
-        // 2026-11-20-together-actions-state-in-picture-and-genome-routes-
-        // design.md §5, 2026-11-23-twelve-together-actions-and-propose-
-        // design.md §4.1).
+        // So is a together action the persona cannot have: a machine's toilet
+        // (spec 2026-11-23-twelve-together-actions-and-propose-design.md
+        // §4.1). None is ruled out for the pair's compatibility (spec
+        // 2026-11-27-together-action-groups-design.md §5.1).
         let together_refused = pde::together_ruled_out(&input.event, traits.machine);
         // A together action her world does not have, a fight in a modern
         // one or a cycle in a fantasy one (spec 2026-11-23-hot-spring-fight-
@@ -12436,7 +12438,7 @@ data: [DONE]\n\n";
 
     /// §5: a picture's state read with the scopes its path holds: a sauna
     /// under way on the default (bond-only) scopes reads a towel, on
-    /// romance-compatible ones nothing.
+    /// romance-compatible ones a loose towel.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_sauna_on_default_scopes_reads_a_towel(pool: PgPool) {
         use eros_engine_core::scope::{romance_compatible, AffinityScope};
@@ -22221,8 +22223,8 @@ data: [DONE]\n\n";
         );
     }
 
-    /// A together action ruled out before the judge (the romance gate, a
-    /// machine, the habit roll) is something she will not agree to, never
+    /// A together action ruled out before the judge (a machine, the habit
+    /// roll) is something she will not agree to, never
     /// something she will not take (spec 2026-11-23-twelve-together-actions-
     /// and-propose-design.md §4.1, §5).
     #[test]

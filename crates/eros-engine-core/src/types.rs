@@ -149,8 +149,9 @@ pub enum UserAction {
     /// The user asks to shower, take a bath or take a sauna with her (spec
     /// 2026-11-20-together-actions-state-in-picture-and-genome-routes-
     /// design.md §5). Accepted, she is in the event `together_kind` names,
-    /// and the turn shows her picture when pictures are available; only a
-    /// romance-compatible pair can have a shower or a bath accepted.
+    /// and the turn shows her picture when pictures are available. A shower
+    /// and a bath are nude actions (spec 2026-11-27-together-action-groups-
+    /// design.md §5.1); the judge decides them for any pair.
     ShowerTogether,
     BathTogether,
     SaunaTogether,
@@ -204,10 +205,11 @@ pub enum UserAction {
     HikeTogether,
     /// The user asks her to dance, go adventuring, play with fire, sing,
     /// skinny-dip or commit a crime with them (spec 2026-11-26-more-together-
-    /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md §4): each
-    /// behaves as `jog_together` does, except that a refusal drops chemistry
-    /// (a refused `commit_crime_together` drops bond). `skinny_dip_together`
-    /// is romance-gated and answered in the `emotional` tone.
+    /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md §4).
+    /// Adventure, fire and crime are thrill actions and a refusal drops bond;
+    /// `skinny_dip_together` is a nude action, answered in the `emotional`
+    /// tone; a refused dance, song or skinny dip drops chemistry (spec
+    /// 2026-11-27-together-action-groups-design.md §5).
     DanceTogether,
     AdventureTogether,
     PlayWithFireTogether,
@@ -218,10 +220,10 @@ pub enum UserAction {
     /// outfit-ladder-and-fish-together-design.md §6.1): behaves as
     /// `hike_together` does, two to three hours.
     FishTogether,
-    /// The user asks her to ride a horse naked with them (spec 2026-11-27
-    /// §6.2): romance-gated and answered in the `emotional` tone as
-    /// `skinny_dip_together` is, a refusal drops chemistry, and her period
-    /// does not roll it.
+    /// The user asks her to ride a horse naked with them (spec 2026-11-27-
+    /// swim-outfit-ladder-and-fish-together-design.md §6.2): a nude action,
+    /// the counterpart of `ride_horse_together`, so a refusal drops bond and
+    /// chemistry (spec 2026-11-27-together-action-groups-design.md §5.3).
     RideHorseNakedTogether,
     /// The user asks her to do yoga, hike or take a hot spring naked with
     /// them (spec 2026-11-27-together-action-groups-design.md §6): nude
@@ -232,7 +234,7 @@ pub enum UserAction {
     HotSpringNakedTogether,
     /// The user asks her to do something with them, in their own words (spec
     /// 2026-11-26 §8): behaves as `jog_together` does, placing
-    /// `custom_together`. Neither romance-gated nor emotional, and a refusal
+    /// `custom_together`. A general action: not emotional, and a refusal
     /// drops chemistry as `custom`'s does. The row it places points at the
     /// user's message, which is where the text lives.
     CustomTogether {
