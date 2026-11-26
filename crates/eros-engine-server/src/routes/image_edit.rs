@@ -1051,7 +1051,7 @@ async fn edit_image(
                 instruction_message_id,
                 None,
                 false,
-                None,
+                &[],
                 user_locale.timezone,
                 on_date,
             )

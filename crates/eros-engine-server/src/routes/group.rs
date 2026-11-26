@@ -2420,7 +2420,12 @@ mod tests {
             .and_then(|m| m.last())
             .and_then(|m| m["content"].as_str())
             .expect("the composer's user message");
-        assert!(payload.contains("[此刻穿着]\n什么都没穿\n"), "{payload}");
+        // A loose towel for a compatible pair (spec 2026-11-27-together-
+        // action-groups-design.md §7).
+        assert!(
+            payload.contains("[此刻穿着]\n身上只松松地裹着一条浴巾\n"),
+            "{payload}"
+        );
         assert!(
             payload.contains("[此刻状态]\n和对方一起蒸桑拿\n"),
             "{payload}"

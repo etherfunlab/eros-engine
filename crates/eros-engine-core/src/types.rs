@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::affinity::{Affinity, AffinityDeltas, AffinityLine};
-use crate::events::EventKind;
+use crate::events::{EventKind, TogetherGroup};
 use crate::persona::CompanionPersona;
 use crate::relationship::StatusAsk;
 use crate::scope::{AffinityScope, MemoryScope};
@@ -149,8 +149,9 @@ pub enum UserAction {
     /// The user asks to shower, take a bath or take a sauna with her (spec
     /// 2026-11-20-together-actions-state-in-picture-and-genome-routes-
     /// design.md §5). Accepted, she is in the event `together_kind` names,
-    /// and the turn shows her picture when pictures are available; only a
-    /// romance-compatible pair can have a shower or a bath accepted.
+    /// and the turn shows her picture when pictures are available. A shower
+    /// and a bath are nude actions (spec 2026-11-27-together-action-groups-
+    /// design.md §5.1); the judge decides them for any pair.
     ShowerTogether,
     BathTogether,
     SaunaTogether,
@@ -204,10 +205,11 @@ pub enum UserAction {
     HikeTogether,
     /// The user asks her to dance, go adventuring, play with fire, sing,
     /// skinny-dip or commit a crime with them (spec 2026-11-26-more-together-
-    /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md §4): each
-    /// behaves as `jog_together` does, except that a refusal drops chemistry
-    /// (a refused `commit_crime_together` drops bond). `skinny_dip_together`
-    /// is romance-gated and answered in the `emotional` tone.
+    /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md §4).
+    /// Adventure, fire and crime are thrill actions and a refusal drops bond;
+    /// `skinny_dip_together` is a nude action, answered in the `emotional`
+    /// tone; a refused dance, song or skinny dip drops chemistry (spec
+    /// 2026-11-27-together-action-groups-design.md §5).
     DanceTogether,
     AdventureTogether,
     PlayWithFireTogether,
@@ -218,14 +220,21 @@ pub enum UserAction {
     /// outfit-ladder-and-fish-together-design.md §6.1): behaves as
     /// `hike_together` does, two to three hours.
     FishTogether,
-    /// The user asks her to ride a horse naked with them (spec 2026-11-27
-    /// §6.2): romance-gated and answered in the `emotional` tone as
-    /// `skinny_dip_together` is, a refusal drops chemistry, and her period
-    /// does not roll it.
+    /// The user asks her to ride a horse naked with them (spec 2026-11-27-
+    /// swim-outfit-ladder-and-fish-together-design.md §6.2): a nude action,
+    /// the counterpart of `ride_horse_together`, so a refusal drops bond and
+    /// chemistry (spec 2026-11-27-together-action-groups-design.md §5.3).
     RideHorseNakedTogether,
+    /// The user asks her to do yoga, hike or take a hot spring naked with
+    /// them (spec 2026-11-27-together-action-groups-design.md §6): nude
+    /// counterparts of `yoga_together`, `hike_together` and
+    /// `hot_spring_together`.
+    YogaNakedTogether,
+    HikeNakedTogether,
+    HotSpringNakedTogether,
     /// The user asks her to do something with them, in their own words (spec
     /// 2026-11-26 §8): behaves as `jog_together` does, placing
-    /// `custom_together`. Neither romance-gated nor emotional, and a refusal
+    /// `custom_together`. A general action: not emotional, and a refusal
     /// drops chemistry as `custom`'s does. The row it places points at the
     /// user's message, which is where the text lives.
     CustomTogether {
@@ -292,29 +301,43 @@ impl DateDuration {
     }
 }
 
+/// The together actions she may turn down only for not caring for the
+/// outdoors: a refusal drops bond (spec 2026-11-27-swim-outfit-ladder-and-
+/// fish-together-design.md §7).
+const OUTDOOR_ACTIONS: [UserAction; 5] = [
+    UserAction::JogTogether,
+    UserAction::HikeTogether,
+    UserAction::FishTogether,
+    UserAction::CycleTogether,
+    UserAction::RideHorseTogether,
+];
+
 impl UserAction {
     /// Whether her reply to this action is written in the `emotional` tone,
     /// accepted or refused, when the deployment has the tone on (spec
-    /// 2026-11-12-emotional-action-replies-design.md §2).
+    /// 2026-11-12-emotional-action-replies-design.md §2): every nude together
+    /// action (spec 2026-11-27-together-action-groups-design.md §5.1) and
+    /// the gestures and status asks below.
     pub fn speaks_emotionally(&self) -> bool {
-        matches!(
-            self,
-            UserAction::FrenchKiss
-                | UserAction::Tease
-                | UserAction::HugFromBehind
-                | UserAction::Touch
-                | UserAction::Strip
-                | UserAction::ShowerTogether
-                | UserAction::BathTogether
-                | UserAction::SexTogether
-                | UserAction::StreakTogether
-                | UserAction::SkinnyDipTogether
-                | UserAction::RideHorseNakedTogether
-                | UserAction::Propose
-                | UserAction::BreakUp
-                | UserAction::Threaten
-                | UserAction::Tip { .. }
-        )
+        self.together_group() == Some(TogetherGroup::Nude)
+            || matches!(
+                self,
+                UserAction::FrenchKiss
+                    | UserAction::Tease
+                    | UserAction::HugFromBehind
+                    | UserAction::Touch
+                    | UserAction::Strip
+                    | UserAction::Propose
+                    | UserAction::BreakUp
+                    | UserAction::Threaten
+                    | UserAction::Tip { .. }
+            )
+    }
+
+    /// The group of the kind this together action places (spec 2026-11-27
+    /// §4.1); `None` for every other action.
+    pub fn together_group(&self) -> Option<TogetherGroup> {
+        self.together_kind().and_then(EventKind::together_group)
     }
 
     /// The status ask this action puts to her (spec 2026-11-23-affinity-50-
@@ -361,6 +384,9 @@ impl UserAction {
             UserAction::CommitCrimeTogether => Some(EventKind::CommittingCrimeTogether),
             UserAction::FishTogether => Some(EventKind::FishingTogether),
             UserAction::RideHorseNakedTogether => Some(EventKind::NakedHorseRidingTogether),
+            UserAction::YogaNakedTogether => Some(EventKind::NakedYogaTogether),
+            UserAction::HikeNakedTogether => Some(EventKind::NakedHikingTogether),
+            UserAction::HotSpringNakedTogether => Some(EventKind::NakedHotSpringTogether),
             UserAction::CustomTogether { .. } => Some(EventKind::CustomTogether),
             _ => None,
         }
@@ -373,23 +399,6 @@ impl UserAction {
             UserAction::CustomTogether { text } => Some(text),
             _ => None,
         }
-    }
-
-    /// Whether only a romance-compatible pair can have this action accepted:
-    /// ruled out before the judge when the turn's scopes are not (spec
-    /// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
-    /// custom-together-design.md §4, §6). The kinds these place are
-    /// `EventKind::ENDS_ON_CHEMISTRY_DROP`.
-    pub fn romance_gated(&self) -> bool {
-        matches!(
-            self,
-            UserAction::ShowerTogether
-                | UserAction::BathTogether
-                | UserAction::SexTogether
-                | UserAction::StreakTogether
-                | UserAction::SkinnyDipTogether
-                | UserAction::RideHorseNakedTogether
-        )
     }
 
     /// What this action has her take, and how many: a `give` its item and
@@ -407,27 +416,19 @@ impl UserAction {
         }
     }
 
-    /// The line a refusal of this action drops: handing something over,
-    /// giving something to keep, asking her into a crime, or out on a jog, a
-    /// hike, a fishing trip, a bike ride or a horse ride is friendship (spec
-    /// 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7); every
-    /// other physical gesture is romance. A refused tip drops nothing
-    /// (spec 2026-10-11 §6), nor does seeing through a bluff, a threat or a
-    /// trick (spec 2026-11-08 §2.2), nor does turning down a date, a
+    /// The lines a refusal of this action drops, each one tier (spec
+    /// 2026-11-27-together-action-groups-design.md §5.3). Friendship
+    /// (`bond`): handing something over, giving something to keep, a thrill
+    /// action, or a jog, a hike, a fishing trip, a bike ride or a horse ride,
+    /// which she may turn down only for not caring for the outdoors. Both
+    /// lines: the nude counterpart of one of those outdoor five (a streak, a
+    /// naked hike, a naked ride). Romance (`chemistry`): every other physical
+    /// gesture. None: a tip (spec 2026-10-11 §6), seeing through a bluff, a
+    /// threat or a trick (spec 2026-11-08 §2.2), turning down a date, a
     /// proposal, a break-up, a challenge or a bet.
-    pub fn refusal_line(&self) -> Option<AffinityLine> {
+    pub fn refusal_lines(&self) -> &'static [AffinityLine] {
+        use AffinityLine::{Bond, Chemistry};
         match self {
-            // A refused jog, hike, fishing trip, bike ride or horse ride may
-            // only mean she does not care for the outdoors (spec 2026-11-27-
-            // swim-outfit-ladder-and-fish-together-design.md §7).
-            UserAction::Give { .. }
-            | UserAction::Gift { .. }
-            | UserAction::CommitCrimeTogether
-            | UserAction::JogTogether
-            | UserAction::HikeTogether
-            | UserAction::FishTogether
-            | UserAction::CycleTogether
-            | UserAction::RideHorseTogether => Some(AffinityLine::Bond),
             UserAction::Tip { .. }
             | UserAction::Bluff
             | UserAction::Threaten
@@ -436,8 +437,20 @@ impl UserAction {
             | UserAction::BreakUp
             | UserAction::Challenge
             | UserAction::Bet
-            | UserAction::Date { .. } => None,
-            _ => Some(AffinityLine::Chemistry),
+            | UserAction::Date { .. } => &[],
+            UserAction::Give { .. } | UserAction::Gift { .. } => &[Bond],
+            a if OUTDOOR_ACTIONS.contains(a) => &[Bond],
+            a => match a.together_kind() {
+                Some(k) if k.together_group() == Some(TogetherGroup::Thrill) => &[Bond],
+                Some(k)
+                    if k.clothed_counterpart().is_some_and(|c| {
+                        OUTDOOR_ACTIONS.iter().any(|o| o.together_kind() == Some(c))
+                    }) =>
+                {
+                    &[Bond, Chemistry]
+                }
+                _ => &[Chemistry],
+            },
         }
     }
 }
@@ -837,12 +850,13 @@ mod tests {
             assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
             assert_eq!(a.together_kind(), Some(kind), "{a:?}");
             // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7.
-            let line = if matches!(a, UserAction::JogTogether | UserAction::RideHorseTogether) {
-                AffinityLine::Bond
-            } else {
-                AffinityLine::Chemistry
+            let lines: &[AffinityLine] = match a {
+                UserAction::JogTogether | UserAction::RideHorseTogether => &[AffinityLine::Bond],
+                // Spec 2026-11-27-together-action-groups-design.md §5.3.
+                UserAction::StreakTogether => &[AffinityLine::Bond, AffinityLine::Chemistry],
+                _ => &[AffinityLine::Chemistry],
             };
-            assert_eq!(a.refusal_line(), Some(line), "{a:?}");
+            assert_eq!(a.refusal_lines(), lines, "{a:?}");
         }
         for a in [
             UserAction::Kiss,
@@ -929,7 +943,13 @@ mod tests {
             assert_eq!(serde_json::to_value(&a).unwrap(), v);
             assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
             assert_eq!(a.together_kind(), Some(kind), "{a:?}");
-            assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
+            // A fight is a thrill action (spec 2026-11-27-together-action-groups-design.md §5.3).
+            let line = if a == UserAction::FightTogether {
+                AffinityLine::Bond
+            } else {
+                AffinityLine::Chemistry
+            };
+            assert_eq!(a.refusal_lines(), [line], "{a:?}");
             assert!(!a.speaks_emotionally(), "{a:?}");
         }
     }
@@ -970,7 +990,7 @@ mod tests {
             } else {
                 AffinityLine::Chemistry
             };
-            assert_eq!(a.refusal_line(), Some(line), "{a:?}");
+            assert_eq!(a.refusal_lines(), [line], "{a:?}");
             assert!(!a.speaks_emotionally(), "{a:?}");
             assert_eq!(a.consumed(), None, "{a:?}");
             assert_eq!(a.status_ask(), None, "{a:?}");
@@ -1027,9 +1047,9 @@ mod tests {
         assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
         assert_eq!(a.together_kind(), Some(EventKind::CustomTogether));
         assert_eq!(a.together_text(), Some("去海边放烟花"));
-        assert!(!a.romance_gated());
+        assert_eq!(a.together_group(), Some(TogetherGroup::General));
         assert!(!a.speaks_emotionally());
-        assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry));
+        assert_eq!(a.refusal_lines(), [AffinityLine::Chemistry]);
         assert_eq!(a.consumed(), None);
         assert_eq!(a.status_ask(), None);
         // No other action carries text for a together event.
@@ -1053,16 +1073,16 @@ mod tests {
             assert!(!a.speaks_emotionally(), "{a:?}");
         }
         assert_eq!(
-            UserAction::CommitCrimeTogether.refusal_line(),
-            Some(AffinityLine::Bond)
+            UserAction::CommitCrimeTogether.refusal_lines(),
+            [AffinityLine::Bond]
         );
         assert_eq!(
-            UserAction::SkinnyDipTogether.refusal_line(),
-            Some(AffinityLine::Chemistry)
+            UserAction::SkinnyDipTogether.refusal_lines(),
+            [AffinityLine::Chemistry]
         );
         assert_eq!(
-            UserAction::SingTogether.refusal_line(),
-            Some(AffinityLine::Chemistry)
+            UserAction::SingTogether.refusal_lines(),
+            [AffinityLine::Chemistry]
         );
     }
 
@@ -1077,10 +1097,9 @@ mod tests {
             UserAction::CycleTogether,
             UserAction::RideHorseTogether,
         ] {
-            assert_eq!(a.refusal_line(), Some(AffinityLine::Bond), "{a:?}");
+            assert_eq!(a.refusal_lines(), [AffinityLine::Bond], "{a:?}");
         }
         for a in [
-            UserAction::AdventureTogether,
             UserAction::WalkTogether,
             UserAction::SwimTogether,
             UserAction::WorkoutTogether,
@@ -1088,9 +1107,50 @@ mod tests {
             UserAction::StargazeTogether,
             UserAction::DanceTogether,
             UserAction::SingTogether,
-            UserAction::RideHorseNakedTogether,
         ] {
-            assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
+            assert_eq!(a.refusal_lines(), [AffinityLine::Chemistry], "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-27-together-action-groups-design.md §5.3: thrill drops
+    /// bond; a nude counterpart of a bond-dropping outdoor action drops both.
+    #[test]
+    fn refusal_lines_by_group_and_counterpart() {
+        use AffinityLine::{Bond, Chemistry};
+        const OUTDOOR: [UserAction; 5] = [
+            UserAction::JogTogether,
+            UserAction::HikeTogether,
+            UserAction::FishTogether,
+            UserAction::CycleTogether,
+            UserAction::RideHorseTogether,
+        ];
+        const BOTH: [UserAction; 3] = [
+            UserAction::StreakTogether,
+            UserAction::HikeNakedTogether,
+            UserAction::RideHorseNakedTogether,
+        ];
+        for a in all_actions()
+            .into_iter()
+            .filter(|a| a.together_kind().is_some())
+        {
+            let want: &[AffinityLine] = if BOTH.contains(&a) {
+                &[Bond, Chemistry]
+            } else if OUTDOOR.contains(&a) || THRILL_ACTIONS.contains(&a) {
+                &[Bond]
+            } else {
+                &[Chemistry]
+            };
+            assert_eq!(a.refusal_lines(), want, "{a:?}");
+        }
+        for a in [
+            UserAction::SkinnyDipTogether,
+            UserAction::YogaNakedTogether,
+            UserAction::HotSpringNakedTogether,
+            UserAction::ShowerTogether,
+            UserAction::BathTogether,
+            UserAction::SexTogether,
+        ] {
+            assert_eq!(a.refusal_lines(), [Chemistry], "{a:?}");
         }
     }
 
@@ -1106,23 +1166,57 @@ mod tests {
         assert_eq!(a.status_ask(), None);
         assert_eq!(a.together_text(), None);
         assert!(!a.speaks_emotionally());
-        assert!(!a.romance_gated());
+        assert_eq!(a.together_group(), Some(TogetherGroup::General));
     }
 
     /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6.2.
     #[test]
-    fn ride_horse_naked_together_is_gated_and_emotional() {
+    fn ride_horse_naked_together_is_nude_and_emotional() {
         let a = UserAction::RideHorseNakedTogether;
         let v = serde_json::json!({ "type": "ride_horse_naked_together" });
         assert_eq!(serde_json::to_value(&a).unwrap(), v);
         assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
         assert_eq!(a.together_kind(), Some(EventKind::NakedHorseRidingTogether));
-        assert!(a.romance_gated());
+        assert_eq!(a.together_group(), Some(TogetherGroup::Nude));
         assert!(a.speaks_emotionally());
-        assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry));
+        assert_eq!(
+            a.refusal_lines(),
+            [AffinityLine::Bond, AffinityLine::Chemistry]
+        );
         assert_eq!(a.consumed(), None);
         assert_eq!(a.status_ask(), None);
         assert_eq!(a.together_text(), None);
+    }
+
+    /// Spec 2026-11-27-together-action-groups-design.md §6.
+    #[test]
+    fn three_nude_actions_name_their_events() {
+        use EventKind::*;
+        for (a, wire, kind) in [
+            (
+                UserAction::YogaNakedTogether,
+                "yoga_naked_together",
+                NakedYogaTogether,
+            ),
+            (
+                UserAction::HikeNakedTogether,
+                "hike_naked_together",
+                NakedHikingTogether,
+            ),
+            (
+                UserAction::HotSpringNakedTogether,
+                "hot_spring_naked_together",
+                NakedHotSpringTogether,
+            ),
+        ] {
+            let v = serde_json::json!({ "type": wire });
+            assert_eq!(serde_json::to_value(&a).unwrap(), v);
+            assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+            assert_eq!(a.together_kind(), Some(kind), "{a:?}");
+            assert_eq!(a.consumed(), None, "{a:?}");
+            assert_eq!(a.status_ask(), None, "{a:?}");
+            assert_eq!(a.together_text(), None, "{a:?}");
+        }
     }
 
     /// One of every action: each unit variant and one of each payload variant.
@@ -1182,6 +1276,9 @@ mod tests {
             CommitCrimeTogether,
             FishTogether,
             RideHorseNakedTogether,
+            YogaNakedTogether,
+            HikeNakedTogether,
+            HotSpringNakedTogether,
             CustomTogether { text: "x".into() },
             Challenge,
             Bet,
@@ -1199,26 +1296,82 @@ mod tests {
         ]
     }
 
-    /// The kinds a chemistry drop ends are exactly the kinds the
-    /// romance-gated actions place (spec 2026-11-26 §6).
+    /// The kinds a chemistry drop ends are exactly the kinds the nude
+    /// actions place (spec 2026-11-27-together-action-groups-design.md §5.1).
     #[test]
-    fn romance_gated_actions_place_the_kinds_a_chemistry_drop_ends() {
+    fn nude_actions_place_the_kinds_a_chemistry_drop_ends() {
         let sorted = |mut kinds: Vec<EventKind>| {
             kinds.sort_by_key(|k| k.as_str());
             kinds
         };
-        let gated: Vec<EventKind> = all_actions()
+        let nude: Vec<EventKind> = all_actions()
             .iter()
-            .filter(|a| a.romance_gated())
+            .filter(|a| a.together_group() == Some(TogetherGroup::Nude))
             .filter_map(|a| a.together_kind())
             .collect();
         assert_eq!(
-            sorted(gated),
+            sorted(nude),
             sorted(EventKind::ENDS_ON_CHEMISTRY_DROP.to_vec())
         );
-        // `strip` has its own gate (`pde::strip_ruled_out`).
-        assert!(!UserAction::Strip.romance_gated());
-        assert!(!UserAction::SaunaTogether.romance_gated());
+    }
+
+    const NUDE_ACTIONS: [UserAction; 9] = [
+        UserAction::ShowerTogether,
+        UserAction::BathTogether,
+        UserAction::SexTogether,
+        UserAction::StreakTogether,
+        UserAction::SkinnyDipTogether,
+        UserAction::RideHorseNakedTogether,
+        UserAction::YogaNakedTogether,
+        UserAction::HikeNakedTogether,
+        UserAction::HotSpringNakedTogether,
+    ];
+
+    const THRILL_ACTIONS: [UserAction; 4] = [
+        UserAction::AdventureTogether,
+        UserAction::CommitCrimeTogether,
+        UserAction::PlayWithFireTogether,
+        UserAction::FightTogether,
+    ];
+
+    /// Spec 2026-11-27-together-action-groups-design.md §4.1.
+    #[test]
+    fn every_together_action_has_its_group() {
+        for a in all_actions() {
+            let want = if NUDE_ACTIONS.contains(&a) {
+                Some(TogetherGroup::Nude)
+            } else if THRILL_ACTIONS.contains(&a) {
+                Some(TogetherGroup::Thrill)
+            } else if a.together_kind().is_some() {
+                Some(TogetherGroup::General)
+            } else {
+                None
+            };
+            assert_eq!(a.together_group(), want, "{a:?}");
+        }
+        for a in [
+            UserAction::FallAsleepTogether,
+            UserAction::SwimTogether,
+            UserAction::HotSpringTogether,
+        ] {
+            assert_eq!(a.together_group(), Some(TogetherGroup::General), "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-27-together-action-groups-design.md §5.1: every nude
+    /// action speaks emotionally; no general or thrill one does.
+    #[test]
+    fn nude_actions_speak_emotionally() {
+        for a in all_actions()
+            .into_iter()
+            .filter(|a| a.together_kind().is_some())
+        {
+            assert_eq!(
+                a.speaks_emotionally(),
+                a.together_group() == Some(TogetherGroup::Nude),
+                "{a:?}"
+            );
+        }
     }
 
     /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §4: social
@@ -1233,7 +1386,7 @@ mod tests {
             assert_eq!(serde_json::to_value(&a).unwrap(), v);
             assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
             assert_eq!(a.together_kind(), None, "{a:?}");
-            assert_eq!(a.refusal_line(), None, "{a:?}");
+            assert_eq!(a.refusal_lines(), [] as [AffinityLine; 0], "{a:?}");
             assert!(!a.speaks_emotionally(), "{a:?}");
         }
     }
@@ -1241,7 +1394,7 @@ mod tests {
     /// Spec 2026-11-23 §7: turning a proposal down costs nothing.
     #[test]
     fn a_refused_proposal_drops_no_line() {
-        assert_eq!(UserAction::Propose.refusal_line(), None);
+        assert_eq!(UserAction::Propose.refusal_lines(), [] as [AffinityLine; 0]);
     }
 
     /// Spec 2026-11-23-twelve-together-actions-and-propose-design.md §7.
@@ -1267,7 +1420,7 @@ mod tests {
             UserAction::BreakUp
         );
         assert!(UserAction::BreakUp.speaks_emotionally());
-        assert_eq!(UserAction::BreakUp.refusal_line(), None);
+        assert_eq!(UserAction::BreakUp.refusal_lines(), [] as [AffinityLine; 0]);
         assert_eq!(UserAction::BreakUp.together_kind(), None);
         assert_eq!(UserAction::BreakUp.consumed(), None);
     }
@@ -1309,7 +1462,7 @@ mod tests {
             }
         );
         assert_eq!(serde_json::to_value(&a).unwrap()["duration"], "mid");
-        assert_eq!(a.refusal_line(), None);
+        assert_eq!(a.refusal_lines(), [] as [AffinityLine; 0]);
         assert!(!a.speaks_emotionally());
         assert_eq!(DateDuration::Short.hours(), 1);
         assert_eq!(DateDuration::Mid.hours(), 4);
@@ -1526,7 +1679,7 @@ mod tests {
             name: None,
             quantity: 1,
         };
-        assert_eq!(give.refusal_line().unwrap(), AffinityLine::Bond);
+        assert_eq!(give.refusal_lines(), [AffinityLine::Bond]);
         for a in [
             UserAction::Kiss,
             UserAction::Hug,
@@ -1547,7 +1700,7 @@ mod tests {
             UserAction::SaunaTogether,
             UserAction::Custom { text: "x".into() },
         ] {
-            assert_eq!(a.refusal_line().unwrap(), AffinityLine::Chemistry, "{a:?}");
+            assert_eq!(a.refusal_lines(), [AffinityLine::Chemistry], "{a:?}");
         }
     }
 
@@ -1581,7 +1734,7 @@ mod tests {
             kind: ItemKind::Item,
             name: "摩托车".into(),
         };
-        assert_eq!(gift.refusal_line(), Some(AffinityLine::Bond));
+        assert_eq!(gift.refusal_lines(), [AffinityLine::Bond]);
     }
 
     #[test]
@@ -1666,13 +1819,16 @@ mod tests {
     #[test]
     fn a_refused_social_action_drops_no_line() {
         for a in [UserAction::Bluff, UserAction::Threaten, UserAction::Trick] {
-            assert_eq!(a.refusal_line(), None, "{a:?}");
+            assert_eq!(a.refusal_lines(), [] as [AffinityLine; 0], "{a:?}");
         }
     }
 
     #[test]
     fn a_refused_tip_drops_no_line() {
-        assert_eq!(UserAction::Tip { amount_usd: 20.0 }.refusal_line(), None);
+        assert_eq!(
+            UserAction::Tip { amount_usd: 20.0 }.refusal_lines(),
+            [] as [AffinityLine; 0]
+        );
     }
 
     #[test]

@@ -1155,7 +1155,7 @@ mod tests {
                 Some(umid),
                 None,
                 false,
-                None,
+                &[],
                 None,
                 false,
             )

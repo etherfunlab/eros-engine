@@ -7,7 +7,7 @@
 //! `persona_story_memories` its 1:1 embedded recall mirror.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use eros_engine_core::events::EventKind;
+use eros_engine_core::events::{EventKind, TogetherGroup};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::time::Duration;
@@ -394,9 +394,8 @@ impl<'a> StoryRepo<'a> {
     /// `cap` newest, and a row under way survives it. Left out: a
     /// `taking_space` / `fell_out` whose session is gone or archived (it
     /// belongs to that relationship), a false alarm still under way (she
-    /// does not know yet), and every `bathing_together`, `showering_together`,
-    /// `having_sex_together`, `streaking_together`, `skinny_dipping_together`,
-    /// `naked_horse_riding_together`, `using_toilet_together`,
+    /// does not know yet), and every nude together kind (spec 2026-11-27-
+    /// together-action-groups-design.md §5.1), `using_toilet_together`,
     /// `asleep_together`, `custom_together` and `on_a_date`: a romantic
     /// choice's or action's outcome lives in the conversation only (spec
     /// 2026-10-30 §4.7, 2026-11-23 §4.3), and a date in its own sub-session.
@@ -418,30 +417,24 @@ impl<'a> StoryRepo<'a> {
             .filter(|k| k.is_false_alarm())
             .map(EventKind::as_str)
             .collect();
-        // Romantic outcomes and the private together kinds stay in the
+        // Every nude kind and the private together kinds stay in the
         // conversation (spec 2026-11-23-twelve-together-actions-and-propose-
-        // design.md §4.3; spec 2026-11-26-more-together-actions-bath-outfit-
-        // chemistry-drop-and-custom-together-design.md §4; the naked ride,
-        // spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md
-        // §6.2). So does a
+        // design.md §4.3; spec 2026-11-27-together-action-groups-design.md
+        // §5.1). So does a
         // `custom_together`: what it holds is unknown, and its `message_id`
         // is the user's message, which the join below would read as her
         // telling (§8.2, §8.3).
-        let kept_out: Vec<&str> = [
-            EventKind::BathingTogether,
-            EventKind::ShoweringTogether,
-            EventKind::OnADate,
-            EventKind::HavingSexTogether,
-            EventKind::StreakingTogether,
-            EventKind::SkinnyDippingTogether,
-            EventKind::NakedHorseRidingTogether,
-            EventKind::UsingToiletTogether,
-            EventKind::AsleepTogether,
-            EventKind::CustomTogether,
-        ]
-        .into_iter()
-        .map(EventKind::as_str)
-        .collect();
+        let kept_out: Vec<&str> = EventKind::SPECIAL
+            .into_iter()
+            .filter(|k| k.together_group() == Some(TogetherGroup::Nude))
+            .chain([
+                EventKind::UsingToiletTogether,
+                EventKind::AsleepTogether,
+                EventKind::CustomTogether,
+                EventKind::OnADate,
+            ])
+            .map(EventKind::as_str)
+            .collect();
         #[allow(clippy::type_complexity)] // sqlx tuple query — type alias would add noise
         let rows: Vec<(
             Uuid,
@@ -1730,6 +1723,49 @@ mod tests {
                 "singing_together",
             ]
         );
+    }
+
+    /// Spec 2026-11-27-together-action-groups-design.md §5.1: every nude kind
+    /// stays in the conversation; a general outing reaches her story.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_keep_every_nude_kind_out(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let kinds = [
+            EventKind::ShoweringTogether,
+            EventKind::BathingTogether,
+            EventKind::HavingSexTogether,
+            EventKind::StreakingTogether,
+            EventKind::SkinnyDippingTogether,
+            EventKind::NakedHorseRidingTogether,
+            EventKind::NakedYogaTogether,
+            EventKind::NakedHikingTogether,
+            EventKind::NakedHotSpringTogether,
+            EventKind::FishingTogether,
+        ];
+        for (i, k) in kinds.iter().enumerate() {
+            let from = now - chrono::Duration::hours(2 * (i as i64 + 1));
+            seed_event(
+                &pool,
+                inst,
+                Some(s),
+                k.as_str(),
+                k.as_str(),
+                from,
+                from + chrono::Duration::hours(1),
+                None,
+            )
+            .await;
+        }
+        let got = repo
+            .life_events(inst, now - chrono::Duration::days(7), now, 30)
+            .await
+            .unwrap();
+        let got: Vec<&str> = got.iter().map(|e| e.event.kind.as_str()).collect();
+        assert_eq!(got, vec!["fishing_together"]);
     }
 
     /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6:

@@ -199,6 +199,9 @@ pub enum UserActionKind {
     CommitCrimeTogether,
     FishTogether,
     RideHorseNakedTogether,
+    YogaNakedTogether,
+    HikeNakedTogether,
+    HotSpringNakedTogether,
     CustomTogether,
     Challenge,
     Bet,
@@ -350,9 +353,12 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
-/// the line the action touches (`give`, `gift`, `commit_crime_together`,
-/// `jog_together`, `hike_together`, `fish_together`, `cycle_together` and
-/// `ride_horse_together` → bond, every other physical or custom action →
+/// each line the action touches (`give`, `gift`, the thrill actions
+/// `adventure_together`, `commit_crime_together`, `play_with_fire_together`
+/// and `fight_together`, and `jog_together`, `hike_together`,
+/// `fish_together`, `cycle_together` and `ride_horse_together` → bond;
+/// `streak_together`, `hike_naked_together` and `ride_horse_naked_together`
+/// → bond and chemistry; every other physical or custom action →
 /// chemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `break_up`,
 /// `challenge` or `bet` costs nothing.
 /// An accepted `gift` joins the persona's items or wardrobe. A `date` asks her
@@ -388,9 +394,16 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// `adventure_together` → `adventuring_together` (two to three hours).
 /// `fish_together` → `fishing_together` (two to three hours) and
 /// `ride_horse_naked_together` → `naked_horse_riding_together` (one hour)
-/// start an event the same way. A `skinny_dip_together` or
-/// `ride_horse_naked_together` to a pair whose scopes are not
-/// romance-compatible is refused. `custom_together` asks her to do something with the user in the
+/// start an event the same way, as do `yoga_naked_together` →
+/// `naked_yoga_together` and `hot_spring_naked_together` →
+/// `naked_hot_spring_together` (one hour each) and `hike_naked_together` →
+/// `naked_hiking_together` (two to three hours). No together action is
+/// refused for the pair's scopes: the judge decides. During her period a
+/// `sex_together`, or a together action that happens in water
+/// (`swim_together`, `hot_spring_together`, `sauna_together`,
+/// `shower_together`, `bath_together`, `skinny_dip_together`,
+/// `hot_spring_naked_together`), is refused two times in three before the
+/// judge, and that refusal costs nothing. `custom_together` asks her to do something with the user in the
 /// user's own `text` (required): accepted, it starts a `custom_together`
 /// event (one hour) whose `message_id` is the user's message, and nothing
 /// rules it out before the judge; refused, it costs chemistry.
@@ -530,6 +543,9 @@ impl UserActionDto {
             UserActionKind::CommitCrimeTogether => UserAction::CommitCrimeTogether,
             UserActionKind::FishTogether => UserAction::FishTogether,
             UserActionKind::RideHorseNakedTogether => UserAction::RideHorseNakedTogether,
+            UserActionKind::YogaNakedTogether => UserAction::YogaNakedTogether,
+            UserActionKind::HikeNakedTogether => UserAction::HikeNakedTogether,
+            UserActionKind::HotSpringNakedTogether => UserAction::HotSpringNakedTogether,
             UserActionKind::CustomTogether => UserAction::CustomTogether {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom_together")?,
@@ -5285,6 +5301,22 @@ mod validate_payload_tests {
                 "ride_horse_naked_together",
                 UserActionKind::RideHorseNakedTogether,
                 UserAction::RideHorseNakedTogether,
+            ),
+            // Spec 2026-11-27-together-action-groups-design.md §6.
+            (
+                "yoga_naked_together",
+                UserActionKind::YogaNakedTogether,
+                UserAction::YogaNakedTogether,
+            ),
+            (
+                "hike_naked_together",
+                UserActionKind::HikeNakedTogether,
+                UserAction::HikeNakedTogether,
+            ),
+            (
+                "hot_spring_naked_together",
+                UserActionKind::HotSpringNakedTogether,
+                UserAction::HotSpringNakedTogether,
             ),
         ] {
             let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))

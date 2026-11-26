@@ -2894,9 +2894,10 @@ fn picture_action(
     (!stands).then_some(target)
 }
 
-/// An action refused before the judge (a give the habit roll refused, a strip,
-/// shower or bath together an incompatible pair cannot have, a date the gate
-/// turns down) is refused, whatever the judge or the rule engine settled on.
+/// An action refused before the judge (a give the habit roll refused, a strip
+/// an incompatible pair cannot have, a machine's toilet together, a date the
+/// gate turns down) is refused, whatever the judge or the rule engine settled
+/// on.
 fn apply_forced_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused: bool) {
     if refused && plan.action_response.is_some() {
         plan.action_response = Some(eros_engine_core::types::ActionResponse::Refuse);
@@ -3108,9 +3109,10 @@ fn build_pde_ctx(
     // action refused before the judge (a give the habit roll refused, spec
     // 2026-10-28-outing-indulgence-needs-and-habits-design.md §3.1; a strip an
     // incompatible pair cannot have, spec 2026-11-08-strip-and-world-setting-
-    // design.md §2.1, and so is a together action, spec 2026-11-20-
-    // together-actions-state-in-picture-and-genome-routes-design.md §5 and
-    // 2026-11-23-twelve-together-actions-and-propose-design.md §4.1, §5;
+    // design.md §2.1; a machine's toilet together, spec 2026-11-23-twelve-
+    // together-actions-and-propose-design.md §4.1, §5 — no together action is
+    // ruled out for compatibility, spec 2026-11-27-together-action-groups-
+    // design.md §5.1;
     // sex or water her period's roll refused, spec 2026-11-24-period-cycle-
     // design.md §8; a date the gate turns down, spec 2026-11-12-activity-sub-
     // session-design.md §4.3; a proposal or break-up the status does not
@@ -5465,10 +5467,10 @@ pub(crate) fn run_stream_with(
         // world-setting-design.md §2.1): decided here too, so the judge writes
         // for the outcome.
         let strip_refused = pde::strip_ruled_out(&input.event);
-        // So is a together action the pair or the persona cannot have (spec
-        // 2026-11-20-together-actions-state-in-picture-and-genome-routes-
-        // design.md §5, 2026-11-23-twelve-together-actions-and-propose-
-        // design.md §4.1).
+        // So is a together action the persona cannot have: a machine's toilet
+        // (spec 2026-11-23-twelve-together-actions-and-propose-design.md
+        // §4.1). None is ruled out for the pair's compatibility (spec
+        // 2026-11-27-together-action-groups-design.md §5.1).
         let together_refused = pde::together_ruled_out(&input.event, traits.machine);
         // A together action her world does not have, a fight in a modern
         // one or a cycle in a fantasy one (spec 2026-11-23-hot-spring-fight-
@@ -12088,31 +12090,72 @@ data: [DONE]\n\n";
         )
     }
 
-    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
-    /// custom-together-design.md §5: a hot spring she accepted draws a
-    /// romance-compatible pair's picture undressed, over a named outfit. Only
-    /// the composer's slot: the reply still wears the outfit.
+    /// Spec 2026-11-27-together-action-groups-design.md §7: a hot spring she
+    /// accepted draws a compatible female persona in her tier's swimsuit,
+    /// over a named outfit. Only the composer's slot: the reply still wears
+    /// the outfit.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn an_accepted_hot_spring_draws_her_undressed_for_a_compatible_pair(pool: PgPool) {
-        let (frames, payload, replies, clothing, answer) = water_picture_turn(
+    async fn an_accepted_hot_spring_draws_the_tiers_swimsuit(pool: PgPool) {
+        let (frames, payload, replies, clothing, answer) = water_picture_turn_with(
             &pool,
             eros_engine_core::types::UserAction::HotSpringTogether,
             "accept",
             true,
+            Some(serde_json::json!({"gender": "female"})),
+            Some(0.5),
+            &[],
             |m| m.outfit = Some("红色旗袍".into()),
         )
         .await;
         assert_eq!(action_response_of(&frames), "accept");
         assert_eq!(image_requests(&frames), 1);
-        assert!(payload.contains("[此刻穿着]\n什么都没穿\n"), "{payload}");
+        assert!(
+            payload.contains("[此刻穿着]\nBandeau bikini\n"),
+            "{payload}"
+        );
         assert!(
             payload.contains("[此刻状态]\n和对方一起泡温泉\n"),
             "{payload}"
         );
-        assert_eq!(clothing, "什么都没穿");
+        assert_eq!(clothing, "Bandeau bikini");
         assert_eq!(answer, "accept");
         assert!(replies.contains("红色旗袍"), "{replies}");
-        assert!(!replies.contains("什么都没穿"), "{replies}");
+        assert!(!replies.contains("Bandeau bikini"), "{replies}");
+    }
+
+    /// §7: a sauna she accepted draws a compatible pair in a loose towel.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_sauna_draws_a_loose_towel_for_a_compatible_pair(pool: PgPool) {
+        let (_, payload, _, clothing, _) = water_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::SaunaTogether,
+            "accept",
+            true,
+            |_| {},
+        )
+        .await;
+        assert!(
+            payload.contains("[此刻穿着]\n身上只松松地裹着一条浴巾\n"),
+            "{payload}"
+        );
+        assert_eq!(clothing, "身上只松松地裹着一条浴巾");
+    }
+
+    /// §7: a shower she accepted draws her with nothing on, the nude
+    /// group's line.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_shower_draws_her_with_nothing_on(pool: PgPool) {
+        let (frames, payload, _, clothing, _) = water_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::ShowerTogether,
+            "accept",
+            false,
+            |_| {},
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(payload.contains("[此刻穿着]\n什么都没穿\n"), "{payload}");
+        assert_eq!(clothing, "什么都没穿");
     }
 
     /// §5: a sauna she accepted draws a pair that is not romance-compatible
@@ -12395,7 +12438,7 @@ data: [DONE]\n\n";
 
     /// §5: a picture's state read with the scopes its path holds: a sauna
     /// under way on the default (bond-only) scopes reads a towel, on
-    /// romance-compatible ones nothing.
+    /// romance-compatible ones a loose towel.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_sauna_on_default_scopes_reads_a_towel(pool: PgPool) {
         use eros_engine_core::scope::{romance_compatible, AffinityScope};
@@ -12430,6 +12473,41 @@ data: [DONE]\n\n";
         assert_eq!(picture.clothing_override, Some("身上只裹着一条浴巾"));
         assert_eq!(picture.state.as_deref(), Some("和对方一起蒸桑拿"));
         let picture = read(romance_compatible(AffinityScope::full())).await;
+        // A loose towel for a compatible pair (spec 2026-11-27-together-
+        // action-groups-design.md §7).
+        assert_eq!(picture.clothing_override, Some("身上只松松地裹着一条浴巾"));
+    }
+
+    /// Spec 2026-11-27-together-action-groups-design.md §7: a bath her own
+    /// accepted ask placed is a nude kind like any other: nothing on.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn her_own_bath_reads_nothing_on(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        seed_events(
+            &pool,
+            user_id,
+            instance_id,
+            session_id,
+            &[ev("bathing_together", 10, 20)],
+        )
+        .await;
+        let picture = state_for_picture(
+            &pool,
+            instance_id,
+            None,
+            chrono::Utc::now(),
+            None,
+            None,
+            crate::prompt::WaterWear {
+                romance_compatible: false,
+                wearer: crate::prompt::Wearer::Other,
+                virgin: false,
+                chemistry: 0.0,
+                coin: true,
+            },
+        )
+        .await;
         assert_eq!(picture.clothing_override, Some("什么都没穿"));
     }
 
@@ -12610,11 +12688,30 @@ data: [DONE]\n\n";
         assert_eq!(context["tier_drop"], "chemistry", "{context}");
     }
 
-    /// An incompatible pair's shower is refused before the judge: with no
-    /// judge the rule engine would accept it. It drops chemistry, shows no
-    /// picture and places nothing.
+    /// Spec 2026-11-27-together-action-groups-design.md §5.3: a refused
+    /// streak, the nude counterpart of a jog, drops bond and chemistry.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn an_incompatible_pair_never_showers_together(pool: PgPool) {
+    async fn a_refused_streak_drops_bond_and_chemistry(pool: PgPool) {
+        let (frames, _, umid) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::StreakTogether,
+            Some("refuse"),
+            true,
+            &[],
+            true,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert!(events_of_kind(&pool, "streaking_together").await.is_empty());
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert_eq!(context["tier_drop"], "both", "{context}");
+    }
+
+    /// Spec 2026-11-27-together-action-groups-design.md §5.1: an
+    /// incompatible pair's shower is no longer refused before the judge;
+    /// with no judge the rule engine accepts it and the kind is placed.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incompatible_pairs_shower_reaches_the_judge(pool: PgPool) {
         let (frames, _, umid) = run_together_turn(
             &pool,
             eros_engine_core::types::UserAction::ShowerTogether,
@@ -12624,12 +12721,26 @@ data: [DONE]\n\n";
             true,
         )
         .await;
-        assert_eq!(action_response_of(&frames), "refuse");
-        assert_eq!(meta_action_type(&frames), FrameActionType::Reply);
-        assert_eq!(image_requests(&frames), 0);
-        assert!(events_of_kind(&pool, "showering_together").await.is_empty());
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_eq!(events_of_kind(&pool, "showering_together").await.len(), 1);
         let (context, _) = turn_affinity_row(&pool, umid).await;
-        assert_eq!(context["tier_drop"], "chemistry", "{context}");
+        assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    /// §5.1: so is an incompatible pair's sex.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incompatible_pairs_sex_reaches_the_judge(pool: PgPool) {
+        let (frames, _, _) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::SexTogether,
+            None,
+            false,
+            &[],
+            true,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_eq!(events_of_kind(&pool, "having_sex_together").await.len(), 1);
     }
 
     /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
@@ -21999,8 +22110,8 @@ data: [DONE]\n\n";
         use eros_engine_core::types::ActionResponse::{Accept, Refuse};
         use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
         use eros_engine_core::types::UserAction::{
-            CycleTogether, FishTogether, HikeTogether, RideHorseNakedTogether, SwimTogether,
-            WorkoutTogether,
+            CycleTogether, FishTogether, HikeNakedTogether, HikeTogether, HotSpringNakedTogether,
+            RideHorseNakedTogether, SwimTogether, WorkoutTogether, YogaNakedTogether,
         };
         let mut cases = Vec::new();
         for a in [
@@ -22010,6 +22121,9 @@ data: [DONE]\n\n";
             HikeTogether,
             FishTogether,
             RideHorseNakedTogether,
+            YogaNakedTogether,
+            HikeNakedTogether,
+            HotSpringNakedTogether,
         ] {
             assert!(is_picture_action(&a), "{a:?}");
             cases.extend([
@@ -22109,8 +22223,8 @@ data: [DONE]\n\n";
         );
     }
 
-    /// A together action ruled out before the judge (the romance gate, a
-    /// machine, the habit roll) is something she will not agree to, never
+    /// A together action ruled out before the judge (a machine, the habit
+    /// roll) is something she will not agree to, never
     /// something she will not take (spec 2026-11-23-twelve-together-actions-
     /// and-propose-design.md §4.1, §5).
     #[test]
@@ -29340,7 +29454,7 @@ data: [DONE]\n\n"
                 Some(umid),
                 None,
                 false,
-                None,
+                &[],
                 None,
                 false,
             )

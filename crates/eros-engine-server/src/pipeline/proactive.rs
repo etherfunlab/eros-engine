@@ -463,6 +463,9 @@ fn kind_cue(
         | CommittingCrimeTogether
         | FishingTogether
         | NakedHorseRidingTogether
+        | NakedYogaTogether
+        | NakedHikingTogether
+        | NakedHotSpringTogether
         | CustomTogether => {
             unreachable!("{kind:?} is never told")
         }
