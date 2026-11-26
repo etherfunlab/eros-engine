@@ -5966,7 +5966,7 @@
       },
       "EventView": {
         "type": "object",
-        "description": "A life event: what happened, when it started and ends, whether it keeps\nthe persona offline while it lasts, and the message that told it (`null`\nfor an event that is not told).",
+        "description": "A life event: what happened, when it started and ends, whether it keeps\nthe persona offline while it lasts, and the message that told it (`null`\nfor an event that is not told). On a `custom_together` `message_id` is\nthe user's message that asked, not hers.",
         "required": [
           "kind",
           "category",
@@ -5999,6 +5999,13 @@
           "started_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The user's words of a `custom_together`, read from the message that\nasked; `null` once that message is gone, and for every other kind."
           }
         }
       },

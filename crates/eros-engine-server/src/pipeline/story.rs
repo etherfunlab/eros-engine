@@ -654,6 +654,7 @@ mod tests {
                 started_at,
                 ends_at,
                 message_id: None,
+                text: None,
             },
             told: told.map(str::to_string),
         }

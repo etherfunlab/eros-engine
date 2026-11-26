@@ -13,7 +13,10 @@ use crate::life_choices::pending_for_instance_on;
 
 /// One event. `session_id` is where it was drawn and told, `message_id` the
 /// message that told it; either is `None` once its row is gone, and
-/// `message_id` is `None` for an event that is never told.
+/// `message_id` is `None` for an event that is never told. On a
+/// `custom_together` `message_id` is the user's message that asked (spec
+/// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-custom-
+/// together-design.md §8.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventRecord {
     pub id: Uuid,
@@ -22,6 +25,11 @@ pub struct EventRecord {
     pub started_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
     pub message_id: Option<Uuid>,
+    /// The user's words of a `custom_together`, read from that message's
+    /// `metadata.action.text` by [`EventRepo::current`] and
+    /// [`EventRepo::by_key`]; `None` once the message is gone, for every
+    /// other kind, and from every other read.
+    pub text: Option<String>,
 }
 
 impl EventRecord {
@@ -116,6 +124,7 @@ fn record(
         started_at,
         ends_at,
         message_id,
+        text: None,
     })
 }
 
@@ -329,6 +338,7 @@ impl EventRepo<'_> {
             started_at: e.started_at,
             ends_at: e.ends_at,
             message_id,
+            text: None,
         })
     }
 
@@ -438,7 +448,7 @@ impl EventRepo<'_> {
         Ok(ended)
     }
 
-    /// The event written in this session under `event_key`.
+    /// The event written in this session under `event_key`, with its text.
     pub async fn by_key(
         &self,
         session_id: Uuid,
@@ -452,7 +462,29 @@ impl EventRepo<'_> {
         .bind(event_key)
         .fetch_optional(self.pool)
         .await?;
-        Ok(row.and_then(record))
+        let mut e = row.and_then(record);
+        if let Some(e) = e.as_mut() {
+            self.read_text(e).await?;
+        }
+        Ok(e)
+    }
+
+    /// Fill `e.text` for a `custom_together` whose message is there: the
+    /// user's words, `metadata.action.text` of the row `message_id` names
+    /// (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.3). Reads nothing for any other kind.
+    async fn read_text(&self, e: &mut EventRecord) -> Result<(), sqlx::Error> {
+        let (EventKind::CustomTogether, Some(message_id)) = (e.kind, e.message_id) else {
+            return Ok(());
+        };
+        e.text = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT metadata->'action'->>'text' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(message_id)
+        .fetch_optional(self.pool)
+        .await?
+        .flatten();
+        Ok(())
     }
 
     /// The instance's events started at or after `since`, across its
@@ -497,7 +529,8 @@ impl EventRepo<'_> {
     /// newest `period` and the newest `period_scare` row started by the
     /// moment, however old; a row of either kind under way lands in neither
     /// of the other two slots. With `period` `None` the cycle rows are not
-    /// read. One statement.
+    /// read. One statement, and one more for a `custom_together` foreground's
+    /// text.
     pub async fn current(
         &self,
         instance_id: Uuid,
@@ -582,6 +615,9 @@ impl EventRepo<'_> {
             if slot.is_none() {
                 *slot = Some(e);
             }
+        }
+        if let Some(e) = out.foreground.as_mut() {
+            self.read_text(e).await?;
         }
         if let Some(health) = period {
             out.cycle_rows = CycleRows {
@@ -1269,6 +1305,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((c.foreground, c.background), (None, None));
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.3: a `custom_together` reads the user's
+    /// words from the message that asked, for as long as that message is
+    /// there.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn current_reads_the_custom_text_from_the_user_row(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let asked: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, '2026-10-01T10:00:00Z') RETURNING id",
+        )
+        .bind(s)
+        .bind(json!({"action": {
+            "type": "custom_together", "text": "去海边放烟花", "response": "accept",
+        }}))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let key = format!("action:{asked}:custom_together");
+        let mut tx = pool.begin().await.unwrap();
+        EventRepo::place_together_in_tx(
+            &mut tx,
+            &ev(
+                i,
+                s,
+                &key,
+                CustomTogether,
+                "2026-10-01T10:00:00Z",
+                "2026-10-01T11:00:00Z",
+            ),
+            asked,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let at = t("2026-10-01T10:30:00Z");
+
+        let e = repo.current(i, None, at, None).await.unwrap().foreground;
+        let e = e.expect("under way");
+        assert_eq!((e.kind, e.message_id), (CustomTogether, Some(asked)));
+        assert_eq!(e.text.as_deref(), Some("去海边放烟花"));
+        let by_key = repo.by_key(s, &key).await.unwrap().expect("written");
+        assert_eq!(by_key.text.as_deref(), Some("去海边放烟花"));
+
+        sqlx::query("DELETE FROM engine.chat_messages WHERE id = $1")
+            .bind(asked)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let e = repo.current(i, None, at, None).await.unwrap().foreground;
+        let e = e.expect("still under way");
+        assert_eq!((e.message_id, e.text), (None, None));
+        let by_key = repo.by_key(s, &key).await.unwrap().expect("written");
+        assert_eq!(by_key.text, None);
     }
 
     #[sqlx::test(migrations = "./migrations")]

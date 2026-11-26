@@ -488,6 +488,7 @@ impl<'a> StoryRepo<'a> {
                             started_at,
                             ends_at,
                             message_id,
+                            text: None,
                         },
                         told,
                     })

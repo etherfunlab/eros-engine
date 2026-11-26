@@ -4377,38 +4377,46 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-/// The background, cycle and foreground kinds a picture reads from the events
-/// `current` holds, with the kind being started this moment (`starting`, not
-/// stored yet) counted as live: it stands in for the slot `slot()` gives it
-/// (spec 2026-11-24-period-cycle-design.md §7).
-fn picture_kinds(
-    current: &eros_engine_store::events::CurrentEvents,
-    starting: Option<eros_engine_core::events::EventKind>,
+/// An event as a picture reads it: its kind, and the user's words of a
+/// `custom_together` (spec 2026-11-26-more-together-actions-bath-outfit-
+/// chemistry-drop-and-custom-together-design.md §8.3).
+type Doing<'a> = (eros_engine_core::events::EventKind, Option<&'a str>);
+
+/// The background and cycle kinds and the foreground a picture reads from
+/// the events `current` holds, with the event being started this moment
+/// (`starting`, not stored yet) counted as live: it stands in for the slot
+/// `slot()` gives its kind (spec 2026-11-24-period-cycle-design.md §7).
+fn picture_kinds<'a>(
+    current: &'a eros_engine_store::events::CurrentEvents,
+    starting: Option<Doing<'a>>,
 ) -> (
     Option<eros_engine_core::events::EventKind>,
     Option<eros_engine_core::events::EventKind>,
-    Option<eros_engine_core::events::EventKind>,
+    Option<Doing<'a>>,
 ) {
     use eros_engine_core::events::Slot;
     let mut background = current.background.as_ref().map(|e| e.kind);
     let mut cycle = current.cycle.as_ref().map(|e| e.kind);
-    let mut foreground = current.foreground.as_ref().map(|e| e.kind);
-    if let Some(kind) = starting {
-        *match kind.slot() {
-            Slot::Background => &mut background,
-            Slot::Cycle => &mut cycle,
-            Slot::Foreground => &mut foreground,
-        } = Some(kind);
+    let mut foreground = current
+        .foreground
+        .as_ref()
+        .map(|e| (e.kind, e.text.as_deref()));
+    if let Some((kind, text)) = starting {
+        match kind.slot() {
+            Slot::Background => background = Some(kind),
+            Slot::Cycle => cycle = Some(kind),
+            Slot::Foreground => foreground = Some((kind, text)),
+        }
     }
     (background, cycle, foreground)
 }
 
 /// What the composer's `[此刻状态]` says of the events `current` holds, with
-/// the kind being started this moment (`starting`, not stored yet) counted as
-/// live in its slot. Pure.
+/// the event being started this moment (`starting`, not stored yet) counted
+/// as live in its slot. Pure.
 pub(crate) fn picture_state_of(
     current: &eros_engine_store::events::CurrentEvents,
-    starting: Option<eros_engine_core::events::EventKind>,
+    starting: Option<Doing<'_>>,
 ) -> Option<String> {
     let (background, cycle, foreground) = picture_kinds(current, starting);
     crate::prompt::current_state(background, cycle, foreground)
@@ -4423,8 +4431,8 @@ pub(crate) fn partner_gender_of(
     starting: Option<eros_engine_core::events::EventKind>,
     gender: Option<crate::routes::companion_stream::UserGender>,
 ) -> Option<&'static str> {
-    let (background, _, foreground) = picture_kinds(current, starting);
-    let shared = [background, foreground]
+    let (background, _, foreground) = picture_kinds(current, starting.map(|k| (k, None)));
+    let shared = [background, foreground.map(|(kind, _)| kind)]
         .into_iter()
         .flatten()
         .any(|kind| kind.is_shared());
@@ -4463,10 +4471,13 @@ pub(crate) async fn state_for_picture(
             tracing::warn!(%instance_id, "image-compose: event read failed: {e}");
             eros_engine_store::events::CurrentEvents::none(now)
         });
-    let (background, cycle, foreground) = picture_kinds(&current, starting);
+    let (background, cycle, foreground) = picture_kinds(&current, starting.map(|k| (k, None)));
     PictureState {
         state: crate::prompt::current_state(background, cycle, foreground),
-        clothing_override: crate::prompt::water_clothing(foreground, romance_compatible),
+        clothing_override: crate::prompt::water_clothing(
+            foreground.map(|(kind, _)| kind),
+            romance_compatible,
+        ),
     }
 }
 
@@ -6269,9 +6280,19 @@ pub(crate) fn run_stream_with(
                 // an accepted together action's event counts as live, though it
                 // is stored only with her answer, and never on a date (spec
                 // 2026-11-20-together-actions-state-in-picture-and-genome-
-                // routes-design.md §5).
+                // routes-design.md §5). A `custom_together` carries the
+                // user's words from the action in hand, on a date as well
+                // (spec 2026-11-26-more-together-actions-bath-outfit-
+                // chemistry-drop-and-custom-together-design.md §8.3).
                 let placed = accepted_together(user_msg.action.as_ref(), plan.action_response);
-                let picture_state = picture_state_of(&current, placed);
+                let doing = placed.map(|kind| {
+                    let text = user_msg
+                        .action
+                        .as_ref()
+                        .and_then(eros_engine_core::types::UserAction::together_text);
+                    (kind, text)
+                });
+                let picture_state = picture_state_of(&current, doing);
                 // The user's gender, when what she is doing is something she
                 // shares with them (spec 2026-11-24 §7.2).
                 let partner_gender = partner_gender_of(&current, placed, user_msg.user_gender);
@@ -6280,7 +6301,7 @@ pub(crate) fn run_stream_with(
                 // clothing (spec 2026-11-26-more-together-actions-bath-outfit-
                 // chemistry-drop-and-custom-together-design.md §5).
                 let clothing_override = crate::prompt::water_clothing(
-                    picture_kinds(&current, placed).2,
+                    picture_kinds(&current, doing).2.map(|(kind, _)| kind),
                     eros_engine_core::scope::romance_compatible(user_msg.affinity_scope),
                 );
                 let mut image_only_done = false;
@@ -12082,6 +12103,31 @@ data: [DONE]\n\n";
             "{payload}"
         );
         assert_eq!(clothing, "红色旗袍");
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.3: the picture of an accepted
+    /// `custom_together` reads the user's words from the action in hand, and
+    /// the row is placed.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_custom_together_shows_its_text(pool: PgPool) {
+        let (frames, payload, _, _, answer) = water_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::CustomTogether {
+                text: "去海边放烟花".into(),
+            },
+            "accept",
+            true,
+            |_| {},
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起：「去海边放烟花」\n"),
+            "{payload}"
+        );
+        assert_eq!(answer, "accept");
+        assert_eq!(events_of_kind(&pool, "custom_together").await.len(), 1);
     }
 
     /// §5: a picture's state read with the scopes its path holds: a sauna
@@ -24307,6 +24353,7 @@ data: [DONE]\n\n"
             started_at: chrono::DateTime::UNIX_EPOCH,
             ends_at: chrono::DateTime::UNIX_EPOCH,
             message_id: None,
+            text: None,
         }
     }
 
@@ -24327,15 +24374,15 @@ data: [DONE]\n\n"
         // An incident takes the foreground's place, a background the
         // background's; the other one stays.
         assert_eq!(
-            picture_state_of(&under_way, Some(TakingSelfie)).as_deref(),
+            picture_state_of(&under_way, Some((TakingSelfie, None))).as_deref(),
             Some("短途旅游；刚拍了张自拍")
         );
         assert_eq!(
-            picture_state_of(&nothing, Some(TakingSelfie)).as_deref(),
+            picture_state_of(&nothing, Some((TakingSelfie, None))).as_deref(),
             Some("刚拍了张自拍")
         );
         assert_eq!(
-            picture_state_of(&nothing, Some(ShortTrip)).as_deref(),
+            picture_state_of(&nothing, Some((ShortTrip, None))).as_deref(),
             Some("短途旅游")
         );
         // The slot it does not take stays as it is.
@@ -24345,11 +24392,11 @@ data: [DONE]\n\n"
             ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
         };
         assert_eq!(
-            picture_state_of(&incident_only, Some(LongTrip)).as_deref(),
+            picture_state_of(&incident_only, Some((LongTrip, None))).as_deref(),
             Some("长途旅游；在坐火车")
         );
         assert_eq!(
-            picture_state_of(&under_way, Some(LongTrip)).as_deref(),
+            picture_state_of(&under_way, Some((LongTrip, None))).as_deref(),
             Some("长途旅游；在坐火车")
         );
         let background_only = eros_engine_store::events::CurrentEvents {
@@ -24358,7 +24405,7 @@ data: [DONE]\n\n"
             ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
         };
         assert_eq!(
-            picture_state_of(&background_only, Some(TakingSelfie)).as_deref(),
+            picture_state_of(&background_only, Some((TakingSelfie, None))).as_deref(),
             Some("短途旅游；刚拍了张自拍")
         );
     }
@@ -24386,7 +24433,7 @@ data: [DONE]\n\n"
             Some("短途旅游；月经中；在坐火车")
         );
         assert_eq!(
-            picture_state_of(&on_period, Some(TakingSelfie)).as_deref(),
+            picture_state_of(&on_period, Some((TakingSelfie, None))).as_deref(),
             Some("短途旅游；月经中；刚拍了张自拍")
         );
         let background_only = eros_engine_store::events::CurrentEvents {
@@ -24394,11 +24441,11 @@ data: [DONE]\n\n"
             ..eros_engine_store::events::CurrentEvents::none(epoch)
         };
         assert_eq!(
-            picture_state_of(&background_only, Some(Period)).as_deref(),
+            picture_state_of(&background_only, Some((Period, None))).as_deref(),
             Some("短途旅游；月经中")
         );
         assert_eq!(
-            picture_state_of(&on_period, Some(PeriodScare)).as_deref(),
+            picture_state_of(&on_period, Some((PeriodScare, None))).as_deref(),
             Some("短途旅游；月经没来；在坐火车")
         );
     }
@@ -24432,6 +24479,7 @@ data: [DONE]\n\n"
             picture_state_of(
                 &on_a_date,
                 accepted_together(Some(&UserAction::SaunaTogether), Some(Accept))
+                    .map(|k| (k, None))
             )
             .as_deref(),
             Some("和对方一起蒸桑拿")
@@ -29360,6 +29408,42 @@ data: [DONE]\n\n"
                 .await
                 .unwrap();
         assert_eq!(Some(date_ends), s.activity.ends_at, "the date goes on");
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.3: on a date an accepted
+    /// `custom_together` places nothing, and its picture still reads the
+    /// user's words.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_custom_together_on_a_date_shows_its_text(pool: PgPool) {
+        let s = date_scene(
+            &pool,
+            serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": "accept"}),
+            "[tasks.chat_image_prompt_compose]\nmodel=\"composer\"\n",
+        )
+        .await;
+        let (frames, _) = s
+            .send(
+                1,
+                serde_json::json!({
+                    "content": "",
+                    "action": {"type": "custom_together", "text": "去海边放烟花"},
+                    "image": {},
+                }),
+            )
+            .await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "action_response" && f["response"] == "accept"),
+            "{frames:?}"
+        );
+        let payload = the_composer_payload(&s.mock).await;
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起：「去海边放烟花」\n"),
+            "{payload}"
+        );
+        assert!(events_of_kind(&pool, "custom_together").await.is_empty());
     }
 
     /// A date scene's one turn: an accepted `sauna_together` with a picture,
