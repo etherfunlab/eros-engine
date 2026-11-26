@@ -848,6 +848,12 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::SwimTogether => "想和你一起游泳".into(),
         UserAction::CycleTogether => "想和你一起骑单车".into(),
         UserAction::HikeTogether => "想和你一起爬山".into(),
+        UserAction::DanceTogether => "想和你一起跳舞".into(),
+        UserAction::AdventureTogether => "想和你一起去冒险".into(),
+        UserAction::PlayWithFireTogether => "想和你一起玩火".into(),
+        UserAction::SingTogether => "想和你一起唱歌".into(),
+        UserAction::SkinnyDipTogether => "想和你一起裸泳".into(),
+        UserAction::CommitCrimeTogether => "想和你一起去犯罪".into(),
         UserAction::Challenge => "向你发起挑战".into(),
         UserAction::Bet => "想和你打个赌".into(),
         UserAction::Custom { text } => text.clone(),
@@ -1183,6 +1189,12 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         SwimmingTogether => "和对方一起游泳",
         CyclingTogether => "和对方一起骑单车",
         HikingTogether => "和对方一起爬山",
+        DancingTogether => "和对方一起跳舞",
+        AdventuringTogether => "和对方一起冒险",
+        PlayingWithFireTogether => "和对方一起玩火",
+        SingingTogether => "和对方一起唱歌",
+        SkinnyDippingTogether => "和对方一起裸泳",
+        CommittingCrimeTogether => "和对方一起犯罪",
     }
 }
 
@@ -1584,6 +1596,23 @@ pub(crate) fn stripped_clothing(outfit: Option<&str>) -> String {
     match outfit {
         Some(o) => format!("「{o}」被对方脱掉了"),
         None => "衣服被对方脱掉了".to_string(),
+    }
+}
+
+/// What the composer's `[此刻穿着]` says when the foreground of a picture is
+/// a hot spring or a sauna with the user, over the judge's clothing and a
+/// named outfit (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-
+/// drop-and-custom-together-design.md §5): nothing on for a romance-compatible
+/// pair, a towel otherwise. `None` for any other foreground.
+pub(crate) fn water_clothing(
+    foreground: Option<eros_engine_core::events::EventKind>,
+    romance_compatible: bool,
+) -> Option<&'static str> {
+    use eros_engine_core::events::EventKind::{HotSpringTogether, SaunaTogether};
+    match foreground? {
+        HotSpringTogether | SaunaTogether if romance_compatible => Some("什么都没穿"),
+        HotSpringTogether | SaunaTogether => Some("身上只裹着一条浴巾"),
+        _ => None,
     }
 }
 
@@ -5654,6 +5683,26 @@ mod tests {
         );
     }
 
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §5.
+    #[test]
+    fn water_clothing_by_kind_and_pair() {
+        use eros_engine_core::events::EventKind::*;
+        for k in [HotSpringTogether, SaunaTogether] {
+            assert_eq!(water_clothing(Some(k), true), Some("什么都没穿"));
+            assert_eq!(water_clothing(Some(k), false), Some("身上只裹着一条浴巾"));
+        }
+        for k in [
+            BathingTogether,
+            ShoweringTogether,
+            Bathing,
+            SwimmingTogether,
+        ] {
+            assert_eq!(water_clothing(Some(k), true), None);
+        }
+        assert_eq!(water_clothing(None, true), None);
+    }
+
     #[test]
     fn current_state_lists_background_then_foreground() {
         use eros_engine_core::events::EventKind::{OnATrain, ShortTrip};
@@ -7142,6 +7191,43 @@ mod tests {
             action_outcome(&UserAction::Challenge, ActionResponse::Refuse),
             "对方向你发起挑战，你没应战。"
         );
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §4.
+    #[test]
+    fn six_more_together_actions_read_their_markers_and_labels() {
+        for (a, marker, label) in [
+            (
+                UserAction::DanceTogether,
+                "想和你一起跳舞",
+                "和对方一起跳舞",
+            ),
+            (
+                UserAction::AdventureTogether,
+                "想和你一起去冒险",
+                "和对方一起冒险",
+            ),
+            (
+                UserAction::PlayWithFireTogether,
+                "想和你一起玩火",
+                "和对方一起玩火",
+            ),
+            (UserAction::SingTogether, "想和你一起唱歌", "和对方一起唱歌"),
+            (
+                UserAction::SkinnyDipTogether,
+                "想和你一起裸泳",
+                "和对方一起裸泳",
+            ),
+            (
+                UserAction::CommitCrimeTogether,
+                "想和你一起去犯罪",
+                "和对方一起犯罪",
+            ),
+        ] {
+            assert_eq!(action_marker(&a), format!("（{marker}）"), "{a:?}");
+            assert_eq!(event_label(a.together_kind().unwrap()), label, "{a:?}");
+        }
     }
 
     /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-

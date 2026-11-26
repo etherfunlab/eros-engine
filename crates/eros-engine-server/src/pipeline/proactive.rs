@@ -425,13 +425,42 @@ fn kind_cue(
         // (`events::is_told`); anyone else is simply out and keeps replying.
         OutShopping if traits.female => "（你接下来要出门逛街，这段时间顾不上看手机。）".into(),
         OutShopping => "（你正在外面逛街。）".into(),
-        AwayFromPhone | Asleep | BrosGathering | SisGathering | HavingSex | TakingSpace
-        | FellOut | TravelingTogether | BathingTogether | OnADate | ShoweringTogether
-        | SaunaTogether | UsingToiletTogether | SmokingTogether | AsleepTogether
-        | HavingSexTogether | WalkingTogether | SmokingWeedTogether | JoggingTogether
-        | YogaTogether | StargazingTogether | HorseRidingTogether | StreakingTogether
-        | DrinkingTogether | HotSpringTogether | FightingTogether | WorkingOutTogether
-        | SwimmingTogether | CyclingTogether | HikingTogether => {
+        AwayFromPhone
+        | Asleep
+        | BrosGathering
+        | SisGathering
+        | HavingSex
+        | TakingSpace
+        | FellOut
+        | TravelingTogether
+        | BathingTogether
+        | OnADate
+        | ShoweringTogether
+        | SaunaTogether
+        | UsingToiletTogether
+        | SmokingTogether
+        | AsleepTogether
+        | HavingSexTogether
+        | WalkingTogether
+        | SmokingWeedTogether
+        | JoggingTogether
+        | YogaTogether
+        | StargazingTogether
+        | HorseRidingTogether
+        | StreakingTogether
+        | DrinkingTogether
+        | HotSpringTogether
+        | FightingTogether
+        | WorkingOutTogether
+        | SwimmingTogether
+        | CyclingTogether
+        | HikingTogether
+        | DancingTogether
+        | AdventuringTogether
+        | PlayingWithFireTogether
+        | SingingTogether
+        | SkinnyDippingTogether
+        | CommittingCrimeTogether => {
             unreachable!("{kind:?} is never told")
         }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),
@@ -739,13 +768,17 @@ async fn store(
         };
         // The events at the instant the reply prompt read them; the event
         // itself is not stored yet, so the kind it starts counts as live.
-        let current_state = state_for_picture(
+        // What she wears in a hot spring or a sauna reads the request's scopes
+        // (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-
+        // and-custom-together-design.md §5).
+        let shown = state_for_picture(
             &state.pool,
             g.instance_id,
             None,
             g.now.now,
             Some(*kind),
             crate::prompt::persona_traits(&g.persona).cycle_health(),
+            eros_engine_core::scope::romance_compatible(g.affinity_scope),
         )
         .await;
         let img = build_delegated_image_prompt_for(
@@ -758,10 +791,11 @@ async fn store(
             g.user_id,
             g.session_id,
             body_state.as_deref(),
-            current_state.as_deref(),
+            shown.state.as_deref(),
             None,
             None,
             "event",
+            shown.clothing_override,
         )
         .await;
         metadata.insert(

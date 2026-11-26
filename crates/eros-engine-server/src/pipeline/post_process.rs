@@ -27,6 +27,7 @@ use eros_engine_store::character_insight::{
     CharacterInsightEventRepo, CharacterInsightRepo,
 };
 use eros_engine_store::chat::ChatRepo;
+use eros_engine_store::events::EventRepo;
 use eros_engine_store::human_fact::{FactInput, FactSource, HumanFactRepo};
 use eros_engine_store::insight::{InsightEventInsert, InsightEventRepo};
 use eros_engine_store::memory::{MemoryLayer, MemoryRepo};
@@ -419,6 +420,22 @@ pub(crate) async fn run_affinity_turn(
     )
     .await;
 
+    // A turn that carried chemistry down a tier ends an intimate event of hers
+    // under way since before its message (spec 2026-11-26-more-together-
+    // actions-bath-outfit-chemistry-drop-and-custom-together-design.md §6). A
+    // write of its own, after the affinity commit: it takes the instance's
+    // lock, which is never taken while the affinity row's is held. A date
+    // turn ends none: the date's settlement scores it, and opening the date
+    // already ended whatever she was doing.
+    if let (Some(true), Some(message_id), false) = (committed, user_message_id, activity_turn) {
+        if let Err(e) = (EventRepo { pool: &state.pool })
+            .end_intimate_after_message(instance_id, message_id, chrono::Utc::now())
+            .await
+        {
+            tracing::warn!(%session_id, "ending an intimate event failed: {e}");
+        }
+    }
+
     // Feeling-clause summarizer (spec 2026-09-03): movement turns and a
     // refused action's tier drop only,
     // gated on the [tasks.affinity_summary] section being present at
@@ -433,7 +450,7 @@ pub(crate) async fn run_affinity_turn(
     }
 
     // Last, so the ask's own generation never delays the feeling clause.
-    if committed && judged {
+    if committed.is_some() && judged {
         super::life_choice::maybe_ask(state, session_id, user_id, instance_id, persona).await;
     }
 }
@@ -447,8 +464,10 @@ pub(crate) async fn run_affinity_turn(
 /// responsibility because the streak reset is a pipeline-policy concern,
 /// not a row-update concern.
 ///
-/// `true` when the turn's event row committed. `journal_tz` dates the tier
-/// rows the write journals (UTC when `None`).
+/// `Some` when the turn's graded event committed, holding whether the write
+/// carried the chemistry tier down (`AffinityRepo::persist_with_event`);
+/// `None` otherwise, a ghost included. `journal_tz` dates the tier rows the
+/// write journals (UTC when `None`).
 #[allow(clippy::too_many_arguments)] // each arg is a distinct affinity-persist concern
 async fn persist_affinity(
     state: &AppState,
@@ -465,7 +484,7 @@ async fn persist_affinity(
     user_message_id: Option<Uuid>,
     tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
     journal_tz: Option<chrono_tz::Tz>,
-) -> bool {
+) -> Option<bool> {
     let repo = AffinityRepo { pool: &state.pool };
 
     // Demo sessions get boosted positive raw scores so meters move within the
@@ -494,10 +513,10 @@ async fn persist_affinity(
         .await
     {
         Ok(Some(a)) => a,
-        Ok(None) => return false,
+        Ok(None) => return None,
         Err(e) => {
             tracing::warn!("affinity load_or_create failed: {e}");
-            return false;
+            return None;
         }
     };
 
@@ -506,13 +525,13 @@ async fn persist_affinity(
             if let Err(e) = repo.record_ghost(&mut affinity, user_message_id).await {
                 tracing::warn!("affinity record_ghost failed: {e}");
             }
-            false
+            None
         }
         ActionType::ProductQa => {
             // product_qa turns never run post_process (the stream arm skips
             // it); keep the match exhaustive without side effects.
             tracing::warn!("persist_affinity called with ProductQa — ignoring");
-            false
+            None
         }
         ActionType::ReplyText
         | ActionType::ReplyImage
@@ -551,10 +570,10 @@ async fn persist_affinity(
                 )
                 .await
             {
-                Ok(()) => true,
+                Ok(chem_fell) => Some(chem_fell),
                 Err(e) => {
                     tracing::warn!("affinity persist_with_event failed: {e}");
-                    false
+                    None
                 }
             }
         }
@@ -5962,5 +5981,254 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 0, "a group turn leaves no {table} row");
         }
+    }
+
+    // ─── A chemistry drop ends an intimate event ────────────────────
+
+    /// The judge's verdicts for the turns below: nothing moves, or both
+    /// chemistry axes fall four steps (about 0.16 each).
+    const NEUTRAL_EVAL: &str = r#"{"warmth":2,"trust":{"grade":0,"direction":"up"},"intimacy":{"grade":0,"direction":"up"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":0,"direction":"up"},"patience":2,"reason":"稳"}"#;
+    const CHEMISTRY_DOWN_EVAL: &str = r#"{"warmth":2,"trust":{"grade":0,"direction":"up"},"intimacy":{"grade":4,"direction":"down"},"intrigue":{"grade":0,"direction":"up"},"tension":{"grade":4,"direction":"down"},"patience":2,"reason":"冷"}"#;
+
+    /// The user's line on the judged turns below; only the judge's request
+    /// carries it.
+    const JUDGED_LINE: &str = "我今天过得还不错，你呢";
+
+    /// A moment `m` minutes ago, whole microseconds, so what Postgres stores
+    /// is what the test compares.
+    fn minutes_ago(m: i64) -> chrono::DateTime<chrono::Utc> {
+        use chrono::SubsecRound;
+        (chrono::Utc::now() - chrono::Duration::minutes(m)).trunc_subsecs(6)
+    }
+
+    /// `session_id`'s affinity row with both lines at 0.45, tier 3.
+    async fn both_lines_at_tier_three(
+        pool: &sqlx::PgPool,
+        owner: Uuid,
+        instance_id: Uuid,
+        session_id: Uuid,
+    ) {
+        AffinityRepo { pool }
+            .load_or_create(session_id, owner, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+                SET trust = 0.45, intrigue = 0.45, intimacy = 0.45, tension = 0.45, \
+                    bond_tier = 3, chem_tier = 3, updated_at = now() \
+              WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// (bond_tier, chem_tier) as stored.
+    async fn stored_tiers(pool: &sqlx::PgPool, session_id: Uuid) -> (i16, i16) {
+        sqlx::query_as(
+            "SELECT bond_tier, chem_tier FROM engine.companion_affinity WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// An event of `kind` placed in `session_id` at `started_at`, under way
+    /// for half an hour; returns its id.
+    async fn place_event(
+        pool: &sqlx::PgPool,
+        instance_id: Uuid,
+        session_id: Uuid,
+        kind: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.persona_events \
+               (instance_id, session_id, event_key, kind, started_at, ends_at) \
+             VALUES ($1, $2, $3, $3, $4, $5) RETURNING id",
+        )
+        .bind(instance_id)
+        .bind(session_id)
+        .bind(kind)
+        .bind(started_at)
+        .bind(started_at + chrono::Duration::minutes(30))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn event_ends(pool: &sqlx::PgPool, id: Uuid) -> chrono::DateTime<chrono::Utc> {
+        sqlx::query_scalar("SELECT ends_at FROM engine.persona_events WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A user message of `session_id` sent at `sent_at`.
+    async fn user_message_at(
+        pool: &sqlx::PgPool,
+        session_id: Uuid,
+        sent_at: chrono::DateTime<chrono::Utc>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', 'seed', $2) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(sent_at)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// One judged turn of `session_id`, driven by the user message `umid`,
+    /// the judge answering `eval`; `tier_drop` makes it a refused action.
+    async fn judged_turn(
+        pool: &sqlx::PgPool,
+        eval: &'static str,
+        (owner, instance_id, session_id): (Uuid, Uuid, Uuid),
+        umid: Uuid,
+        tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
+    ) {
+        let state = state_with_mock_openrouter(
+            pool.clone(),
+            "[tasks.affinity_evaluation]\nmodel=\"aff/m\"\n",
+            vec![(JUDGED_LINE, eval)],
+        )
+        .await;
+        run_affinity_turn(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            &persona_named("Aria"),
+            ActionType::ReplyText,
+            JUDGED_LINE,
+            "嗯，我在听。",
+            Default::default(),
+            Default::default(),
+            Some(umid),
+            None,
+            tier_drop.is_some(),
+            tier_drop,
+            None,
+            false,
+        )
+        .await;
+    }
+
+    /// A refused action drops chemistry a tier: the sex together under way
+    /// since before the message ends at the write.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_action_during_sex_together_ends_it(pool: sqlx::PgPool) {
+        use eros_engine_core::affinity::AffinityLine;
+        let (owner, instance, session) = text_relationship(&pool).await;
+        both_lines_at_tier_three(&pool, owner, instance, session).await;
+        let started = minutes_ago(5);
+        let sex = place_event(&pool, instance, session, "having_sex_together", started).await;
+        let umid = user_message_at(&pool, session, minutes_ago(1)).await;
+
+        judged_turn(
+            &pool,
+            NEUTRAL_EVAL,
+            (owner, instance, session),
+            umid,
+            Some(AffinityLine::Chemistry),
+        )
+        .await;
+
+        assert_eq!(stored_tiers(&pool, session).await, (3, 2));
+        let ends = event_ends(&pool, sex).await;
+        assert!(ends > started && ends <= chrono::Utc::now(), "{ends}");
+    }
+
+    /// The event is hers, not the session's: a refusal in another 1:1 session
+    /// of the same instance ends it too.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_action_in_another_session_of_hers_ends_it(pool: sqlx::PgPool) {
+        use eros_engine_core::affinity::AffinityLine;
+        let (owner, instance, there) = text_relationship(&pool).await;
+        let here = ChatRepo { pool: &pool }
+            .create_session(owner, instance)
+            .await
+            .unwrap()
+            .id;
+        both_lines_at_tier_three(&pool, owner, instance, here).await;
+        let started = minutes_ago(5);
+        let sex = place_event(&pool, instance, there, "having_sex_together", started).await;
+        let umid = user_message_at(&pool, here, minutes_ago(1)).await;
+
+        judged_turn(
+            &pool,
+            NEUTRAL_EVAL,
+            (owner, instance, here),
+            umid,
+            Some(AffinityLine::Chemistry),
+        )
+        .await;
+
+        assert_eq!(stored_tiers(&pool, here).await, (3, 2));
+        let ends = event_ends(&pool, sex).await;
+        assert!(ends > started && ends <= chrono::Utc::now(), "{ends}");
+    }
+
+    /// The turn that placed the event was sent before it started: its write
+    /// carrying chemistry down a tier ends nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_placing_turn_never_ends_its_own_event(pool: sqlx::PgPool) {
+        let (owner, instance, session) = text_relationship(&pool).await;
+        both_lines_at_tier_three(&pool, owner, instance, session).await;
+        let sent = minutes_ago(2);
+        let umid = user_message_at(&pool, session, sent).await;
+        let shower = place_event(
+            &pool,
+            instance,
+            session,
+            "showering_together",
+            sent + chrono::Duration::seconds(1),
+        )
+        .await;
+        let ends = event_ends(&pool, shower).await;
+
+        judged_turn(
+            &pool,
+            CHEMISTRY_DOWN_EVAL,
+            (owner, instance, session),
+            umid,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            stored_tiers(&pool, session).await.1,
+            2,
+            "the judge carried chemistry down a tier"
+        );
+        assert_eq!(event_ends(&pool, shower).await, ends);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_bond_drop_ends_nothing(pool: sqlx::PgPool) {
+        use eros_engine_core::affinity::AffinityLine;
+        let (owner, instance, session) = text_relationship(&pool).await;
+        both_lines_at_tier_three(&pool, owner, instance, session).await;
+        let bath = place_event(&pool, instance, session, "bathing_together", minutes_ago(5)).await;
+        let ends = event_ends(&pool, bath).await;
+        let umid = user_message_at(&pool, session, minutes_ago(1)).await;
+
+        judged_turn(
+            &pool,
+            NEUTRAL_EVAL,
+            (owner, instance, session),
+            umid,
+            Some(AffinityLine::Bond),
+        )
+        .await;
+
+        assert_eq!(stored_tiers(&pool, session).await, (2, 3));
+        assert_eq!(event_ends(&pool, bath).await, ends);
     }
 }

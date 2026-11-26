@@ -4431,9 +4431,20 @@ pub(crate) fn partner_gender_of(
     gender.filter(|_| shared).map(|g| g.zh())
 }
 
+/// What a picture's events give the composer: `[此刻状态]`, and the
+/// `[此刻穿着]` the engine writes over the plan's clothing, if any.
+#[derive(Default)]
+pub(crate) struct PictureState {
+    pub state: Option<String>,
+    pub clothing_override: Option<&'static str>,
+}
+
 /// What she is doing at a picture's moment, as the composer reads it: the
 /// events under way for `instance_id` at `at_message` (or at `now` without
-/// one), plus `starting`. `period` is the persona's
+/// one), plus `starting`, and what she wears in a hot spring or a sauna for a
+/// pair `romance_compatible` or not, the caller's resolved scopes (spec
+/// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-custom-
+/// together-design.md §5). `period` is the persona's
 /// `PersonaTraits::cycle_health`. Fail-open: a failed read is warned and reads
 /// as no events under way (`starting` still counts), never blocks the picture.
 pub(crate) async fn state_for_picture(
@@ -4443,7 +4454,8 @@ pub(crate) async fn state_for_picture(
     now: chrono::DateTime<chrono::Utc>,
     starting: Option<eros_engine_core::events::EventKind>,
     period: Option<eros_engine_core::events::Health>,
-) -> Option<String> {
+    romance_compatible: bool,
+) -> PictureState {
     let current = (eros_engine_store::events::EventRepo { pool })
         .current(instance_id, at_message, now, period)
         .await
@@ -4451,7 +4463,11 @@ pub(crate) async fn state_for_picture(
             tracing::warn!(%instance_id, "image-compose: event read failed: {e}");
             eros_engine_store::events::CurrentEvents::none(now)
         });
-    picture_state_of(&current, starting)
+    let (background, cycle, foreground) = picture_kinds(&current, starting);
+    PictureState {
+        state: crate::prompt::current_state(background, cycle, foreground),
+        clothing_override: crate::prompt::water_clothing(foreground, romance_compatible),
+    }
 }
 
 /// Resolve the per-turn image inputs, generate the subject via the composer
@@ -4462,7 +4478,8 @@ pub(crate) async fn state_for_picture(
 /// subject — there is nothing left to fall back to — and never blocks the
 /// image turn. `compose_image_prompt` turns that empty subject into a plain
 /// persona-appearance portrait prompt (#212). `partner_gender` is the user's
-/// gender, the composer's `[对方]` section.
+/// gender, the composer's `[对方]` section; `clothing_override`, when given,
+/// is its `[此刻穿着]` in place of `plan.clothing`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_delegated_image_prompt(
     state: &AppState,
@@ -4476,6 +4493,7 @@ pub(crate) async fn build_delegated_image_prompt(
     body_state: Option<&str>,
     current_state: Option<&str>,
     partner_gender: Option<&str>,
+    clothing_override: Option<&str>,
 ) -> DelegatedImagePrompt {
     build_delegated_image_prompt_for(
         state,
@@ -4491,6 +4509,7 @@ pub(crate) async fn build_delegated_image_prompt(
         partner_gender,
         None,
         compose_source(plan.action_type),
+        clothing_override,
     )
     .await
 }
@@ -4511,6 +4530,7 @@ pub(crate) async fn build_delegated_image_prompt_with(
     body_state: Option<&str>,
     current_state: Option<&str>,
     companion: Option<&ImageCompanionContext>,
+    clothing_override: Option<&str>,
 ) -> DelegatedImagePrompt {
     build_delegated_image_prompt_for(
         state,
@@ -4526,6 +4546,7 @@ pub(crate) async fn build_delegated_image_prompt_with(
         None,
         companion,
         compose_source(plan.action_type),
+        clothing_override,
     )
     .await
 }
@@ -4550,7 +4571,8 @@ pub(crate) fn compose_source(a: ActionType) -> &'static str {
 /// caller: `event` for a life event's picture (spec 2026-10-26-event-message-
 /// image-design.md §6). `current_state` is what she is doing, the composer's
 /// `[此刻状态]` section; `partner_gender` is the user's gender, its `[对方]`
-/// section.
+/// section; `clothing_override`, when given, is its `[此刻穿着]` and the
+/// audit's `clothing` in place of `plan.clothing`, which stays as it is.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_delegated_image_prompt_for(
     state: &AppState,
@@ -4566,7 +4588,9 @@ pub(crate) async fn build_delegated_image_prompt_for(
     partner_gender: Option<&str>,
     companion: Option<&ImageCompanionContext>,
     source: &'static str,
+    clothing_override: Option<&str>,
 ) -> DelegatedImagePrompt {
+    let clothing = clothing_override.or(plan.clothing.as_deref());
     let inputs = resolve_image_turn_inputs(plan, req_image);
     let style_str = serde_json::to_value(inputs.style)
         .ok()
@@ -4583,7 +4607,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
                 &c,
                 &render_compose_payload_with(
                     persona,
-                    plan.clothing.as_deref(),
+                    clothing,
                     pde_transcript,
                     latest_user_msg,
                     inputs.aspect_ratio.as_deref(),
@@ -4683,7 +4707,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
             status,
             inputs: compose_inputs_json_with(
                 persona,
-                plan.clothing.as_deref(),
+                clothing,
                 pde_transcript,
                 latest_user_msg,
                 &style_str,
@@ -6251,6 +6275,14 @@ pub(crate) fn run_stream_with(
                 // The user's gender, when what she is doing is something she
                 // shares with them (spec 2026-11-24 §7.2).
                 let partner_gender = partner_gender_of(&current, placed, user_msg.user_gender);
+                // What she wears in a hot spring or a sauna, by the turn's
+                // scopes: the composer's slot only, the plan keeps its
+                // clothing (spec 2026-11-26-more-together-actions-bath-outfit-
+                // chemistry-drop-and-custom-together-design.md §5).
+                let clothing_override = crate::prompt::water_clothing(
+                    picture_kinds(&current, placed).2,
+                    eros_engine_core::scope::romance_compatible(user_msg.affinity_scope),
+                );
                 let mut image_only_done = false;
                 let mut image_only_produced: Vec<crate::pipeline::post_process::ProducedMessage> =
                     Vec::new();
@@ -6279,6 +6311,7 @@ pub(crate) fn run_stream_with(
                         body_state.as_deref(),
                         picture_state.as_deref(),
                         partner_gender,
+                        clothing_override,
                     )
                     .await;
                     let subject = img.subject;
@@ -6654,6 +6687,7 @@ pub(crate) fn run_stream_with(
                                 body_state_c.as_deref(),
                                 picture_state_c.as_deref(),
                                 partner_gender,
+                                clothing_override,
                             )
                             .await
                         })))
@@ -6855,6 +6889,7 @@ pub(crate) fn run_stream_with(
                                     body_state.as_deref(),
                                     picture_state.as_deref(),
                                     partner_gender,
+                                    clothing_override,
                                 )
                                 .await
                             }
@@ -6871,6 +6906,7 @@ pub(crate) fn run_stream_with(
                                     body_state.as_deref(),
                                     picture_state.as_deref(),
                                     partner_gender,
+                                    clothing_override,
                                 )
                                 .await
                             }
@@ -10865,6 +10901,7 @@ data: [DONE]\n\n";
             None,
             Some("和对方一起慢跑"),
             Some("男性"),
+            None,
         )
         .await;
         assert_eq!(img.subject, "SUBJECT");
@@ -11729,6 +11766,34 @@ data: [DONE]\n\n";
         image: bool,
         art: Option<serde_json::Value>,
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        run_together_turn_tweaked(
+            pool,
+            action,
+            response,
+            judge_action,
+            compatible,
+            events,
+            image,
+            art,
+            |_| {},
+        )
+        .await
+    }
+
+    /// [`run_together_turn_mock`] with `tweak` applied to the turn's message
+    /// before it runs: a named outfit, a forced picture, the user's gender.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_together_turn_tweaked(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        response: Option<&str>,
+        judge_action: &str,
+        compatible: bool,
+        events: &[EventSeed],
+        image: bool,
+        art: Option<serde_json::Value>,
+        tweak: impl FnOnce(&mut PersistedUserMessage),
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -11839,32 +11904,218 @@ data: [DONE]\n\n";
         } else {
             Default::default()
         };
-        let frames: Vec<ProtocolFrame> = run_stream(
-            std::sync::Arc::new(state),
-            PersistedUserMessage {
-                user_message_id: umid,
-                session_id,
-                user_id,
-                instance_id,
-                content: String::new(),
-                prompt_traits: vec![],
-                audit: None,
-                tier: None,
-                memory_scope,
-                affinity_scope,
-                image_url: None,
-                image: image.then(Default::default),
-                quote: Default::default(),
-                user_locale: Default::default(),
-                user_gender: None,
-                action: Some(action),
-                outfit: None,
-            },
-            None,
-        )
-        .collect()
-        .await;
+        let mut msg = PersistedUserMessage {
+            user_message_id: umid,
+            session_id,
+            user_id,
+            instance_id,
+            content: String::new(),
+            prompt_traits: vec![],
+            audit: None,
+            tier: None,
+            memory_scope,
+            affinity_scope,
+            image_url: None,
+            image: image.then(Default::default),
+            quote: Default::default(),
+            user_locale: Default::default(),
+            user_gender: None,
+            action: Some(action),
+            outfit: None,
+        };
+        tweak(&mut msg);
+        let frames: Vec<ProtocolFrame> = run_stream(std::sync::Arc::new(state), msg, None)
+            .collect()
+            .await;
         (frames, mock, umid)
+    }
+
+    /// One together turn with pictures available, the judge answering
+    /// `response` and `tweak` applied to the turn's message. The frames, the
+    /// composer's user payload, every reply request's body, the clothing the
+    /// compose event recorded and the user row's stored answer.
+    async fn water_picture_turn(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        response: &str,
+        compatible: bool,
+        tweak: impl FnOnce(&mut PersistedUserMessage),
+    ) -> (Vec<ProtocolFrame>, String, String, String, String) {
+        let (frames, mock, umid) = run_together_turn_tweaked(
+            pool,
+            action,
+            Some(response),
+            "reply_text",
+            compatible,
+            &[],
+            true,
+            None,
+            tweak,
+        )
+        .await;
+        let reqs = mock.received_requests().await.unwrap();
+        let body = |r: &wiremock::Request| String::from_utf8_lossy(&r.body).into_owned();
+        let composer: Vec<_> = reqs
+            .iter()
+            .filter(|r| body(r).contains("\"model\":\"composer\""))
+            .collect();
+        assert_eq!(composer.len(), 1, "one composer call");
+        let replies = reqs
+            .iter()
+            .map(body)
+            .filter(|b| b.contains("\"model\":\"deepseek/x\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clothing: String =
+            sqlx::query_scalar("SELECT inputs->>'clothing' FROM engine.chat_images_events")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let answer: String = sqlx::query_scalar(
+            "SELECT metadata->'action'->>'response' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(umid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (
+            frames,
+            composer_payload(composer[0]),
+            replies,
+            clothing,
+            answer,
+        )
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §5: a hot spring she accepted draws a
+    /// romance-compatible pair's picture undressed, over a named outfit. Only
+    /// the composer's slot: the reply still wears the outfit.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_hot_spring_draws_her_undressed_for_a_compatible_pair(pool: PgPool) {
+        let (frames, payload, replies, clothing, answer) = water_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::HotSpringTogether,
+            "accept",
+            true,
+            |m| m.outfit = Some("红色旗袍".into()),
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_eq!(image_requests(&frames), 1);
+        assert!(payload.contains("[此刻穿着]\n什么都没穿\n"), "{payload}");
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起泡温泉\n"),
+            "{payload}"
+        );
+        assert_eq!(clothing, "什么都没穿");
+        assert_eq!(answer, "accept");
+        assert!(replies.contains("红色旗袍"), "{replies}");
+        assert!(!replies.contains("什么都没穿"), "{replies}");
+    }
+
+    /// §5: a sauna she accepted draws a pair that is not romance-compatible
+    /// in a towel.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_sauna_draws_a_towel_for_an_incompatible_pair(pool: PgPool) {
+        let (frames, payload, _, clothing, answer) = water_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::SaunaTogether,
+            "accept",
+            false,
+            |m| m.outfit = Some("红色旗袍".into()),
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(
+            payload.contains("[此刻穿着]\n身上只裹着一条浴巾\n"),
+            "{payload}"
+        );
+        assert_eq!(clothing, "身上只裹着一条浴巾");
+        assert_eq!(answer, "accept");
+    }
+
+    /// §5: a refused hot spring places no kind, so a forced picture wears the
+    /// named outfit.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_hot_spring_keeps_the_named_outfit(pool: PgPool) {
+        let (frames, payload, _, clothing, answer) = water_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::HotSpringTogether,
+            "refuse",
+            true,
+            |m| {
+                m.outfit = Some("红色旗袍".into());
+                m.image = Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    ..Default::default()
+                });
+            },
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyImage);
+        assert!(payload.contains("[此刻穿着]\n红色旗袍\n"), "{payload}");
+        assert_eq!(clothing, "红色旗袍");
+        assert_eq!(answer, "refuse");
+    }
+
+    /// §5: no other kind is covered: an accepted jog's picture reads as the
+    /// jogging test's, in the named outfit.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_jog_picture_is_unchanged(pool: PgPool) {
+        let (frames, payload, _, clothing, _) = water_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::JogTogether,
+            "accept",
+            true,
+            |m| {
+                m.outfit = Some("红色旗袍".into());
+                m.user_gender = Some(crate::routes::companion_stream::UserGender::Male);
+            },
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(payload.contains("[此刻穿着]\n红色旗袍\n"), "{payload}");
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起慢跑\n\n[对方]\n男性\n\n[最近场景]"),
+            "{payload}"
+        );
+        assert_eq!(clothing, "红色旗袍");
+    }
+
+    /// §5: a picture's state read with the scopes its path holds: a sauna
+    /// under way on the default (bond-only) scopes reads a towel, on
+    /// romance-compatible ones nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_sauna_on_default_scopes_reads_a_towel(pool: PgPool) {
+        use eros_engine_core::scope::{romance_compatible, AffinityScope};
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        seed_events(
+            &pool,
+            user_id,
+            instance_id,
+            session_id,
+            &[ev("sauna_together", 10, 50)],
+        )
+        .await;
+        let read = |compatible| {
+            state_for_picture(
+                &pool,
+                instance_id,
+                None,
+                chrono::Utc::now(),
+                None,
+                None,
+                compatible,
+            )
+        };
+        let picture = read(romance_compatible(AffinityScope::default())).await;
+        assert_eq!(picture.clothing_override, Some("身上只裹着一条浴巾"));
+        assert_eq!(picture.state.as_deref(), Some("和对方一起蒸桑拿"));
+        let picture = read(romance_compatible(AffinityScope::full())).await;
+        assert_eq!(picture.clothing_override, Some("什么都没穿"));
     }
 
     /// `(event_key, session_id, started_at, ends_at)` of every event of `kind`.

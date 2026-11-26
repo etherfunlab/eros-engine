@@ -492,9 +492,13 @@ pub(crate) fn run_group_turn(
                 member_session_id: c.member_session_id,
                 instance_id: c.instance_id,
             });
-            // What the speaker is doing, for the composer's `[此刻状态]`; read
-            // only for a turn that draws.
-            let picture_state = if matches!(
+            let seat_scopes = turn.scopes(seat.member_session_id);
+            // What the speaker is doing, for the composer's `[此刻状态]`, and
+            // what she wears in a hot spring or a sauna by the speaker's
+            // scopes (spec 2026-11-26-more-together-actions-bath-outfit-
+            // chemistry-drop-and-custom-together-design.md §5); read only for
+            // a turn that draws.
+            let picture = if matches!(
                 plan.action_type,
                 ActionType::ReplyImage | ActionType::ReplyTextImage
             ) {
@@ -505,10 +509,11 @@ pub(crate) fn run_group_turn(
                     chrono::Utc::now(),
                     None,
                     crate::prompt::persona_traits(&seat.persona).cycle_health(),
+                    eros_engine_core::scope::romance_compatible(seat_scopes.1),
                 )
                 .await
             } else {
-                None
+                Default::default()
             };
 
             // Image only: compose, persist an image row, emit meta/done/image_request.
@@ -523,8 +528,9 @@ pub(crate) fn run_group_turn(
                     turn.user_id,
                     turn.group_session_id,
                     None,
-                    picture_state.as_deref(),
+                    picture.state.as_deref(),
                     companion_ctx.as_ref(),
+                    picture.clothing_override,
                 )
                 .await;
                 turn_failures.extend(img.failures.iter().cloned());
@@ -611,10 +617,11 @@ pub(crate) fn run_group_turn(
                     turn.image.clone(),
                     transcript.clone(),
                     latest.clone(),
-                    picture_state.clone(),
+                    picture.state.clone(),
                     companion_ctx.clone(),
                 );
                 let (uid, gid) = (turn.user_id, turn.group_session_id);
+                let clothing_override = picture.clothing_override;
                 AbortOnDrop(Some(tokio::spawn(async move {
                     build_delegated_image_prompt_with(
                         &st,
@@ -628,6 +635,7 @@ pub(crate) fn run_group_turn(
                         None,
                         state_c.as_deref(),
                         ctx_c.as_ref(),
+                        clothing_override,
                     )
                     .await
                 })))
@@ -707,7 +715,6 @@ pub(crate) fn run_group_turn(
                 ActionType::ReplyText
             };
             let outcome = Arc::new(std::sync::Mutex::new(BurstOutcome::default()));
-            let seat_scopes = turn.scopes(seat.member_session_id);
             let burst = drive_chat_burst_for(
                 state.clone(),
                 turn.group_session_id,
@@ -779,8 +786,9 @@ pub(crate) fn run_group_turn(
                                 turn.user_id,
                                 turn.group_session_id,
                                 None,
-                                picture_state.as_deref(),
+                                picture.state.as_deref(),
                                 companion_ctx.as_ref(),
+                                picture.clothing_override,
                             )
                             .await
                         }

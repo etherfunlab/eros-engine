@@ -2373,6 +2373,60 @@ mod tests {
         assert!(!payload.contains("洗澡中"), "{payload}");
     }
 
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §5: a group picture during her sauna reads
+    /// the speaker's own scopes from the send.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_group_picture_in_a_sauna_reads_the_speakers_scopes(pool: PgPool) {
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_image","inner_state":null,"reply_mode":null,"clothing":null}],"reason":null}"#;
+        let mut f = fixture_with(
+            pool,
+            Some(director_sse(verdict)),
+            200,
+            None,
+            COMPOSE_TASK,
+            |_| {},
+        )
+        .await;
+        mount_composer(&f._server).await;
+        sqlx::query(
+            "INSERT INTO engine.persona_events \
+               (instance_id, session_id, event_key, kind, started_at, ends_at) \
+             VALUES ($1, $2, 'seed', 'sauna_together', now() - interval '10 minutes', \
+                     now() + interval '50 minutes')",
+        )
+        .bind(instance_of(&f.pool, f.a).await)
+        .bind(f.a)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let a_key = f.a.to_string();
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"拍张照","client_msg_id":"01JGROUPSAUNAIMAGESSSSSSSG","image":{},
+                   "member_scopes":{a_key:{"affinity_scope":"full"}}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+
+        let reqs = f._server.received_requests().await.unwrap();
+        let composer: Value = reqs
+            .iter()
+            .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+            .find(|b| b["model"] == "composer-model")
+            .expect("the composer ran");
+        let payload = composer["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .and_then(|m| m["content"].as_str())
+            .expect("the composer's user message");
+        assert!(payload.contains("[此刻穿着]\n什么都没穿\n"), "{payload}");
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起蒸桑拿\n"),
+            "{payload}"
+        );
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn an_exhausted_composer_drops_the_companion_from_the_frame(pool: PgPool) {
         let verdict = r#"{"speakers":[{"member":"m1","action":"reply_image","inner_state":null,"reply_mode":null,"clothing":null,"with":"m2"}],"reason":null}"#;

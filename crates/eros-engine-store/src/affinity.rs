@@ -356,13 +356,15 @@ struct GradedWrite<'a> {
 /// [`AffinityRepo::persist_activity_in_tx`], on the row the caller locked:
 /// time decay, the grade pipeline, the row UPDATE, the event INSERT and the
 /// journal's label moves, all on `conn`; nothing here commits. Returns the
-/// persisted state and what the event committed.
+/// persisted state, what the event committed, and whether the chemistry tier
+/// fell: read against the post-decay snapshot, so a tier that decay alone
+/// carried down is no fall.
 async fn write_graded(
     conn: &mut sqlx::PgConnection,
     locked: AffinityRow,
     w: GradedWrite<'_>,
     tuning: &AffinityTuning,
-) -> Result<(Affinity, EventDeltas), sqlx::Error> {
+) -> Result<(Affinity, EventDeltas, bool), sqlx::Error> {
     let pending: PendingDeltas = locked
         .pending_deltas
         .as_ref()
@@ -626,6 +628,7 @@ async fn write_graded(
     )
     .await?;
 
+    let chem_fell = current.chem_tier() < before_affinity.chem_tier();
     Ok((
         current,
         EventDeltas {
@@ -633,6 +636,7 @@ async fn write_graded(
             lines,
             label_changes,
         },
+        chem_fell,
     ))
 }
 
@@ -1017,6 +1021,10 @@ impl<'a> AffinityRepo<'a> {
     /// row dated in this timezone (UTC when `None`); a line that falls takes
     /// back the rows of the labels it fell below, if they are under 24 hours
     /// old.
+    ///
+    /// Returns `true` when the write left the chemistry tier below where the
+    /// post-decay snapshot had it: a fall this turn made, never one decay
+    /// alone made.
     #[allow(clippy::too_many_arguments)] // each arg is a distinct persist concern
     pub async fn persist_with_event(
         &self,
@@ -1046,7 +1054,7 @@ impl<'a> AffinityRepo<'a> {
         // The user's timezone, for dating the tier moments the relationship
         // journal takes from this write; UTC when absent.
         journal_tz: Option<chrono_tz::Tz>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
         // Lock the row and read the freshest committed values inside the tx.
@@ -1056,7 +1064,7 @@ impl<'a> AffinityRepo<'a> {
         .bind(affinity.id)
         .fetch_one(&mut *tx)
         .await?;
-        let (current, _) = write_graded(
+        let (current, _, chem_fell) = write_graded(
             &mut tx,
             locked,
             GradedWrite {
@@ -1083,7 +1091,7 @@ impl<'a> AffinityRepo<'a> {
 
         // Reflect the persisted state back to the caller.
         *affinity = current;
-        Ok(())
+        Ok(chem_fell)
     }
 
     /// Increment ghost counters and stamp `last_ghost_at`. No deltas applied.
@@ -1165,14 +1173,14 @@ impl<'a> AffinityRepo<'a> {
         resolution: &str,
         lines: &[AffinityLine],
         tuning: &AffinityTuning,
-    ) -> Result<Affinity, sqlx::Error> {
+    ) -> Result<(Affinity, bool), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let after = Self::persist_life_choice_drop_in_tx(
+        let dropped = Self::persist_life_choice_drop_in_tx(
             &mut tx, session_id, choice_id, resolution, lines, tuning,
         )
         .await?;
         tx.commit().await?;
-        Ok(after)
+        Ok(dropped)
     }
 
     /// Each of `lines` drops one tier, by the rejected-action landing rule,
@@ -1188,7 +1196,8 @@ impl<'a> AffinityRepo<'a> {
     /// `latest_turn_event` does not return it. `resolution` (`accept` /
     /// `decline`) and `choice_id` go in its `context`. The `tier_reached`
     /// journal rows of labels the drop fell below go too when under 24 hours
-    /// old, as on a falling turn. Returns the post-drop state.
+    /// old, as on a falling turn. Returns the post-drop state and whether the
+    /// chemistry tier fell from where the post-decay snapshot had it.
     pub async fn persist_life_choice_drop_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         session_id: Uuid,
@@ -1196,7 +1205,7 @@ impl<'a> AffinityRepo<'a> {
         resolution: &str,
         lines: &[AffinityLine],
         tuning: &AffinityTuning,
-    ) -> Result<Affinity, sqlx::Error> {
+    ) -> Result<(Affinity, bool), sqlx::Error> {
         let locked = sqlx::query_as::<_, AffinityRow>(
             "SELECT * FROM engine.companion_affinity WHERE session_id = $1 FOR UPDATE",
         )
@@ -1297,7 +1306,8 @@ impl<'a> AffinityRepo<'a> {
         )
         .await?;
 
-        Ok(current)
+        let chem_fell = current.chem_tier() < before.chem_tier();
+        Ok((current, chem_fell))
     }
 
     /// The session's status and cold war, row-locked until the caller's
@@ -1477,7 +1487,8 @@ impl<'a> AffinityRepo<'a> {
             tuning,
         )
         .await
-        .map(Some)
+        // A date's settlement ends no event, so its fall is not read.
+        .map(|(after, deltas, _)| Some((after, deltas)))
     }
 
     /// What a settled date's event committed: the session's `activity` event
@@ -1549,7 +1560,7 @@ mod tests {
             journal_tz,
         )
         .await
-        .unwrap()
+        .unwrap();
     }
 
     async fn make_session(pool: &PgPool, user_id: Uuid, instance_id: Uuid) -> Uuid {
@@ -3852,7 +3863,7 @@ mod tests {
             None,
         )
         .await
-        .unwrap()
+        .unwrap();
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -4071,6 +4082,102 @@ mod tests {
         .await
         .unwrap();
         assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    /// A fresh relationship with its four line axes as given, last written
+    /// `days_ago` days ago, its tier columns as stored at that time.
+    async fn relationship_at(
+        pool: &PgPool,
+        (trust, intrigue, intimacy, tension): (f64, f64, f64, f64),
+        days_ago: i32,
+    ) -> Affinity {
+        let repo = AffinityRepo { pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, user_id).await;
+        let session = make_session(pool, user_id, instance_id).await;
+        let a = repo
+            .load_or_create(session, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+                SET trust = $2, intrigue = $3, intimacy = $4, tension = $5, \
+                    bond_tier = $6, chem_tier = $7, \
+                    updated_at = now() - make_interval(days => $8) \
+              WHERE id = $1",
+        )
+        .bind(a.id)
+        .bind(trust)
+        .bind(intrigue)
+        .bind(intimacy)
+        .bind(tension)
+        .bind(i16::from(eros_engine_core::affinity::tier_index(
+            (trust + intrigue) / 2.0,
+        )))
+        .bind(i16::from(eros_engine_core::affinity::tier_index(
+            (intimacy + tension) / 2.0,
+        )))
+        .bind(days_ago)
+        .execute(pool)
+        .await
+        .unwrap();
+        repo.load(session).await.unwrap().expect("row")
+    }
+
+    /// One turn with neutral grades and `tier_drop`; whether chemistry fell.
+    async fn neutral_turn(
+        pool: &PgPool,
+        a: &mut Affinity,
+        tier_drop: Option<AffinityLine>,
+    ) -> bool {
+        AffinityRepo { pool }
+            .persist_with_event(
+                a,
+                &AxisGrades::default(),
+                &AffinityDeltas::default(),
+                1.0,
+                &AffinityTuning::default(),
+                "message",
+                serde_json::json!({}),
+                None,
+                EndpointLevelReads::default(),
+                None,
+                None,
+                None,
+                tier_drop,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The fall is read inside the write, against the post-decay snapshot: a
+    /// refused action's chemistry drop is one, a bond drop is not, and a tier
+    /// that decay alone carried down is not either.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_with_event_reports_a_chemistry_tier_fall(pool: PgPool) {
+        // Both lines at 0.45, tier 3.
+        let mut a = relationship_at(&pool, (0.45, 0.45, 0.45, 0.45), 0).await;
+        assert!(neutral_turn(&pool, &mut a, Some(AffinityLine::Chemistry)).await);
+        assert_eq!(a.chem_tier(), 2);
+
+        let mut a = relationship_at(&pool, (0.45, 0.45, 0.45, 0.45), 0).await;
+        assert!(!neutral_turn(&pool, &mut a, Some(AffinityLine::Bond)).await);
+        assert_eq!((a.bond_tier(), a.chem_tier()), (2, 3));
+
+        // Chemistry 0.355, stored at tier 3; four days of tension decay
+        // (−0.02) carry it to 0.345, tier 2, before the turn grades.
+        let mut a = relationship_at(&pool, (0.0, 0.0, 0.35, 0.36), 4).await;
+        let stored: i16 =
+            sqlx::query_scalar("SELECT chem_tier FROM engine.companion_affinity WHERE id = $1")
+                .bind(a.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, 3);
+        assert!(!neutral_turn(&pool, &mut a, None).await);
+        assert_eq!(a.chem_tier(), 2);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -4786,7 +4893,7 @@ mod tests {
         let (session, a) = seed_drop_relationship(&pool).await;
         let choice_id = Uuid::new_v4();
 
-        let after = repo
+        let (after, _) = repo
             .persist_life_choice_drop(
                 session,
                 choice_id,
@@ -4879,7 +4986,7 @@ mod tests {
         let (session, a) = seed_drop_relationship(&pool).await;
         let choice_id = Uuid::new_v4();
 
-        let after = repo
+        let (after, _) = repo
             .persist_life_choice_drop(
                 session,
                 choice_id,
@@ -5058,7 +5165,7 @@ mod tests {
             ["bond:friend"]
         );
 
-        let after = repo
+        let (after, _) = repo
             .persist_life_choice_drop(
                 session,
                 Uuid::new_v4(),

@@ -565,13 +565,31 @@ async fn on_period(
     Ok(cycle.is_some_and(|c| c.kind == EventKind::Period))
 }
 
+/// Whether the pair is in the water or in bed at `now` (spec
+/// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-custom-
+/// together-design.md §7): the foreground is one of
+/// [`EventKind::HOLDS_BACK_INTIMATE_ASKS`].
+async fn intimate_now(
+    state: &AppState,
+    instance_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let foreground = (EventRepo { pool: &state.pool })
+        .current(instance_id, None, now, None)
+        .await?
+        .foreground;
+    Ok(foreground.is_some_and(|e| EventKind::HOLDS_BACK_INTIMATE_ASKS.contains(&e.kind)))
+}
+
 /// The romantic trigger (spec 2026-10-30 §4.3, spec 2026-11-23-affinity-50
 /// §7.2, §7.3), then her ask (§4.4) through [`speak`]: a proposal, or her
 /// sleep ask in the form the status gives it. Only a pair the caller's
 /// recorded scopes mark as romantic qualifies, and the ask is generated under
 /// those scopes. She does not ask `sleep_together` while her period is under
-/// way (spec 2026-11-24-period-cycle-design.md §9); the kind stays unsettled,
-/// so the ask only waits.
+/// way (spec 2026-11-24-period-cycle-design.md §9), nor while the pair is in
+/// the water or in bed (spec 2026-11-26-more-together-actions-bath-outfit-
+/// chemistry-drop-and-custom-together-design.md §7, [`intimate_now`]); the
+/// kind stays unsettled, so the ask only waits.
 async fn try_romance(
     state: &AppState,
     session_id: Uuid,
@@ -624,8 +642,12 @@ async fn try_romance(
         return Ok(());
     };
     // Read only once the sex ask is the one chosen: `propose` and
-    // `fall_asleep_together` are asked on her period as on any other day.
-    if kind == LifeChoiceKind::SleepTogether && on_period(state, instance_id, persona, now).await? {
+    // `fall_asleep_together` are asked on her period, or in the bath, as on
+    // any other day.
+    if kind == LifeChoiceKind::SleepTogether
+        && (on_period(state, instance_id, persona, now).await?
+            || intimate_now(state, instance_id, now).await?)
+    {
         return Ok(());
     }
     if !runway_clear(state, session_id, instance_id, now).await? {
@@ -721,10 +743,12 @@ fn bathe_qualifies(chem_tier: u8, hygienic: Option<bool>, endpoints: &[JudgedEnd
 
 /// She asks the user to take a bath with her: a romance-compatible pair that
 /// [`bathe_qualifies`], not within [`BATHE_COOLDOWN_DAYS`] of the last
-/// accept or ignore, and not while her period is under way (spec
-/// 2026-11-24-period-cycle-design.md §9). Its own trigger, independent of the
-/// bed: it runs after the romantic trigger, whose pending ask closes the
-/// runway.
+/// accept or ignore, not while her period is under way (spec
+/// 2026-11-24-period-cycle-design.md §9), and not while the pair is in the
+/// water or in bed (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-
+/// drop-and-custom-together-design.md §7, [`intimate_now`]). Its own trigger,
+/// independent of the bed: it runs after the romantic trigger, whose pending
+/// ask closes the runway.
 async fn try_bathe(
     state: &AppState,
     session_id: Uuid,
@@ -760,6 +784,7 @@ async fn try_bathe(
         .settled_since(session_id, LifeChoiceKind::BatheTogether, cooled)
         .await?
         || on_period(state, instance_id, persona, now).await?
+        || intimate_now(state, instance_id, now).await?
         || !runway_clear(state, session_id, instance_id, now).await?
     {
         return Ok(());
@@ -2917,12 +2942,18 @@ mod tests {
     impl Scene {
         /// An event of `kind` under way on the instance for the next day.
         async fn event_under_way(&self, kind: EventKind) {
+            self.event_under_way_as(kind, "under-way").await;
+        }
+
+        /// [`Self::event_under_way`] under `event_key`, for a second row in
+        /// the session (the key is unique in it).
+        async fn event_under_way_as(&self, kind: EventKind, event_key: &str) {
             let now = Utc::now();
             EventRepo { pool: &self.pool }
                 .insert_preempting(&NewEvent {
                     instance_id: self.instance_id,
                     session_id: self.session_id,
-                    event_key: "under-way",
+                    event_key,
                     kind,
                     started_at: now - Duration::hours(1),
                     ends_at: now + Duration::hours(24),
@@ -3641,5 +3672,127 @@ mod tests {
             s.turn(&state, SEEN).await;
         }
         assert_eq!(s.kinds().await, vec![pending("travel_together")]);
+    }
+
+    // ---- Held back in the water or in bed (spec 2026-11-26 §7) ----
+
+    impl Scene {
+        /// The kind of the foreground under way now, if any.
+        async fn foreground_kind(&self) -> Option<EventKind> {
+            EventRepo { pool: &self.pool }
+                .current(self.instance_id, None, Utc::now(), None)
+                .await
+                .unwrap()
+                .foreground
+                .map(|e| e.kind)
+        }
+
+        /// Every row of the instance ended a minute ago.
+        async fn end_events(&self) {
+            sqlx::query(
+                "UPDATE engine.persona_events SET ends_at = now() - interval '1 minute' \
+                  WHERE instance_id = $1",
+            )
+            .bind(self.instance_id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// She does not ask for a bath while the pair is in a hot spring, and
+    /// asks on the same pair once it is over.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_bath_ask_during_a_hot_spring_together(pool: PgPool) {
+        let mock = mock_llm(WARM, Some(BATHE_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        let mut s = scene_with_lines(&pool, 0.5, 0.25).await;
+        s.set_art(json!({"hygienic": true})).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
+        s.event_under_way(EventKind::HotSpringTogether).await;
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(
+            s.foreground_kind().await,
+            Some(EventKind::HotSpringTogether)
+        );
+        assert!(s.kinds().await.is_empty(), "in the hot spring");
+        assert!(companion_calls(&mock).await.is_empty());
+
+        s.end_events().await;
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.kinds().await, vec![pending("bathe_together")]);
+    }
+
+    /// While the pair is in the bath she does not ask them to bed, and the
+    /// kind stays unsettled so the ask only waits; a proposal is asked as on
+    /// any other day.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_sleep_ask_during_bathing_together_but_propose_still_asks(pool: PgPool) {
+        let mock = mock_llm(WARM, Some(SLEEP_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        let mut s = scene_with_lines(&pool, 0.5, 0.5).await;
+        // Not hygienic, so no bath is asked; a background, so no trip: the
+        // bed is the one ask in play.
+        s.set_art(json!({"hygienic": false})).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
+        s.event_under_way_as(EventKind::ShortTrip, "trip").await;
+        s.event_under_way(EventKind::BathingTogether).await;
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(s.foreground_kind().await, Some(EventKind::BathingTogether));
+        assert!(s.kinds().await.is_empty(), "in the bath");
+        assert!(companion_calls(&mock).await.is_empty());
+        assert!(
+            !(LifeChoiceRepo { pool: &pool })
+                .settled(s.session_id, LifeChoiceKind::SleepTogether)
+                .await
+                .unwrap(),
+            "the ask waits; nothing is settled"
+        );
+        s.end_events().await;
+        s.turn(&state, SEEN).await;
+        assert_eq!(s.kinds().await, vec![pending("sleep_together")]);
+
+        let warm = mock_llm(WARM, Some(PROPOSE_TEXT)).await;
+        let cold = mock_llm(PATIENT, Some(PROPOSE_TEXT)).await;
+        let warm_state = with_models(test_state(pool.clone()), &warm.uri());
+        let cold_state = with_models(test_state(pool.clone()), &cold.uri());
+        let mut s = scene_with_lines(&pool, 0.7, 0.7).await;
+        s.set_art(json!({"hygienic": false})).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
+        s.event_under_way(EventKind::BathingTogether).await;
+        for is_warm in FIVE_OF_EIGHT {
+            s.turn(if is_warm { &warm_state } else { &cold_state }, SEEN)
+                .await;
+        }
+        assert_eq!(s.foreground_kind().await, Some(EventKind::BathingTogether));
+        assert_eq!(s.kinds().await, vec![pending("propose")]);
+    }
+
+    /// An event outside the five holds nothing back: a walk together does
+    /// not stop her bath ask.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_walk_holds_back_nothing(pool: PgPool) {
+        let mock = mock_llm(WARM, Some(BATHE_TEXT)).await;
+        let state = with_models(test_state(pool.clone()), &mock.uri());
+        let mut s = scene_with_lines(&pool, 0.5, 0.25).await;
+        s.set_art(json!({"hygienic": true})).await;
+        s.record_scopes("full", AffinityScope::chemistry()).await;
+        s.set_status("dating", false).await;
+        s.event_under_way(EventKind::WalkingTogether).await;
+
+        for _ in 0..3 {
+            s.turn(&state, SEEN).await;
+        }
+        assert_eq!(s.foreground_kind().await, Some(EventKind::WalkingTogether));
+        assert_eq!(s.kinds().await, vec![pending("bathe_together")]);
     }
 }
