@@ -460,7 +460,8 @@ fn kind_cue(
         | PlayingWithFireTogether
         | SingingTogether
         | SkinnyDippingTogether
-        | CommittingCrimeTogether => {
+        | CommittingCrimeTogether
+        | CustomTogether => {
             unreachable!("{kind:?} is never told")
         }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),

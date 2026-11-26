@@ -211,6 +211,14 @@ pub enum UserAction {
     SingTogether,
     SkinnyDipTogether,
     CommitCrimeTogether,
+    /// The user asks her to do something with them, in their own words (spec
+    /// 2026-11-26 §8): behaves as `jog_together` does, placing
+    /// `custom_together`. Neither romance-gated nor emotional, and a refusal
+    /// drops chemistry as `custom`'s does. The row it places points at the
+    /// user's message, which is where the text lives.
+    CustomTogether {
+        text: String,
+    },
     /// The user challenges her, or proposes a bet: social actions whose
     /// answer says whether she takes it up; no winner is decided, and a
     /// refusal drops nothing (spec 2026-11-23 §4).
@@ -338,6 +346,16 @@ impl UserAction {
             UserAction::SingTogether => Some(EventKind::SingingTogether),
             UserAction::SkinnyDipTogether => Some(EventKind::SkinnyDippingTogether),
             UserAction::CommitCrimeTogether => Some(EventKind::CommittingCrimeTogether),
+            UserAction::CustomTogether { .. } => Some(EventKind::CustomTogether),
+            _ => None,
+        }
+    }
+
+    /// The user's own words of a `custom_together`: what the event it places
+    /// is about. `None` for every other action.
+    pub fn together_text(&self) -> Option<&str> {
+        match self {
+            UserAction::CustomTogether { text } => Some(text),
             _ => None,
         }
     }
@@ -959,6 +977,31 @@ mod tests {
         }
     }
 
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.1: the one together action with a payload.
+    #[test]
+    fn custom_together_carries_its_text() {
+        let a = UserAction::CustomTogether {
+            text: "去海边放烟花".into(),
+        };
+        let v = serde_json::json!({ "type": "custom_together", "text": "去海边放烟花" });
+        assert_eq!(serde_json::to_value(&a).unwrap(), v);
+        assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+        assert_eq!(a.together_kind(), Some(EventKind::CustomTogether));
+        assert_eq!(a.together_text(), Some("去海边放烟花"));
+        assert!(!a.romance_gated());
+        assert!(!a.speaks_emotionally());
+        assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry));
+        assert_eq!(a.consumed(), None);
+        assert_eq!(a.status_ask(), None);
+        // No other action carries text for a together event.
+        for other in all_actions() {
+            if !matches!(other, UserAction::CustomTogether { .. }) {
+                assert_eq!(other.together_text(), None, "{other:?}");
+            }
+        }
+    }
+
     #[test]
     fn only_skinny_dip_of_the_six_speaks_emotionally_and_only_crime_drops_bond() {
         assert!(UserAction::SkinnyDipTogether.speaks_emotionally());
@@ -1040,6 +1083,7 @@ mod tests {
             SingTogether,
             SkinnyDipTogether,
             CommitCrimeTogether,
+            CustomTogether { text: "x".into() },
             Challenge,
             Bet,
             Custom { text: "x".into() },

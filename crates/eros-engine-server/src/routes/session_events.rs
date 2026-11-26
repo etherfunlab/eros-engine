@@ -55,9 +55,11 @@ const MAX_EVENT_KEY_CHARS: usize = 128;
 /// `hot_spring_together`, `fighting_together`, `working_out_together`,
 /// `swimming_together`, `cycling_together`, `hiking_together`,
 /// `dancing_together`, `adventuring_together`, `playing_with_fire_together`,
-/// `singing_together`, `skinny_dipping_together` and
-/// `committing_crime_together` are placed by the engine, never drawn: they
-/// appear in responses only, and a `kinds` filter that lists one is rejected.
+/// `singing_together`, `skinny_dipping_together`,
+/// `committing_crime_together` and `custom_together` are placed by the
+/// engine, never drawn: they appear in responses only, and a `kinds` filter
+/// that lists one is rejected. A `custom_together`'s `message_id` is the
+/// user's message that asked, not hers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKindDto {
@@ -162,6 +164,7 @@ pub enum EventKindDto {
     SingingTogether,
     SkinnyDippingTogether,
     CommittingCrimeTogether,
+    CustomTogether,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -284,6 +287,7 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::SingingTogether => EventKind::SingingTogether,
             EventKindDto::SkinnyDippingTogether => EventKind::SkinnyDippingTogether,
             EventKindDto::CommittingCrimeTogether => EventKind::CommittingCrimeTogether,
+            EventKindDto::CustomTogether => EventKind::CustomTogether,
         }
     }
 }
@@ -392,6 +396,7 @@ impl From<EventKind> for EventKindDto {
             EventKind::SingingTogether => EventKindDto::SingingTogether,
             EventKind::SkinnyDippingTogether => EventKindDto::SkinnyDippingTogether,
             EventKind::CommittingCrimeTogether => EventKindDto::CommittingCrimeTogether,
+            EventKind::CustomTogether => EventKindDto::CustomTogether,
         }
     }
 }
@@ -421,7 +426,8 @@ impl From<eros_engine_core::events::EventCategory> for EventCategoryDto {
 
 /// A life event: what happened, when it started and ends, whether it keeps
 /// the persona offline while it lasts, and the message that told it (`null`
-/// for an event that is not told).
+/// for an event that is not told). On a `custom_together` `message_id` is
+/// the user's message that asked, not hers.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct EventView {
     pub kind: EventKindDto,
@@ -433,6 +439,9 @@ pub struct EventView {
     pub started_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
     pub message_id: Option<Uuid>,
+    /// The user's words of a `custom_together`, read from the message that
+    /// asked; `null` once that message is gone, and for every other kind.
+    pub text: Option<String>,
 }
 
 impl EventView {
@@ -449,6 +458,7 @@ impl EventView {
             started_at: e.started_at,
             ends_at: e.ends_at,
             message_id: e.message_id,
+            text: e.text.clone(),
         }
     }
 
@@ -463,6 +473,7 @@ impl EventView {
             started_at: e.started_at,
             ends_at: e.ends_at,
             message_id: e.message_id,
+            text: None,
         }
     }
 }
@@ -645,7 +656,10 @@ async fn respond(
     })
 }
 
-/// [`respond`]'s parts: the event, the row that told it, her picture.
+/// [`respond`]'s parts: the event, the row that told it, her picture. A
+/// `custom_together`'s `message_id` is the user's message that asked, never
+/// hers (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-
+/// and-custom-together-design.md §8.3): it returns no message.
 async fn stored(
     state: &AppState,
     session_id: Uuid,
@@ -665,7 +679,10 @@ async fn stored(
     else {
         return Ok((None, None, None));
     };
-    let message = match event.message_id {
+    let told_by = event
+        .message_id
+        .filter(|_| event.kind != EventKind::CustomTogether);
+    let message = match told_by {
         Some(id) => {
             ChatRepo { pool: &state.pool }
                 .message_by_id_in_session(session_id, id)
@@ -1076,6 +1093,7 @@ async fn plan_event(
         started_at: now,
         ends_at: now + drawn.lasts,
         message_id: Some(message_id),
+        text: None,
     };
     let plan = EventPlan::Tell {
         guard,
@@ -2957,6 +2975,19 @@ mod tests {
         }
     }
 
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.4.
+    #[test]
+    fn custom_together_is_a_placed_kind_on_the_wire() {
+        let dto = EventKindDto::from(EventKind::CustomTogether);
+        assert_eq!(serde_json::to_value(dto).unwrap(), json!("custom_together"));
+        assert_eq!(EventKind::from(dto), EventKind::CustomTogether);
+        assert!(serde_json::from_value::<DrawEventRequest>(
+            json!({"event_key": "k", "kinds": ["custom_together"]})
+        )
+        .is_err());
+    }
+
     #[test]
     fn special_kinds_are_rejected_in_the_kinds_filter() {
         for kinds in [
@@ -4036,5 +4067,157 @@ mod tests {
             event_tone(&pool, session_id).await.as_deref(),
             Some("emotional")
         );
+    }
+
+    // ── custom_together (spec 2026-11-26-more-together-actions-bath-outfit-
+    // chemistry-drop-and-custom-together-design.md §8.3–§8.4) ──
+
+    /// The user's row of `session_id` asking `action`, sent at `from` and
+    /// accepted, with the event of `kind` it places from `from` for an hour.
+    /// Returns the row and the event's key.
+    async fn accept_together(
+        pool: &PgPool,
+        instance_id: Uuid,
+        session_id: Uuid,
+        action: serde_json::Value,
+        kind: EventKind,
+        from: DateTime<Utc>,
+    ) -> (Uuid, String) {
+        let asked: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', jsonb_build_object('action', $2::jsonb), $3) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(action)
+        .bind(from)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let key = format!("action:{asked}:{}", kind.as_str());
+        ChatRepo { pool }
+            .set_action_response(
+                asked,
+                eros_engine_core::types::ActionResponse::Accept,
+                instance_id,
+                None,
+                Some(&eros_engine_store::events::NewEvent {
+                    instance_id,
+                    session_id,
+                    event_key: &key,
+                    kind,
+                    started_at: from,
+                    ends_at: from + chrono::Duration::hours(1),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        (asked, key)
+    }
+
+    fn custom_together() -> serde_json::Value {
+        json!({"type": "custom_together", "text": "去海边放烟花"})
+    }
+
+    /// `GET /effects`' `event`.
+    async fn effects_event(pool: &PgPool, session_id: Uuid, user_id: Uuid) -> serde_json::Value {
+        use axum::body::{to_bytes, Body};
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .uri(format!("/v2/comp/session/{session_id}/effects"))
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!(
+                    "Bearer {}",
+                    crate::routes::companion::testutil::mint_test_jwt(user_id)
+                ),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let res = crate::routes::companion::testutil::build_router(test_state(pool.clone()))
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), 65536).await.unwrap()).unwrap();
+        body["event"].clone()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_event_view_carries_the_custom_text(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        let now = Utc::now();
+        let (asked, _) = accept_together(
+            &pool,
+            instance_id,
+            session_id,
+            custom_together(),
+            EventKind::CustomTogether,
+            now - chrono::Duration::minutes(10),
+        )
+        .await;
+        let event = effects_event(&pool, session_id, user_id).await;
+        assert_eq!(event["kind"], json!("custom_together"), "{event}");
+        assert_eq!(event["text"], json!("去海边放烟花"), "{event}");
+        assert_eq!(event["message_id"], json!(asked), "the user's row");
+
+        // The next accepted together action ends it; its event has no text.
+        accept_together(
+            &pool,
+            instance_id,
+            session_id,
+            json!({"type": "jog_together"}),
+            EventKind::JoggingTogether,
+            now - chrono::Duration::minutes(5),
+        )
+        .await;
+        let event = effects_event(&pool, session_id, user_id).await;
+        assert_eq!(event["kind"], json!("jogging_together"), "{event}");
+        assert_eq!(event.get("text"), Some(&json!(null)), "{event}");
+    }
+
+    /// Review Focus 5: a draw asked under the key a `custom_together` was
+    /// placed under returns that event, and never the user's row it points at
+    /// as her message.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_draw_under_the_action_key_never_returns_the_user_row(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "好").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let now = Utc::now();
+        let (asked, key) = accept_together(
+            &pool,
+            instance_id,
+            session_id,
+            custom_together(),
+            EventKind::CustomTogether,
+            now - chrono::Duration::minutes(10),
+        )
+        .await;
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            DrawEventRequest {
+                image: Some(EventImageParams::default()),
+                ..req(&key, None)
+            },
+            now,
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let e = out.event.as_ref().expect("the placed event");
+        assert_eq!(e.kind, EventKindDto::CustomTogether);
+        assert_eq!(e.message_id, Some(asked));
+        assert_eq!(e.text.as_deref(), Some("去海边放烟花"));
+        let body = serde_json::to_value(&out).unwrap();
+        assert_eq!(body["message"], json!(null), "{body}");
+        assert!(body.get("image_request").is_none(), "{body}");
+        assert!(calls(&mock).await.is_empty(), "nothing is generated");
     }
 }

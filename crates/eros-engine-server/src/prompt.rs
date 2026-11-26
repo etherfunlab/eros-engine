@@ -800,7 +800,8 @@ fn tip_value_noun(amount_usd: f64) -> &'static str {
 /// the user wants to do, since the persona may not let it happen. A give's
 /// user-supplied name is quoted with 「」 so it reads as data. So is a gift's
 /// name; a gift reads the same whichever list it joins. `custom` is the
-/// user's own text, unquoted: it feeds only the user-role history marker.
+/// user's own text, unquoted, and so is a `custom_together`'s after its
+/// 「想和你一起：」: both feed only the user-role history marker.
 pub(crate) fn action_phrase(a: &UserAction) -> String {
     match a {
         UserAction::Give {
@@ -854,6 +855,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::SingTogether => "想和你一起唱歌".into(),
         UserAction::SkinnyDipTogether => "想和你一起裸泳".into(),
         UserAction::CommitCrimeTogether => "想和你一起去犯罪".into(),
+        UserAction::CustomTogether { text } => format!("想和你一起：{text}"),
         UserAction::Challenge => "向你发起挑战".into(),
         UserAction::Bet => "想和你打个赌".into(),
         UserAction::Custom { text } => text.clone(),
@@ -870,11 +872,13 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
 /// The action as the judge's `[用户动作]` line and `[user_action]` state it:
 /// 「对方凑过来想亲你」. `custom` reads 「对方的动作：「{text}」」, because the
 /// user's text is not guaranteed to read as a verb phrase; it is quoted with 「」
-/// so it reads as data. A tip adds how much it feels like to the persona; the
-/// amount itself never appears.
+/// so it reads as data. `custom_together` reads
+/// 「对方想和你一起做一件事：「{text}」」 for the same reason. A tip adds how
+/// much it feels like to the persona; the amount itself never appears.
 pub(crate) fn action_subject(a: &UserAction) -> String {
     match a {
         UserAction::Custom { text } => format!("对方的动作：「{text}」"),
+        UserAction::CustomTogether { text } => format!("对方想和你一起做一件事：「{text}」"),
         UserAction::Tip { amount_usd } => format!(
             "对方{}，对你来说算「{}」的一笔",
             action_phrase(a),
@@ -1195,23 +1199,42 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         SingingTogether => "和对方一起唱歌",
         SkinnyDippingTogether => "和对方一起裸泳",
         CommittingCrimeTogether => "和对方一起犯罪",
+        CustomTogether => "和对方一起做一件事",
+    }
+}
+
+/// What the persona calls an event she is in, with its words when it has
+/// them: a `custom_together` with the user's `text` reads 和对方一起：「{text}」
+/// (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+/// custom-together-design.md §8.3); without, and for every other kind,
+/// [`event_label`].
+pub(crate) fn doing_label(kind: eros_engine_core::events::EventKind, text: Option<&str>) -> String {
+    match (kind, text) {
+        (eros_engine_core::events::EventKind::CustomTogether, Some(text)) => {
+            format!("和对方一起：「{text}」")
+        }
+        _ => event_label(kind).to_string(),
     }
 }
 
 /// What she is doing, as the image composer reads it: the labels of what is
 /// live, the background first, then her cycle (spec 2026-11-24-period-cycle-
-/// design.md §7), then the foreground incident, joined by `；`. `None` when
-/// none is.
+/// design.md §7), then the foreground incident with its text (see
+/// [`doing_label`]), joined by `；`. `None` when none is.
 pub(crate) fn current_state(
     background: Option<eros_engine_core::events::EventKind>,
     cycle: Option<eros_engine_core::events::EventKind>,
-    foreground: Option<eros_engine_core::events::EventKind>,
+    foreground: Option<(eros_engine_core::events::EventKind, Option<&str>)>,
 ) -> Option<String> {
-    let labels: Vec<&str> = [background, cycle, foreground]
-        .into_iter()
-        .flatten()
-        .map(event_label)
-        .collect();
+    let labels: Vec<String> = [
+        background.map(|k| (k, None)),
+        cycle.map(|k| (k, None)),
+        foreground,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|(kind, text)| doing_label(kind, text))
+    .collect();
     (!labels.is_empty()).then(|| labels.join("；"))
 }
 
@@ -1259,22 +1282,22 @@ pub(crate) fn event_when_text(
 
 /// What is under way in `c`, in the order it is rendered: the background,
 /// her cycle, then the foreground (spec 2026-11-24-period-cycle-design.md
-/// §7).
+/// §7), each with its text.
 fn under_way(
     c: &eros_engine_store::events::CurrentEvents,
-) -> impl Iterator<Item = eros_engine_core::events::PastEvent> {
-    let cycle = c
-        .cycle
-        .as_ref()
-        .map(|e| eros_engine_core::events::PastEvent {
+) -> impl Iterator<Item = (eros_engine_core::events::PastEvent, Option<&str>)> {
+    let cycle = c.cycle.as_ref().map(|e| {
+        let past = eros_engine_core::events::PastEvent {
             kind: e.kind,
             started_at: e.started_at,
             ends_at: e.ends_at,
-        });
+        };
+        (past, None)
+    });
     [
-        c.background.as_ref().map(|e| e.past()),
+        c.background.as_ref().map(|e| (e.past(), e.text.as_deref())),
         cycle,
-        c.foreground.as_ref().map(|e| e.past()),
+        c.foreground.as_ref().map(|e| (e.past(), e.text.as_deref())),
     ]
     .into_iter()
     .flatten()
@@ -1302,13 +1325,13 @@ pub(crate) fn events_judge_text(
     date_back: Option<&eros_engine_store::activity::ActivityRecord>,
 ) -> Option<String> {
     let mut items: Vec<String> = under_way(c)
-        .map(|e| {
+        .map(|(e, text)| {
             if e.kind.is_false_alarm() {
-                return event_label(e.kind).to_string();
+                return doing_label(e.kind, text);
             }
             format!(
                 "{}（{}前开始，{}）",
-                event_label(e.kind),
+                doing_label(e.kind, text),
                 span_text(c.at - e.started_at),
                 ends_text(e.ends_at - c.at)
             )
@@ -1317,7 +1340,7 @@ pub(crate) fn events_judge_text(
     if let Some(a) = standard_entry(offline, separation) {
         items.push(format!(
             "{}（{}前结束，期间对方的消息你没有回）",
-            event_label(a.kind),
+            doing_label(a.kind, a.text.as_deref()),
             span_text(c.at - a.ends_at)
         ));
     }
@@ -1329,14 +1352,14 @@ pub(crate) fn events_judge_text(
         };
         items.push(format!(
             "{}（{}前结束，{tail}）",
-            event_label(e.kind),
+            doing_label(e.kind, e.text.as_deref()),
             span_text(c.at - e.ends_at)
         ));
     }
     if let Some(s) = scare {
         items.push(format!(
             "{}（{}前结束，结果是虚惊一场）",
-            event_label(s.kind),
+            doing_label(s.kind, s.text.as_deref()),
             span_text(c.at - s.ends_at)
         ));
     }
@@ -1355,11 +1378,15 @@ pub(crate) fn events_judge_text(
 /// 后结束）」; a false alarm under way is its label alone; `None` when none.
 pub(crate) fn events_reply_text(c: &eros_engine_store::events::CurrentEvents) -> Option<String> {
     let items: Vec<String> = under_way(c)
-        .map(|e| {
+        .map(|(e, text)| {
             if e.kind.is_false_alarm() {
-                event_label(e.kind).to_string()
+                doing_label(e.kind, text)
             } else {
-                format!("{}（{}）", event_label(e.kind), ends_text(e.ends_at - c.at))
+                format!(
+                    "{}（{}）",
+                    doing_label(e.kind, text),
+                    ends_text(e.ends_at - c.at)
+                )
             }
         })
         .collect();
@@ -5214,6 +5241,7 @@ mod tests {
                 started_at: at - chrono::Duration::minutes(started_mins_ago),
                 ends_at: at + chrono::Duration::minutes(ends_in_mins),
                 message_id: None,
+                text: None,
             },
             at,
         )
@@ -5707,7 +5735,7 @@ mod tests {
     fn current_state_lists_background_then_foreground() {
         use eros_engine_core::events::EventKind::{OnATrain, ShortTrip};
         assert_eq!(
-            current_state(Some(ShortTrip), None, Some(OnATrain)).as_deref(),
+            current_state(Some(ShortTrip), None, Some((OnATrain, None))).as_deref(),
             Some("短途旅游；在坐火车")
         );
         assert_eq!(
@@ -5715,7 +5743,7 @@ mod tests {
             Some("短途旅游")
         );
         assert_eq!(
-            current_state(None, None, Some(OnATrain)).as_deref(),
+            current_state(None, None, Some((OnATrain, None))).as_deref(),
             Some("在坐火车")
         );
         assert_eq!(current_state(None, None, None), None);
@@ -5726,7 +5754,7 @@ mod tests {
     fn the_picture_state_names_her_period() {
         use eros_engine_core::events::EventKind::{LongTrip, Period, Reading};
         assert_eq!(
-            current_state(Some(LongTrip), Some(Period), Some(Reading)).as_deref(),
+            current_state(Some(LongTrip), Some(Period), Some((Reading, None))).as_deref(),
             Some(
                 &*[
                     event_label(LongTrip),
@@ -7230,6 +7258,73 @@ mod tests {
         }
     }
 
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.1: the user's words stay unquoted in the
+    /// history marker and are quoted with 「」 on the judge's line.
+    #[test]
+    fn custom_together_marker_and_judge_line() {
+        let a = UserAction::CustomTogether {
+            text: "去海边放烟花".into(),
+        };
+        assert_eq!(action_phrase(&a), "想和你一起：去海边放烟花");
+        assert_eq!(action_marker(&a), "（想和你一起：去海边放烟花）");
+        assert_eq!(
+            action_subject(&a),
+            "对方想和你一起做一件事：「去海边放烟花」"
+        );
+        assert_eq!(
+            action_outcome(&a, ActionResponse::Refuse),
+            "对方想和你一起做一件事：「去海边放烟花」，你没有接受。"
+        );
+        // The bare kind, with no words in hand, reads as the fallback.
+        assert_eq!(
+            event_label(a.together_kind().unwrap()),
+            "和对方一起做一件事"
+        );
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.3: a `custom_together` reads the user's
+    /// words when they are in hand and the fallback when not; no other kind
+    /// reads any.
+    #[test]
+    fn doing_label_prints_the_custom_text() {
+        use eros_engine_core::events::EventKind::{CustomTogether, HikingTogether};
+        assert_eq!(
+            doing_label(CustomTogether, Some("去海边放烟花")),
+            "和对方一起：「去海边放烟花」"
+        );
+        assert_eq!(doing_label(CustomTogether, None), "和对方一起做一件事");
+        assert_eq!(doing_label(HikingTogether, Some("x")), "和对方一起爬山");
+    }
+
+    /// §8.3: her state block and the composer's `[此刻状态]` print the words
+    /// of a `custom_together` under way.
+    #[test]
+    fn a_custom_together_under_way_prints_its_text() {
+        use eros_engine_core::events::EventKind::{CustomTogether, ShortTrip};
+        let (mut e, at) = event_at(CustomTogether, 0, 60);
+        e.text = Some("去海边放烟花".into());
+        let c = only((e, at));
+        assert_eq!(
+            events_reply_text(&c).unwrap(),
+            "和对方一起：「去海边放烟花」（约 1 小时后结束）"
+        );
+        assert_eq!(
+            events_judge_text(&c, None, None, None, None).unwrap(),
+            "和对方一起：「去海边放烟花」（不到 1 小时前开始，约 1 小时后结束）"
+        );
+        assert_eq!(
+            current_state(
+                Some(ShortTrip),
+                None,
+                Some((CustomTogether, Some("去海边放烟花")))
+            )
+            .as_deref(),
+            Some("短途旅游；和对方一起：「去海边放烟花」")
+        );
+    }
+
     /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
     /// design.md §6.
     #[test]
@@ -7256,7 +7351,7 @@ mod tests {
             current_state(
                 Some(EventKind::ShortTrip),
                 None,
-                Some(EventKind::HikingTogether)
+                Some((EventKind::HikingTogether, None))
             )
             .as_deref(),
             Some("短途旅游；和对方一起爬山")
@@ -7315,7 +7410,7 @@ mod tests {
             current_state(
                 Some(EventKind::ShortTrip),
                 None,
-                Some(EventKind::SaunaTogether)
+                Some((EventKind::SaunaTogether, None))
             )
             .as_deref(),
             Some("短途旅游；和对方一起蒸桑拿")

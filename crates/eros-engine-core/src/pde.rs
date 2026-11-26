@@ -1421,6 +1421,25 @@ mod tests {
         ));
     }
 
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.1: nothing rules a `custom_together` out
+    /// before the judge, and her period does not roll it.
+    #[test]
+    fn custom_together_is_not_ruled_out_or_rolled() {
+        use crate::events::Setting;
+        let a = UserAction::CustomTogether {
+            text: "去海边放烟花".into(),
+        };
+        // The default scopes are not romance-compatible.
+        let e = action_msg(a);
+        assert!(!together_ruled_out(&e, false));
+        assert!(!together_ruled_out(&e, true));
+        assert!(!period_refuses(&e, true, 0.99));
+        for s in [Setting::Modern, Setting::Fantasy] {
+            assert!(!world_ruled_out(&e, s), "{s:?}");
+        }
+    }
+
     /// Spec 2026-11-24-period-cycle-design.md §8: during her period sex and
     /// the water actions are refused on a roll at or above one in three; no
     /// other action is rolled, and nothing is outside her period.

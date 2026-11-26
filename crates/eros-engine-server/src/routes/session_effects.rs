@@ -589,6 +589,7 @@ mod tests {
                 "started_at": started,
                 "ends_at": started + days(3),
                 "message_id": null,
+                "text": null,
             })
         );
         assert_eq!(
