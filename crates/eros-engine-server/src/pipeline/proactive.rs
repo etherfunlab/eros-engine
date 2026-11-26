@@ -425,13 +425,42 @@ fn kind_cue(
         // (`events::is_told`); anyone else is simply out and keeps replying.
         OutShopping if traits.female => "（你接下来要出门逛街，这段时间顾不上看手机。）".into(),
         OutShopping => "（你正在外面逛街。）".into(),
-        AwayFromPhone | Asleep | BrosGathering | SisGathering | HavingSex | TakingSpace
-        | FellOut | TravelingTogether | BathingTogether | OnADate | ShoweringTogether
-        | SaunaTogether | UsingToiletTogether | SmokingTogether | AsleepTogether
-        | HavingSexTogether | WalkingTogether | SmokingWeedTogether | JoggingTogether
-        | YogaTogether | StargazingTogether | HorseRidingTogether | StreakingTogether
-        | DrinkingTogether | HotSpringTogether | FightingTogether | WorkingOutTogether
-        | SwimmingTogether | CyclingTogether | HikingTogether => {
+        AwayFromPhone
+        | Asleep
+        | BrosGathering
+        | SisGathering
+        | HavingSex
+        | TakingSpace
+        | FellOut
+        | TravelingTogether
+        | BathingTogether
+        | OnADate
+        | ShoweringTogether
+        | SaunaTogether
+        | UsingToiletTogether
+        | SmokingTogether
+        | AsleepTogether
+        | HavingSexTogether
+        | WalkingTogether
+        | SmokingWeedTogether
+        | JoggingTogether
+        | YogaTogether
+        | StargazingTogether
+        | HorseRidingTogether
+        | StreakingTogether
+        | DrinkingTogether
+        | HotSpringTogether
+        | FightingTogether
+        | WorkingOutTogether
+        | SwimmingTogether
+        | CyclingTogether
+        | HikingTogether
+        | DancingTogether
+        | AdventuringTogether
+        | PlayingWithFireTogether
+        | SingingTogether
+        | SkinnyDippingTogether
+        | CommittingCrimeTogether => {
             unreachable!("{kind:?} is never told")
         }
         Sick => format!("（你生病了，大概要 {span}才会好。）"),

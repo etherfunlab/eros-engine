@@ -154,6 +154,12 @@ pub enum EventKindDto {
     SwimmingTogether,
     CyclingTogether,
     HikingTogether,
+    DancingTogether,
+    AdventuringTogether,
+    PlayingWithFireTogether,
+    SingingTogether,
+    SkinnyDippingTogether,
+    CommittingCrimeTogether,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -270,6 +276,12 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::SwimmingTogether => EventKind::SwimmingTogether,
             EventKindDto::CyclingTogether => EventKind::CyclingTogether,
             EventKindDto::HikingTogether => EventKind::HikingTogether,
+            EventKindDto::DancingTogether => EventKind::DancingTogether,
+            EventKindDto::AdventuringTogether => EventKind::AdventuringTogether,
+            EventKindDto::PlayingWithFireTogether => EventKind::PlayingWithFireTogether,
+            EventKindDto::SingingTogether => EventKind::SingingTogether,
+            EventKindDto::SkinnyDippingTogether => EventKind::SkinnyDippingTogether,
+            EventKindDto::CommittingCrimeTogether => EventKind::CommittingCrimeTogether,
         }
     }
 }
@@ -372,6 +384,12 @@ impl From<EventKind> for EventKindDto {
             EventKind::SwimmingTogether => EventKindDto::SwimmingTogether,
             EventKind::CyclingTogether => EventKindDto::CyclingTogether,
             EventKind::HikingTogether => EventKindDto::HikingTogether,
+            EventKind::DancingTogether => EventKindDto::DancingTogether,
+            EventKind::AdventuringTogether => EventKindDto::AdventuringTogether,
+            EventKind::PlayingWithFireTogether => EventKindDto::PlayingWithFireTogether,
+            EventKind::SingingTogether => EventKindDto::SingingTogether,
+            EventKind::SkinnyDippingTogether => EventKindDto::SkinnyDippingTogether,
+            EventKind::CommittingCrimeTogether => EventKindDto::CommittingCrimeTogether,
         }
     }
 }

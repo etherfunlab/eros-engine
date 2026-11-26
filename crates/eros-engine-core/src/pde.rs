@@ -82,22 +82,18 @@ pub fn strip_ruled_out(event: &Event) -> bool {
 /// Whether this turn's together action is ruled out before the judge (spec
 /// 2026-11-20-together-actions-state-in-picture-and-genome-routes-design.md
 /// §5, 2026-11-23-twelve-together-actions-and-propose-design.md §4.1): a
-/// `shower_together`, `bath_together`, `sex_together` or `streak_together`
-/// when the turn's scopes are not romance-compatible, as for `strip`; a
-/// `toilet_together` when the persona is a `machine`. No other action is.
+/// romance-gated action (`UserAction::romance_gated`: `shower_together`,
+/// `bath_together`, `sex_together`, `streak_together` or
+/// `skinny_dip_together`) when the turn's scopes are not romance-compatible,
+/// as for `strip`; a `toilet_together` when the persona is a `machine`. No
+/// other action is.
 pub fn together_ruled_out(event: &Event, machine: bool) -> bool {
     match event {
         Event::UserMessage {
-            action:
-                Some(
-                    UserAction::ShowerTogether
-                    | UserAction::BathTogether
-                    | UserAction::SexTogether
-                    | UserAction::StreakTogether,
-                ),
+            action: Some(action),
             affinity_scope,
             ..
-        } => !crate::scope::romance_compatible(*affinity_scope),
+        } if action.romance_gated() => !crate::scope::romance_compatible(*affinity_scope),
         Event::UserMessage {
             action: Some(UserAction::ToiletTogether),
             ..
@@ -129,9 +125,9 @@ pub const PERIOD_ACCEPT: f64 = 1.0 / 3.0;
 
 /// Whether her period refuses this turn's action before the judge (spec
 /// 2026-11-24-period-cycle-design.md §8): a `sex_together`, `bath_together`,
-/// `hot_spring_together`, `sauna_together` or `swim_together` while
-/// `on_period`, with `roll` (uniform in [0, 1)) at or above `PERIOD_ACCEPT`.
-/// Such a refusal drops no line.
+/// `hot_spring_together`, `sauna_together`, `swim_together` or
+/// `skinny_dip_together` while `on_period`, with `roll` (uniform in [0, 1))
+/// at or above `PERIOD_ACCEPT`. Such a refusal drops no line.
 pub fn period_refuses(event: &Event, on_period: bool, roll: f64) -> bool {
     on_period
         && roll >= PERIOD_ACCEPT
@@ -144,6 +140,7 @@ pub fn period_refuses(event: &Event, on_period: bool, roll: f64) -> bool {
                         | UserAction::HotSpringTogether
                         | UserAction::SaunaTogether
                         | UserAction::SwimTogether
+                        | UserAction::SkinnyDipTogether
                 ),
                 ..
             }
@@ -1361,6 +1358,67 @@ mod tests {
                 assert!(!world_ruled_out(&action_msg(a.clone()), s), "{a:?} {s:?}");
             }
         }
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §4: `skinny_dip_together` is gated and rolled
+    /// as `streak_together` and `swim_together` are; its five siblings are
+    /// neither gated, rolled, nor world-bound.
+    #[test]
+    fn skinny_dip_is_romance_gated_and_rolled_on_her_period() {
+        use crate::events::Setting;
+        use crate::scope::{AffinityScope, MemoryScope};
+        let scoped = |a: UserAction, compatible: bool| {
+            let mut e = action_msg(a);
+            if let Event::UserMessage {
+                memory_scope,
+                affinity_scope,
+                ..
+            } = &mut e
+            {
+                if compatible {
+                    *memory_scope = MemoryScope::Full;
+                    *affinity_scope = AffinityScope::full();
+                } else {
+                    *memory_scope = MemoryScope::default();
+                    *affinity_scope = AffinityScope::default();
+                }
+            }
+            e
+        };
+        let dip = |compatible| scoped(UserAction::SkinnyDipTogether, compatible);
+        assert!(together_ruled_out(&dip(false), false));
+        assert!(!together_ruled_out(&dip(true), false));
+        assert!(period_refuses(
+            &action_msg(UserAction::SkinnyDipTogether),
+            true,
+            0.5
+        ));
+        assert!(!period_refuses(
+            &action_msg(UserAction::SkinnyDipTogether),
+            true,
+            0.1
+        ));
+        for a in [
+            UserAction::DanceTogether,
+            UserAction::AdventureTogether,
+            UserAction::PlayWithFireTogether,
+            UserAction::SingTogether,
+            UserAction::CommitCrimeTogether,
+        ] {
+            assert!(
+                !together_ruled_out(&scoped(a.clone(), false), true),
+                "{a:?}"
+            );
+            assert!(!period_refuses(&action_msg(a.clone()), true, 0.9), "{a:?}");
+            for s in [Setting::Modern, Setting::Fantasy] {
+                assert!(!world_ruled_out(&action_msg(a.clone()), s), "{a:?} {s:?}");
+            }
+        }
+        assert!(!world_ruled_out(
+            &action_msg(UserAction::SkinnyDipTogether),
+            Setting::Fantasy
+        ));
     }
 
     /// Spec 2026-11-24-period-cycle-design.md §8: during her period sex and

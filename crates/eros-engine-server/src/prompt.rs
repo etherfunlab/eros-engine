@@ -848,6 +848,12 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::SwimTogether => "想和你一起游泳".into(),
         UserAction::CycleTogether => "想和你一起骑单车".into(),
         UserAction::HikeTogether => "想和你一起爬山".into(),
+        UserAction::DanceTogether => "想和你一起跳舞".into(),
+        UserAction::AdventureTogether => "想和你一起去冒险".into(),
+        UserAction::PlayWithFireTogether => "想和你一起玩火".into(),
+        UserAction::SingTogether => "想和你一起唱歌".into(),
+        UserAction::SkinnyDipTogether => "想和你一起裸泳".into(),
+        UserAction::CommitCrimeTogether => "想和你一起去犯罪".into(),
         UserAction::Challenge => "向你发起挑战".into(),
         UserAction::Bet => "想和你打个赌".into(),
         UserAction::Custom { text } => text.clone(),
@@ -1183,6 +1189,12 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         SwimmingTogether => "和对方一起游泳",
         CyclingTogether => "和对方一起骑单车",
         HikingTogether => "和对方一起爬山",
+        DancingTogether => "和对方一起跳舞",
+        AdventuringTogether => "和对方一起冒险",
+        PlayingWithFireTogether => "和对方一起玩火",
+        SingingTogether => "和对方一起唱歌",
+        SkinnyDippingTogether => "和对方一起裸泳",
+        CommittingCrimeTogether => "和对方一起犯罪",
     }
 }
 

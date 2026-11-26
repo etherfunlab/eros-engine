@@ -5954,7 +5954,13 @@
           "working_out_together",
           "swimming_together",
           "cycling_together",
-          "hiking_together"
+          "hiking_together",
+          "dancing_together",
+          "adventuring_together",
+          "playing_with_fire_together",
+          "singing_together",
+          "skinny_dipping_together",
+          "committing_crime_together"
         ]
       },
       "EventView": {

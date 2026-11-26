@@ -199,6 +199,18 @@ pub enum UserAction {
     SwimTogether,
     CycleTogether,
     HikeTogether,
+    /// The user asks her to dance, go adventuring, play with fire, sing,
+    /// skinny-dip or commit a crime with them (spec 2026-11-26-more-together-
+    /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md §4): each
+    /// behaves as `jog_together` does. `skinny_dip_together` is romance-gated
+    /// and answered in the `emotional` tone; a refused `commit_crime_together`
+    /// drops bond, not chemistry.
+    DanceTogether,
+    AdventureTogether,
+    PlayWithFireTogether,
+    SingTogether,
+    SkinnyDipTogether,
+    CommitCrimeTogether,
     /// The user challenges her, or proposes a bet: social actions whose
     /// answer says whether she takes it up; no winner is decided, and a
     /// refusal drops nothing (spec 2026-11-23 §4).
@@ -276,6 +288,7 @@ impl UserAction {
                 | UserAction::BathTogether
                 | UserAction::SexTogether
                 | UserAction::StreakTogether
+                | UserAction::SkinnyDipTogether
                 | UserAction::Propose
                 | UserAction::BreakUp
                 | UserAction::Threaten
@@ -319,8 +332,30 @@ impl UserAction {
             UserAction::SwimTogether => Some(EventKind::SwimmingTogether),
             UserAction::CycleTogether => Some(EventKind::CyclingTogether),
             UserAction::HikeTogether => Some(EventKind::HikingTogether),
+            UserAction::DanceTogether => Some(EventKind::DancingTogether),
+            UserAction::AdventureTogether => Some(EventKind::AdventuringTogether),
+            UserAction::PlayWithFireTogether => Some(EventKind::PlayingWithFireTogether),
+            UserAction::SingTogether => Some(EventKind::SingingTogether),
+            UserAction::SkinnyDipTogether => Some(EventKind::SkinnyDippingTogether),
+            UserAction::CommitCrimeTogether => Some(EventKind::CommittingCrimeTogether),
             _ => None,
         }
+    }
+
+    /// Whether only a romance-compatible pair can have this action accepted:
+    /// ruled out before the judge when the turn's scopes are not (spec
+    /// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §4, §6). The kinds these place are
+    /// `EventKind::ENDS_ON_CHEMISTRY_DROP`.
+    pub fn romance_gated(&self) -> bool {
+        matches!(
+            self,
+            UserAction::ShowerTogether
+                | UserAction::BathTogether
+                | UserAction::SexTogether
+                | UserAction::StreakTogether
+                | UserAction::SkinnyDipTogether
+        )
     }
 
     /// What this action has her take, and how many: a `give` its item and
@@ -338,14 +373,17 @@ impl UserAction {
         }
     }
 
-    /// The line a refusal of this action drops: handing something over or
-    /// giving something to keep is friendship, every physical gesture is
-    /// romance. A refused tip drops nothing (spec 2026-10-11 §6), nor does
-    /// seeing through a bluff, a threat or a trick (spec 2026-11-08 §2.2), nor
-    /// does turning down a date, a proposal, a break-up, a challenge or a bet.
+    /// The line a refusal of this action drops: handing something over,
+    /// giving something to keep or asking her into a crime is friendship,
+    /// every other physical gesture is romance. A refused tip drops nothing
+    /// (spec 2026-10-11 §6), nor does seeing through a bluff, a threat or a
+    /// trick (spec 2026-11-08 §2.2), nor does turning down a date, a
+    /// proposal, a break-up, a challenge or a bet.
     pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
-            UserAction::Give { .. } | UserAction::Gift { .. } => Some(AffinityLine::Bond),
+            UserAction::Give { .. } | UserAction::Gift { .. } | UserAction::CommitCrimeTogether => {
+                Some(AffinityLine::Bond)
+            }
             UserAction::Tip { .. }
             | UserAction::Bluff
             | UserAction::Threaten
@@ -881,6 +919,163 @@ mod tests {
             assert_eq!(a.consumed(), None, "{a:?}");
             assert_eq!(a.status_ask(), None, "{a:?}");
         }
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §4.
+    #[test]
+    fn six_more_together_actions_name_their_events() {
+        use EventKind::*;
+        for (a, wire, kind) in [
+            (UserAction::DanceTogether, "dance_together", DancingTogether),
+            (
+                UserAction::AdventureTogether,
+                "adventure_together",
+                AdventuringTogether,
+            ),
+            (
+                UserAction::PlayWithFireTogether,
+                "play_with_fire_together",
+                PlayingWithFireTogether,
+            ),
+            (UserAction::SingTogether, "sing_together", SingingTogether),
+            (
+                UserAction::SkinnyDipTogether,
+                "skinny_dip_together",
+                SkinnyDippingTogether,
+            ),
+            (
+                UserAction::CommitCrimeTogether,
+                "commit_crime_together",
+                CommittingCrimeTogether,
+            ),
+        ] {
+            let v = serde_json::json!({ "type": wire });
+            assert_eq!(serde_json::to_value(&a).unwrap(), v);
+            assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+            assert_eq!(a.together_kind(), Some(kind), "{a:?}");
+            assert_eq!(a.consumed(), None, "{a:?}");
+            assert_eq!(a.status_ask(), None, "{a:?}");
+        }
+    }
+
+    #[test]
+    fn only_skinny_dip_of_the_six_speaks_emotionally_and_only_crime_drops_bond() {
+        assert!(UserAction::SkinnyDipTogether.speaks_emotionally());
+        for a in [
+            UserAction::DanceTogether,
+            UserAction::AdventureTogether,
+            UserAction::PlayWithFireTogether,
+            UserAction::SingTogether,
+            UserAction::CommitCrimeTogether,
+        ] {
+            assert!(!a.speaks_emotionally(), "{a:?}");
+        }
+        assert_eq!(
+            UserAction::CommitCrimeTogether.refusal_line(),
+            Some(AffinityLine::Bond)
+        );
+        assert_eq!(
+            UserAction::SkinnyDipTogether.refusal_line(),
+            Some(AffinityLine::Chemistry)
+        );
+        assert_eq!(
+            UserAction::SingTogether.refusal_line(),
+            Some(AffinityLine::Chemistry)
+        );
+    }
+
+    /// One of every action: each unit variant and one of each payload variant.
+    fn all_actions() -> Vec<UserAction> {
+        use UserAction::*;
+        vec![
+            Give {
+                item: GivenItem::Food,
+                name: None,
+                quantity: 1,
+            },
+            Kiss,
+            Hug,
+            Touch,
+            Lick,
+            FrenchKiss,
+            HugFromBehind,
+            Tease,
+            Pat,
+            Wink,
+            Blink,
+            AskForDance,
+            AskDancing,
+            Photo,
+            Bluff,
+            Threaten,
+            Trick,
+            Strip,
+            ShowerTogether,
+            BathTogether,
+            SaunaTogether,
+            ToiletTogether,
+            SmokeTogether,
+            FallAsleepTogether,
+            SexTogether,
+            WalkTogether,
+            SmokeWeedTogether,
+            JogTogether,
+            YogaTogether,
+            StargazeTogether,
+            RideHorseTogether,
+            StreakTogether,
+            DrinkTogether,
+            Propose,
+            BreakUp,
+            HotSpringTogether,
+            FightTogether,
+            WorkoutTogether,
+            SwimTogether,
+            CycleTogether,
+            HikeTogether,
+            DanceTogether,
+            AdventureTogether,
+            PlayWithFireTogether,
+            SingTogether,
+            SkinnyDipTogether,
+            CommitCrimeTogether,
+            Challenge,
+            Bet,
+            Custom { text: "x".into() },
+            Tip { amount_usd: 5.0 },
+            Gift {
+                kind: ItemKind::Item,
+                name: "x".into(),
+            },
+            Date {
+                duration: DateDuration::Short,
+                place: "海边".into(),
+                content: "看海".into(),
+            },
+        ]
+    }
+
+    /// The kinds a chemistry drop ends are exactly the kinds the
+    /// romance-gated actions place (spec 2026-11-26 §6).
+    #[test]
+    fn romance_gated_actions_place_the_kinds_a_chemistry_drop_ends() {
+        let sorted = |mut kinds: Vec<EventKind>| {
+            kinds.sort_by_key(|k| k.as_str());
+            kinds
+        };
+        let gated: Vec<EventKind> = all_actions()
+            .iter()
+            .filter(|a| a.romance_gated())
+            .filter_map(|a| a.together_kind())
+            .collect();
+        assert_eq!(
+            sorted(gated),
+            sorted(EventKind::ENDS_ON_CHEMISTRY_DROP.to_vec())
+        );
+        // `strip` has its own gate (`pde::strip_ruled_out`).
+        assert!(!UserAction::Strip.romance_gated());
+        assert!(!UserAction::SaunaTogether.romance_gated());
     }
 
     /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §4: social
