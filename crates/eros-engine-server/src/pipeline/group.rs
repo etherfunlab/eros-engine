@@ -494,10 +494,11 @@ pub(crate) fn run_group_turn(
             });
             let seat_scopes = turn.scopes(seat.member_session_id);
             // What the speaker is doing, for the composer's `[此刻状态]`, and
-            // what she wears in a hot spring or a sauna by the speaker's
-            // scopes (spec 2026-11-26-more-together-actions-bath-outfit-
-            // chemistry-drop-and-custom-together-design.md §5); read only for
-            // a turn that draws.
+            // what she wears in the water or naked by the speaker's scopes
+            // and chemistry (spec 2026-11-26-more-together-actions-bath-
+            // outfit-chemistry-drop-and-custom-together-design.md §5; spec
+            // 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §4);
+            // read only for a turn that draws.
             let picture = if matches!(
                 plan.action_type,
                 ActionType::ReplyImage | ActionType::ReplyTextImage
@@ -509,7 +510,11 @@ pub(crate) fn run_group_turn(
                     chrono::Utc::now(),
                     None,
                     crate::prompt::persona_traits(&seat.persona).cycle_health(),
-                    eros_engine_core::scope::romance_compatible(seat_scopes.1),
+                    crate::prompt::WaterWear::of(
+                        &seat.persona,
+                        eros_engine_core::scope::romance_compatible(seat_scopes.1),
+                        seat.affinity.chemistry_score(),
+                    ),
                 )
                 .await
             } else {

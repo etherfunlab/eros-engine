@@ -1630,20 +1630,106 @@ pub(crate) fn stripped_clothing(outfit: Option<&str>) -> String {
     }
 }
 
+/// The persona's gender as the swimming clothing reads it (spec 2026-11-27-
+/// swim-outfit-ladder-and-fish-together-design.md §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wearer {
+    Female,
+    Male,
+    Other,
+}
+
+/// `art_metadata.gender` exactly `female` or `male`; anything else, or none,
+/// is `Other`, as `persona_traits` reads `female`.
+pub(crate) fn wearer(persona: &CompanionPersona) -> Wearer {
+    match meta_str(persona, "gender") {
+        Some("female") => Wearer::Female,
+        Some("male") => Wearer::Male,
+        _ => Wearer::Other,
+    }
+}
+
+/// The chemistry at and above which she swims with nothing on (spec
+/// 2026-11-27 §4): a line inside tier 5.
+pub(crate) const SWIM_NAKED_CHEMISTRY: f64 = 0.95;
+
+/// What the water clothing reads besides the kind (spec 2026-11-27 §4).
+/// `virgin` starts as the card's `is_virgin`; `coin` picks tier 1's swimsuit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WaterWear {
+    pub romance_compatible: bool,
+    pub wearer: Wearer,
+    pub virgin: bool,
+    pub chemistry: f64,
+    pub coin: bool,
+}
+
+impl WaterWear {
+    /// The persona's gender and card virginity, the pair's compatibility and
+    /// chemistry, and a fair coin.
+    pub(crate) fn of(persona: &CompanionPersona, romance_compatible: bool, chemistry: f64) -> Self {
+        WaterWear {
+            romance_compatible,
+            wearer: wearer(persona),
+            virgin: persona_traits(persona).is_virgin,
+            chemistry,
+            coin: rand::thread_rng().gen(),
+        }
+    }
+}
+
 /// What the composer's `[此刻穿着]` says when the foreground of a picture is
-/// a hot spring or a sauna with the user, over the judge's clothing and a
-/// named outfit (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-
-/// drop-and-custom-together-design.md §5): nothing on for a romance-compatible
-/// pair, a towel otherwise. `None` for any other foreground.
+/// in the water or naked with the user, over the judge's clothing and a
+/// named outfit. A hot spring or a sauna: nothing on for a romance-compatible
+/// pair, a towel otherwise (spec 2026-11-26-more-together-actions-bath-
+/// outfit-chemistry-drop-and-custom-together-design.md §5). A skinny dip or a
+/// naked ride: nothing on (spec 2026-11-27 §5). A swim: the swimsuit of her
+/// gender, compatibility, virginity and chemistry tier (spec 2026-11-27 §4),
+/// nothing for a gender other than female or male. `None` for any other
+/// foreground.
 pub(crate) fn water_clothing(
     foreground: Option<eros_engine_core::events::EventKind>,
-    romance_compatible: bool,
+    wear: &WaterWear,
 ) -> Option<&'static str> {
-    use eros_engine_core::events::EventKind::{HotSpringTogether, SaunaTogether};
+    use eros_engine_core::events::EventKind::{
+        HotSpringTogether, NakedHorseRidingTogether, SaunaTogether, SkinnyDippingTogether,
+        SwimmingTogether,
+    };
     match foreground? {
-        HotSpringTogether | SaunaTogether if romance_compatible => Some("什么都没穿"),
+        HotSpringTogether | SaunaTogether if wear.romance_compatible => Some("什么都没穿"),
         HotSpringTogether | SaunaTogether => Some("身上只裹着一条浴巾"),
+        SkinnyDippingTogether | NakedHorseRidingTogether => Some("什么都没穿"),
+        SwimmingTogether => swimsuit(wear),
         _ => None,
+    }
+}
+
+fn swimsuit(wear: &WaterWear) -> Option<&'static str> {
+    let tier = eros_engine_core::affinity::tier_index(wear.chemistry);
+    let naked = wear.chemistry >= SWIM_NAKED_CHEMISTRY;
+    match (wear.wearer, wear.romance_compatible) {
+        (Wearer::Other, _) => None,
+        (Wearer::Female, false) => Some("plain one-piece swimsuit"),
+        (Wearer::Male, false) => Some("board shorts"),
+        _ if naked => Some("什么都没穿"),
+        (Wearer::Female, true) if wear.virgin && tier <= 3 => {
+            Some("navy one-piece swimsuit with name patch and a front drain flap")
+        }
+        (Wearer::Female, true) => Some(match tier {
+            1 if wear.coin => "Tankini top",
+            1 => "Bralette bikini",
+            2 => "Triangle bikini",
+            3 => "Bandeau bikini",
+            4 => "Halter bikini",
+            _ => "String bikini",
+        }),
+        (Wearer::Male, true) => Some(match tier {
+            1 => "rash guard with board shorts",
+            2 => "board shorts",
+            3 => "swim trunks",
+            4 => "square-cut swim trunks",
+            _ => "swim briefs",
+        }),
     }
 }
 
@@ -5715,24 +5801,122 @@ mod tests {
         );
     }
 
+    fn wear(
+        romance_compatible: bool,
+        wearer: Wearer,
+        virgin: bool,
+        chemistry: f64,
+        coin: bool,
+    ) -> WaterWear {
+        WaterWear {
+            romance_compatible,
+            wearer,
+            virgin,
+            chemistry,
+            coin,
+        }
+    }
+
+    const NAVY: &str = "navy one-piece swimsuit with name patch and a front drain flap";
+
     /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
-    /// custom-together-design.md §5.
+    /// custom-together-design.md §5; spec 2026-11-27-swim-outfit-ladder-and-
+    /// fish-together-design.md §4, §5.
     #[test]
-    fn water_clothing_by_kind_and_pair() {
+    fn water_clothing_by_kind_wearer_and_chemistry() {
         use eros_engine_core::events::EventKind::*;
-        for k in [HotSpringTogether, SaunaTogether] {
-            assert_eq!(water_clothing(Some(k), true), Some("什么都没穿"));
-            assert_eq!(water_clothing(Some(k), false), Some("身上只裹着一条浴巾"));
+        use Wearer::{Female, Male, Other};
+        let at = |k, w: WaterWear| water_clothing(Some(k), &w);
+        for w in [Female, Male, Other] {
+            for k in [HotSpringTogether, SaunaTogether] {
+                assert_eq!(at(k, wear(true, w, false, 0.5, true)), Some("什么都没穿"));
+                assert_eq!(
+                    at(k, wear(false, w, false, 0.5, true)),
+                    Some("身上只裹着一条浴巾")
+                );
+            }
+            for k in [SkinnyDippingTogether, NakedHorseRidingTogether] {
+                for compatible in [true, false] {
+                    assert_eq!(
+                        at(k, wear(compatible, w, false, 0.0, true)),
+                        Some("什么都没穿"),
+                        "{k:?} {w:?}"
+                    );
+                }
+            }
         }
-        for k in [
-            BathingTogether,
-            ShoweringTogether,
-            Bathing,
-            SwimmingTogether,
-        ] {
-            assert_eq!(water_clothing(Some(k), true), None);
+        for k in [BathingTogether, ShoweringTogether, Bathing] {
+            assert_eq!(at(k, wear(true, Female, false, 0.5, true)), None);
         }
-        assert_eq!(water_clothing(None, true), None);
+        assert_eq!(
+            water_clothing(None, &wear(true, Female, false, 0.5, true)),
+            None
+        );
+
+        // Female, compatible, not a virgin: the ladder, each cut on the higher tier.
+        let swim = |w: WaterWear| at(SwimmingTogether, w);
+        let her = |c: f64, coin: bool| swim(wear(true, Female, false, c, coin));
+        assert_eq!(her(0.0, true), Some("Tankini top"));
+        assert_eq!(her(0.0, false), Some("Bralette bikini"));
+        assert_eq!(her(0.149, false), Some("Bralette bikini"));
+        assert_eq!(her(0.15, true), Some("Triangle bikini"));
+        assert_eq!(her(0.349, true), Some("Triangle bikini"));
+        assert_eq!(her(0.35, true), Some("Bandeau bikini"));
+        assert_eq!(her(0.62, true), Some("Halter bikini"));
+        assert_eq!(her(0.899, true), Some("Halter bikini"));
+        assert_eq!(her(0.9, true), Some("String bikini"));
+        assert_eq!(her(0.949, true), Some("String bikini"));
+        assert_eq!(her(0.95, true), Some("什么都没穿"));
+        assert_eq!(her(1.0, true), Some("什么都没穿"));
+
+        // Female, compatible, a virgin: the navy suit through tier 3 only.
+        let virgin = |c: f64| swim(wear(true, Female, true, c, true));
+        assert_eq!(virgin(0.0), Some(NAVY));
+        assert_eq!(virgin(0.2), Some(NAVY));
+        assert_eq!(virgin(0.5), Some(NAVY));
+        assert_eq!(virgin(0.62), Some("Halter bikini"));
+        assert_eq!(virgin(0.9), Some("String bikini"));
+        assert_eq!(virgin(0.95), Some("什么都没穿"));
+
+        // Female, not compatible.
+        for v in [true, false] {
+            for c in [0.0, 0.97] {
+                assert_eq!(
+                    swim(wear(false, Female, v, c, true)),
+                    Some("plain one-piece swimsuit")
+                );
+            }
+        }
+
+        // Male: no virginity variant.
+        for v in [true, false] {
+            let him = |c: f64| swim(wear(true, Male, v, c, false));
+            assert_eq!(him(0.0), Some("rash guard with board shorts"));
+            assert_eq!(him(0.15), Some("board shorts"));
+            assert_eq!(him(0.35), Some("swim trunks"));
+            assert_eq!(him(0.62), Some("square-cut swim trunks"));
+            assert_eq!(him(0.9), Some("swim briefs"));
+            assert_eq!(him(0.95), Some("什么都没穿"));
+            assert_eq!(swim(wear(false, Male, v, 0.97, true)), Some("board shorts"));
+        }
+
+        // Any other gender: the composer decides, as before.
+        for compatible in [true, false] {
+            for c in [0.0, 0.97] {
+                assert_eq!(swim(wear(compatible, Other, false, c, true)), None);
+            }
+        }
+    }
+
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §4.
+    #[test]
+    fn wearer_reads_female_and_male_only() {
+        assert_eq!(wearer(&persona_with_gender("female")), Wearer::Female);
+        assert_eq!(wearer(&persona_with_gender("male")), Wearer::Male);
+        for g in ["Female", " female", "non-binary"] {
+            assert_eq!(wearer(&persona_with_gender(g)), Wearer::Other, "{g}");
+        }
+        assert_eq!(wearer(&fixture_persona()), Wearer::Other);
     }
 
     #[test]

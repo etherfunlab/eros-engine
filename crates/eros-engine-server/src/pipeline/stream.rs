@@ -4447,12 +4447,23 @@ pub(crate) struct PictureState {
     pub clothing_override: Option<&'static str>,
 }
 
+/// [`crate::prompt::water_clothing`] for the persona `instance_id` (spec
+/// 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §4).
+pub(crate) async fn water_clothing_for(
+    _pool: &sqlx::PgPool,
+    _instance_id: Uuid,
+    foreground: Option<eros_engine_core::events::EventKind>,
+    wear: crate::prompt::WaterWear,
+) -> Option<&'static str> {
+    crate::prompt::water_clothing(foreground, &wear)
+}
+
 /// What she is doing at a picture's moment, as the composer reads it: the
 /// events under way for `instance_id` at `at_message` (or at `now` without
-/// one), plus `starting`, and what she wears in a hot spring or a sauna for a
-/// pair `romance_compatible` or not, the caller's resolved scopes (spec
-/// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-custom-
-/// together-design.md §5). `period` is the persona's
+/// one), plus `starting`, and what she wears in the water or naked by `wear`,
+/// built from the caller's resolved scopes and chemistry (spec 2026-11-26-
+/// more-together-actions-bath-outfit-chemistry-drop-and-custom-together-
+/// design.md §5; spec 2026-11-27 §4, §5). `period` is the persona's
 /// `PersonaTraits::cycle_health`. Fail-open: a failed read is warned and reads
 /// as no events under way (`starting` still counts), never blocks the picture.
 pub(crate) async fn state_for_picture(
@@ -4462,7 +4473,7 @@ pub(crate) async fn state_for_picture(
     now: chrono::DateTime<chrono::Utc>,
     starting: Option<eros_engine_core::events::EventKind>,
     period: Option<eros_engine_core::events::Health>,
-    romance_compatible: bool,
+    wear: crate::prompt::WaterWear,
 ) -> PictureState {
     let current = (eros_engine_store::events::EventRepo { pool })
         .current(instance_id, at_message, now, period)
@@ -4474,10 +4485,13 @@ pub(crate) async fn state_for_picture(
     let (background, cycle, foreground) = picture_kinds(&current, starting.map(|k| (k, None)));
     PictureState {
         state: crate::prompt::current_state(background, cycle, foreground),
-        clothing_override: crate::prompt::water_clothing(
+        clothing_override: water_clothing_for(
+            pool,
+            instance_id,
             foreground.map(|(kind, _)| kind),
-            romance_compatible,
-        ),
+            wear,
+        )
+        .await,
     }
 }
 
@@ -6296,14 +6310,23 @@ pub(crate) fn run_stream_with(
                 // The user's gender, when what she is doing is something she
                 // shares with them (spec 2026-11-24 §7.2).
                 let partner_gender = partner_gender_of(&current, placed, user_msg.user_gender);
-                // What she wears in a hot spring or a sauna, by the turn's
-                // scopes: the composer's slot only, the plan keeps its
+                // What she wears in the water or naked, by the turn's scopes
+                // and chemistry: the composer's slot only, the plan keeps its
                 // clothing (spec 2026-11-26-more-together-actions-bath-outfit-
-                // chemistry-drop-and-custom-together-design.md §5).
-                let clothing_override = crate::prompt::water_clothing(
+                // chemistry-drop-and-custom-together-design.md §5; spec
+                // 2026-11-27-swim-outfit-ladder-and-fish-together-design.md
+                // §4, §5).
+                let clothing_override = water_clothing_for(
+                    &state.pool,
+                    user_msg.instance_id,
                     picture_kinds(&current, doing).2.map(|(kind, _)| kind),
-                    eros_engine_core::scope::romance_compatible(user_msg.affinity_scope),
-                );
+                    crate::prompt::WaterWear::of(
+                        &input.persona,
+                        eros_engine_core::scope::romance_compatible(user_msg.affinity_scope),
+                        input.affinity.chemistry_score(),
+                    ),
+                )
+                .await;
                 let mut image_only_done = false;
                 let mut image_only_produced: Vec<crate::pipeline::post_process::ProducedMessage> =
                     Vec::new();
@@ -11796,6 +11819,7 @@ data: [DONE]\n\n";
             events,
             image,
             art,
+            None,
             |_| {},
         )
         .await
@@ -11813,6 +11837,7 @@ data: [DONE]\n\n";
         events: &[EventSeed],
         image: bool,
         art: Option<serde_json::Value>,
+        chemistry: Option<f64>,
         tweak: impl FnOnce(&mut PersistedUserMessage),
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -11902,6 +11927,21 @@ data: [DONE]\n\n";
             .unwrap(),
         );
         seed_events(pool, user_id, instance_id, session_id, events).await;
+        // The pair's chemistry, both its axes at `c`.
+        if let Some(c) = chemistry {
+            sqlx::query(
+                "INSERT INTO engine.companion_affinity \
+                   (session_id, user_id, instance_id, intimacy, tension) \
+                 VALUES ($1, $2, $3, $4, $4)",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .bind(instance_id)
+            .bind(c)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
         let meta = serde_json::json!({"action": serde_json::to_value(&action).unwrap()});
         let umid = match (ChatRepo { pool })
             .upsert_user_message_idempotent(
@@ -11962,15 +12002,33 @@ data: [DONE]\n\n";
         compatible: bool,
         tweak: impl FnOnce(&mut PersistedUserMessage),
     ) -> (Vec<ProtocolFrame>, String, String, String, String) {
+        water_picture_turn_with(pool, action, response, compatible, None, None, &[], tweak).await
+    }
+
+    /// [`water_picture_turn`] for a persona with `art` as her
+    /// `art_metadata`, the pair's chemistry at `chemistry` and `events`
+    /// seeded first.
+    #[allow(clippy::too_many_arguments)]
+    async fn water_picture_turn_with(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        response: &str,
+        compatible: bool,
+        art: Option<serde_json::Value>,
+        chemistry: Option<f64>,
+        events: &[EventSeed],
+        tweak: impl FnOnce(&mut PersistedUserMessage),
+    ) -> (Vec<ProtocolFrame>, String, String, String, String) {
         let (frames, mock, umid) = run_together_turn_tweaked(
             pool,
             action,
             Some(response),
             "reply_text",
             compatible,
-            &[],
+            events,
             true,
-            None,
+            art,
+            chemistry,
             tweak,
         )
         .await;
@@ -12081,6 +12139,139 @@ data: [DONE]\n\n";
         assert_eq!(answer, "refuse");
     }
 
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §4: an
+    /// accepted swim draws a compatible female persona in her tier's
+    /// swimsuit, over a named outfit.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_swim_draws_the_tiers_swimsuit(pool: PgPool) {
+        let (frames, payload, _, clothing, answer) = water_picture_turn_with(
+            &pool,
+            eros_engine_core::types::UserAction::SwimTogether,
+            "accept",
+            true,
+            Some(serde_json::json!({"gender": "female"})),
+            Some(0.5),
+            &[],
+            |m| m.outfit = Some("红色旗袍".into()),
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(payload.contains("[此刻穿着]\nBandeau bikini\n"), "{payload}");
+        assert!(payload.contains("[此刻状态]\n和对方一起游泳\n"), "{payload}");
+        assert_eq!(clothing, "Bandeau bikini");
+        assert_eq!(answer, "accept");
+    }
+
+    /// §4: a male persona's first tier.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_swim_draws_a_male_persona_in_a_rash_guard(pool: PgPool) {
+        let (_, payload, _, clothing, _) = water_picture_turn_with(
+            &pool,
+            eros_engine_core::types::UserAction::SwimTogether,
+            "accept",
+            true,
+            Some(serde_json::json!({"gender": "male"})),
+            Some(0.05),
+            &[],
+            |_| {},
+        )
+        .await;
+        assert!(
+            payload.contains("[此刻穿着]\nrash guard with board shorts\n"),
+            "{payload}"
+        );
+        assert_eq!(clothing, "rash guard with board shorts");
+    }
+
+    /// §4: a pair that is not romance-compatible swims in a plain one-piece,
+    /// whatever the chemistry.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incompatible_swim_draws_a_plain_one_piece(pool: PgPool) {
+        let (frames, payload, _, clothing, _) = water_picture_turn_with(
+            &pool,
+            eros_engine_core::types::UserAction::SwimTogether,
+            "accept",
+            false,
+            Some(serde_json::json!({"gender": "female"})),
+            Some(0.97),
+            &[],
+            |_| {},
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(
+            payload.contains("[此刻穿着]\nplain one-piece swimsuit\n"),
+            "{payload}"
+        );
+        assert_eq!(clothing, "plain one-piece swimsuit");
+    }
+
+    /// §4: a refused swim places no kind, so a forced picture wears the
+    /// named outfit.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_swim_writes_no_swimsuit(pool: PgPool) {
+        let (frames, payload, _, clothing, _) = water_picture_turn_with(
+            &pool,
+            eros_engine_core::types::UserAction::SwimTogether,
+            "refuse",
+            true,
+            Some(serde_json::json!({"gender": "female"})),
+            Some(0.5),
+            &[],
+            |m| {
+                m.outfit = Some("红色旗袍".into());
+                m.image = Some(crate::routes::companion_stream::ImageReplyParams {
+                    force: true,
+                    ..Default::default()
+                });
+            },
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert!(payload.contains("[此刻穿着]\n红色旗袍\n"), "{payload}");
+        assert_eq!(clothing, "红色旗袍");
+    }
+
+    /// §5: an accepted skinny dip draws her with nothing on, whatever her
+    /// gender says.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_skinny_dip_draws_her_with_nothing_on(pool: PgPool) {
+        let (frames, payload, _, clothing, _) = water_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::SkinnyDipTogether,
+            "accept",
+            true,
+            |_| {},
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(payload.contains("[此刻穿着]\n什么都没穿\n"), "{payload}");
+        assert_eq!(clothing, "什么都没穿");
+    }
+
+    /// §5: so does an accepted naked ride.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_naked_ride_draws_her_with_nothing_on(pool: PgPool) {
+        let (frames, payload, _, clothing, _) = water_picture_turn_with(
+            &pool,
+            eros_engine_core::types::UserAction::RideHorseNakedTogether,
+            "accept",
+            true,
+            Some(serde_json::json!({"gender": "male"})),
+            None,
+            &[],
+            |_| {},
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(payload.contains("[此刻穿着]\n什么都没穿\n"), "{payload}");
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起裸体骑马\n"),
+            "{payload}"
+        );
+        assert_eq!(clothing, "什么都没穿");
+    }
+
     /// §5: no other kind is covered: an accepted jog's picture reads as the
     /// jogging test's, in the named outfit.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -12154,7 +12345,13 @@ data: [DONE]\n\n";
                 chrono::Utc::now(),
                 None,
                 None,
-                compatible,
+                crate::prompt::WaterWear {
+                    romance_compatible: compatible,
+                    wearer: crate::prompt::Wearer::Other,
+                    virgin: false,
+                    chemistry: 0.0,
+                    coin: true,
+                },
             )
         };
         let picture = read(romance_compatible(AffinityScope::default())).await;
@@ -12162,6 +12359,41 @@ data: [DONE]\n\n";
         assert_eq!(picture.state.as_deref(), Some("和对方一起蒸桑拿"));
         let picture = read(romance_compatible(AffinityScope::full())).await;
         assert_eq!(picture.clothing_override, Some("什么都没穿"));
+    }
+
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §4: a
+    /// swim under way reads the swimsuit of the chemistry the path hands in,
+    /// as group and event pictures do.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_swim_reads_the_tiers_swimsuit_in_state_for_picture(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        seed_events(
+            &pool,
+            user_id,
+            instance_id,
+            session_id,
+            &[ev("swimming_together", 10, 50)],
+        )
+        .await;
+        let picture = state_for_picture(
+            &pool,
+            instance_id,
+            None,
+            chrono::Utc::now(),
+            None,
+            None,
+            crate::prompt::WaterWear {
+                romance_compatible: true,
+                wearer: crate::prompt::Wearer::Female,
+                virgin: false,
+                chemistry: 0.7,
+                coin: true,
+            },
+        )
+        .await;
+        assert_eq!(picture.clothing_override, Some("Halter bikini"));
+        assert_eq!(picture.state.as_deref(), Some("和对方一起游泳"));
     }
 
     /// `(event_key, session_id, started_at, ends_at)` of every event of `kind`.
