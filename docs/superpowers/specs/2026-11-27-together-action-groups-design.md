@@ -1,4 +1,4 @@
-# Together-action groups: general, nude and thrill; water; nude counterparts — Design
+# Together-action groups: general, naturism and thrill; water; naturism counterparts — Design
 
 - **Date:** 2026-11-27
 - **Status:** Approved
@@ -23,11 +23,15 @@ Every together action belongs to one of three groups, and what the engine
 does with it follows from its group and from whether it happens in water:
 
 - **general** — ordinary things done together;
-- **nude** — the same done naked, or naked by nature;
+- **naturism** (天然) — the same done naked, or naked by nature;
 - **thrill** — adventure, crime, playing with fire, fighting.
 
-A general and a nude action that are the same activity are paired (a jog
-and a streak). Three nude actions are added: naked yoga, a naked hike and
+Documentation calls the second group naturism (天然); the code names it
+`Nude` (`TogetherGroup::Nude`), and the action and kind identifiers keep
+`naked`. *(Owner's ruling.)*
+
+A general and a naturism action that are the same activity are paired (a jog
+and a streak). Three naturism actions are added: naked yoga, a naked hike and
 a naked hot spring. The groups replace hand-kept lists, so a new action
 only has to say its group and whether it is wet.
 
@@ -36,7 +40,7 @@ only has to say its group and whether it is wet.
 **Goals.** The group, water and counterpart properties of §4; everything
 of §5–§8 derived from them; the three actions of §6.
 
-**Non-goals.** Nude counterparts beyond the six pairs of §4.3 ("anything I
+**Non-goals.** Naturism counterparts beyond the six pairs of §4.3 ("anything I
 did not list, do not add"); any change to her own solo `bathing` /
 `showering`, to `strip`'s compatibility refusal, or to the compatibility
 her own romantic asks need; any change to the swim ladder's table.
@@ -63,11 +67,11 @@ director, the picture) must read.
 | group | actions → kinds |
 |---|---|
 | general | `walk_together`, `jog_together`, `yoga_together`, `stargaze_together`, `ride_horse_together`, `drink_together`, `smoke_together`, `smoke_weed_together`, `toilet_together`, `fall_asleep_together`, `workout_together`, `swim_together`, `cycle_together`, `hike_together`, `fish_together`, `dance_together`, `sing_together`, `hot_spring_together`, `sauna_together`, `custom_together` |
-| nude | `shower_together`, `bath_together`, `sex_together`, `streak_together`, `skinny_dip_together`, `ride_horse_naked_together`, and §6's `yoga_naked_together`, `hike_naked_together`, `hot_spring_naked_together` |
+| naturism | `shower_together`, `bath_together`, `sex_together`, `streak_together`, `skinny_dip_together`, `ride_horse_naked_together`, and §6's `yoga_naked_together`, `hike_naked_together`, `hot_spring_naked_together` |
 | thrill | `adventure_together`, `commit_crime_together`, `play_with_fire_together`, `fight_together` |
 
 Each action's group is its kind's group. *(Owner's rulings: the three
-groups; nude: sex, shower, bath, skinny dip, streak, the naked ride and the
+groups; naturism: sex, shower, bath, skinny dip, streak, the naked ride and the
 three new ones; thrill: adventure, crime, fire, fight; general: sleep and
 swim. Engine's call: every other action in general, `custom_together`
 included.)*
@@ -76,16 +80,16 @@ included.)*
 
 Wet kinds: `swimming_together`, `hot_spring_together`, `sauna_together`
 (general); `showering_together`, `bathing_together`,
-`skinny_dipping_together`, `naked_hot_spring_together` (nude). No thrill
+`skinny_dipping_together`, `naked_hot_spring_together` (naturism). No thrill
 kind is wet. *(Owner's rulings: water is a property of the general and the
-nude groups; shower and bath are nude and wet. Engine's call: sauna wet,
+naturism groups; shower and bath are naturism and wet. Engine's call: sauna wet,
 keeping it on the two lists it is on today.)*
 
 ### 4.3 Counterparts
 
-Each nude kind below names its clothed counterpart:
+Each naturism kind below names its clothed counterpart:
 
-| nude | clothed |
+| naturism | clothed |
 |---|---|
 | `streaking_together` | `jogging_together` |
 | `naked_hiking_together` | `hiking_together` |
@@ -101,12 +105,13 @@ naked ride, the pair the owner's naked ride implies.)*
 
 ## 5. What the properties decide
 
-### 5.1 Nude
+### 5.1 Naturism
 
-A nude action or kind:
+A naturism action or kind:
 
-- **no romance gate.** `UserAction::romance_gated` goes; nothing is
-  refused before the judge for compatibility. `together_ruled_out` keeps
+- **no romance gate.** Naturism is not a romantic act, so romance
+  compatibility does not gate it: `UserAction::romance_gated` goes and
+  nothing is refused before the judge for compatibility. `together_ruled_out` keeps
   only its machine rule (`toilet_together`). *(Owner's ruling; it
   overturns the gate on `shower_together`, `bath_together`, `sex_together`,
   `streak_together`, `skinny_dip_together` and
@@ -114,9 +119,9 @@ A nude action or kind:
 - **answered in the `emotional` tone** (`speaks_emotionally`), accepted or
   refused. *(Owner's ruling.)*
 - **ended by a chemistry drop**: `EventKind::ENDS_ON_CHEMISTRY_DROP` is the
-  nude kinds. *(Owner's ruling.)*
-- **kept out of the story director**: every nude kind is in `life_events`'
-  kept-out list, beside the non-nude kinds already there for their own
+  naturism kinds. *(Owner's ruling.)*
+- **kept out of the story director**: every naturism kind is in `life_events`'
+  kept-out list, beside the non-naturism kinds already there for their own
   reasons (`using_toilet_together`, `asleep_together`, `custom_together`,
   `on_a_date`). *(Owner's ruling.)*
 - **pictured with nothing on**: §7.
@@ -138,7 +143,7 @@ each by the one-tier drop of today:
 |---|---|
 | `give`, `gift`, every thrill action | bond |
 | `jog_together`, `hike_together`, `fish_together`, `cycle_together`, `ride_horse_together` | bond |
-| a nude action whose counterpart (§4.3) drops bond | bond and chemistry |
+| a naturism action whose counterpart (§4.3) drops bond | bond and chemistry |
 | every other physical or custom action | chemistry |
 | `tip`, `bluff`, `threaten`, `trick`, `propose`, `break_up`, `challenge`, `bet`, `date` | none |
 
@@ -146,7 +151,7 @@ So a refused `streak_together`, `hike_naked_together` or
 `ride_horse_naked_together` drops both lines; a refused
 `skinny_dip_together`, `yoga_naked_together`, `hot_spring_naked_together`,
 `shower_together`, `bath_together` or `sex_together` drops chemistry.
-*(Owner's rulings: thrill drops bond; a nude counterpart of a bond-dropping
+*(Owner's rulings: thrill drops bond; a naturism counterpart of a bond-dropping
 outdoor action drops both. The outdoor five stay a named list: "outdoor"
 is not a group.)* The rules that make a refusal free (the world rule, the
 period roll, `refusal_free`) are unchanged.
@@ -154,7 +159,7 @@ period roll, `refusal_free`) are unchanged.
 The audit's `context.tier_drop` is `bond`, `chemistry` or, for a two-line
 drop, `both`. *(Engine's call.)*
 
-## 6. Three nude actions
+## 6. Three naturism actions
 
 | action `type` | marker | places | label | category | lasts | fits |
 |---|---|---|---|---|---|---|
@@ -162,7 +167,7 @@ drop, `both`. *(Engine's call.)*
 | `hike_naked_together` | 想和你一起裸体爬山 | `naked_hiking_together` | 和对方一起裸体爬山 | `mid` | 2–3 h | both |
 | `hot_spring_naked_together` | 想和你一起裸体泡温泉 | `naked_hot_spring_together` | 和对方一起裸体泡温泉 | `short` | 1 h | both |
 
-Each is nude (§5.1), takes its counterpart's length, and otherwise behaves
+Each is naturism (§5.1), takes its counterpart's length, and otherwise behaves
 as the other together actions: no payload; an accept places the kind and
 ends the incident under way (no event inside a date); a picture turn;
 `SPECIAL`, `Neutral` place, never told, not offline, shared.
@@ -177,7 +182,7 @@ foreground kind:
 
 | foreground | `[此刻穿着]` |
 |---|---|
-| any nude kind | 什么都没穿 |
+| any naturism kind | 什么都没穿 |
 | `swimming_together`, `hot_spring_together` | the swim ladder (spec 2026-11-27-swim-outfit-ladder §4) |
 | `hot_spring_together`, a gender other than female or male | the sauna's two lines below |
 | `sauna_together`, romance-compatible | 身上只松松地裹着一条浴巾 |
@@ -189,7 +194,7 @@ keeps that; a hot spring does not, since a hot spring left to the composer
 is what came back in street clothes (2026-11-26 §5): there she wears the
 sauna's towel, loose for a compatible pair. *(Owner's ruling.)*
 
-*(Owner's rulings: every nude kind nothing on — which takes
+*(Owner's rulings: every naturism kind nothing on — which takes
 `showering_together`, `bathing_together` and `having_sex_together` off "the
 state wins"; the general hot spring wears the swim ladder; the sauna a
 towel, a loose one for a compatible pair. Engine's call: the loose-towel
@@ -233,7 +238,7 @@ outdoor bond refusals of the previous spec.
 - Server: a refused `streak_together` drops both lines and its audit says
   `both`; an incompatible pair's `sex_together` reaches the judge; a
   shower picture and a hot spring picture carry their §7 lines.
-- Story: every nude kind kept out.
+- Story: every naturism kind kept out.
 
 ## 11. Order of work
 
@@ -253,7 +258,7 @@ previous image.
 ## 13. Left to the builder
 
 - The names of the group type and of the three property functions, and
-  whether the counterpart is stored nude→clothed only.
+  whether the counterpart is stored naturism→general only.
 - How `refusal_lines` is typed (a slice, a small struct) and how the
   post-processing drop loops over it.
 - Whether `ENDS_ON_CHEMISTRY_DROP` / `HOLDS_BACK_INTIMATE_ASKS` stay
