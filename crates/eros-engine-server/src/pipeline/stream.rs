@@ -12610,6 +12610,25 @@ data: [DONE]\n\n";
         assert_eq!(context["tier_drop"], "chemistry", "{context}");
     }
 
+    /// Spec 2026-11-27-together-action-groups-design.md §5.3: a refused
+    /// streak, the nude counterpart of a jog, drops bond and chemistry.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_streak_drops_bond_and_chemistry(pool: PgPool) {
+        let (frames, _, umid) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::StreakTogether,
+            Some("refuse"),
+            true,
+            &[],
+            true,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert!(events_of_kind(&pool, "streaking_together").await.is_empty());
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert_eq!(context["tier_drop"], "both", "{context}");
+    }
+
     /// Spec 2026-11-27-together-action-groups-design.md §5.1: an
     /// incompatible pair's shower is no longer refused before the judge;
     /// with no judge the rule engine accepts it and the kind is placed.
@@ -29357,7 +29376,7 @@ data: [DONE]\n\n"
                 Some(umid),
                 None,
                 false,
-                None,
+                &[],
                 None,
                 false,
             )

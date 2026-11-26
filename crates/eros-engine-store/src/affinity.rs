@@ -324,11 +324,11 @@ async fn load_or_create_on(
 /// How a graded write turns its verdict into line movement.
 enum Grading<'a> {
     /// One chat turn: the grades plus the rule nudges at full weight. A
-    /// refused action's line (`tier_drop`) lands one tier below the pre-turn
-    /// position.
+    /// refused action's lines (`tier_drop`) each land one tier below the
+    /// pre-turn position.
     Turn {
         rule_deltas: &'a AffinityDeltas,
-        tier_drop: Option<AffinityLine>,
+        tier_drop: &'a [AffinityLine],
     },
     /// A date's verdict worth `weight` turns, with no rule nudges; each line
     /// moves at most one tier.
@@ -415,7 +415,7 @@ async fn write_graded(
         // position, replacing whatever the judge's grades did to it, and
         // keeps nothing buffered on its axes to land later.
         Grading::Turn { tier_drop, .. } => {
-            if let Some(line) = tier_drop {
+            for &line in tier_drop {
                 current.drop_line_tier(&before_affinity, line);
                 pending_after.clear_line(line);
             }
@@ -431,7 +431,7 @@ async fn write_graded(
                     capped.push(line.as_str());
                 }
             }
-            None
+            &[]
         }
     };
 
@@ -519,14 +519,18 @@ async fn write_graded(
         if let Ok(p) = serde_json::to_value(pending_after) {
             obj.insert("pending_after".into(), p);
         }
-        // Which line a refused action dropped, so a reader can see why the
-        // stored `grades` and that line's movement disagree.
+        // Which lines a refused action dropped, so a reader can see why the
+        // stored `grades` and those lines' movement disagree: `both` for two
+        // (spec 2026-11-27-together-action-groups-design.md §5.3).
         match tier_drop {
-            Some(line) => {
+            [] => {
+                obj.remove("tier_drop");
+            }
+            [line] => {
                 obj.insert("tier_drop".into(), serde_json::json!(line.as_str()));
             }
-            None => {
-                obj.remove("tier_drop");
+            _ => {
+                obj.insert("tier_drop".into(), serde_json::json!("both"));
             }
         }
         // Which lines a date's one-tier cap held, for the same reason.
@@ -1044,9 +1048,10 @@ impl<'a> AffinityRepo<'a> {
         llm_attempts: Option<serde_json::Value>,
         gateway_errors: Option<serde_json::Value>,
         user_message_id: Option<Uuid>,
-        // A refused user action's line (spec 2026-10-05-chat-user-actions-design.md
-        // §6.3); `None` on every other turn.
-        tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
+        // A refused user action's lines (spec 2026-10-05-chat-user-actions-
+        // design.md §6.3; spec 2026-11-27-together-action-groups-design.md
+        // §5.3); empty on every other turn.
+        tier_drop: &[eros_engine_core::affinity::AffinityLine],
         // Multiplier on every POSITIVE committed delta of the four line axes
         // (the cold war's halving, spec 2026-11-23-affinity-50 §6.3); 1.0 = none.
         // Negatives and the two derived endpoints are never scaled.
@@ -1555,7 +1560,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             journal_tz,
         )
@@ -1844,7 +1849,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                &[],
                 1.0,
                 None,
             )
@@ -1905,7 +1910,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             None,
         )
@@ -1961,7 +1966,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                &[],
                 1.0,
                 None,
             )
@@ -2039,7 +2044,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             None,
         )
@@ -2117,7 +2122,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             None,
         )
@@ -2178,7 +2183,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             None,
         )
@@ -2213,7 +2218,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             None,
         )
@@ -2277,7 +2282,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
+                    &[],
                     1.0,
                     None,
                 )
@@ -2338,7 +2343,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                &[],
                 1.0,
                 None,
             )
@@ -2399,7 +2404,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             None,
         )
@@ -2525,7 +2530,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                &[],
                 1.0,
                 None,
             )
@@ -2551,7 +2556,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                &[],
                 1.0,
                 None,
             )
@@ -3186,7 +3191,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             None,
         )
@@ -3555,7 +3560,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             None,
         )
@@ -3727,7 +3732,7 @@ mod tests {
             None,
             None,
             Some(umid),
-            None,
+            &[],
             1.0,
             None,
         )
@@ -3858,7 +3863,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             None,
         )
@@ -3959,6 +3964,71 @@ mod tests {
         assert_eq!(capped, vec!["第二条".to_string()]);
     }
 
+    /// Spec 2026-11-27-together-action-groups-design.md §5.3: a two-line
+    /// refusal drops each line by its own rule; bond at tier 1 lands at 0,
+    /// chemistry one tier down, and the audit says `both`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_two_line_refusal_drops_both_lines(pool: PgPool) {
+        use eros_engine_core::affinity::{tier_drop_target, AffinityLine};
+        let repo = AffinityRepo { pool: &pool };
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session = make_session(&pool, user_id, instance_id).await;
+        let mut a = repo
+            .load_or_create(session, user_id, instance_id)
+            .await
+            .unwrap();
+        // Bond 0.10 (tier 1), chemistry 0.80 (tier 4).
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET trust=0.1, intrigue=0.1, intimacy=0.9, tension=0.7 \
+             WHERE id=$1",
+        )
+        .bind(a.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        repo.persist_with_event(
+            &mut a,
+            &AxisGrades::default(),
+            &AffinityDeltas::default(),
+            1.0,
+            &AffinityTuning::default(),
+            "message",
+            serde_json::json!({}),
+            None,
+            EndpointLevelReads::default(),
+            None,
+            None,
+            None,
+            &[AffinityLine::Bond, AffinityLine::Chemistry],
+            1.0,
+            None,
+        )
+        .await
+        .unwrap();
+        let (trust, intrigue, intimacy, tension): (f64, f64, f64, f64) = sqlx::query_as(
+            "SELECT trust, intrigue, intimacy, tension FROM engine.companion_affinity WHERE id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((trust + intrigue) / 2.0, 0.0, "bond at tier 1 lands at 0");
+        let chem = (intimacy + tension) / 2.0;
+        assert!(
+            (chem - tier_drop_target(0.80)).abs() < 1e-3,
+            "chemistry {chem} lands one tier down"
+        );
+        let context: serde_json::Value = sqlx::query_scalar(
+            "SELECT context FROM engine.companion_affinity_events WHERE affinity_id = $1",
+        )
+        .bind(a.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(context["tier_drop"], "both", "{context}");
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn refused_action_drops_its_line_one_tier_from_the_pre_turn_snapshot(pool: PgPool) {
         use eros_engine_core::affinity::{tier_drop_target, AffinityLine};
@@ -3999,7 +4069,7 @@ mod tests {
             None,
             None,
             None,
-            Some(AffinityLine::Chemistry),
+            &[AffinityLine::Chemistry],
             1.0,
             None,
         )
@@ -4068,7 +4138,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             None,
         )
@@ -4128,7 +4198,7 @@ mod tests {
     async fn neutral_turn(
         pool: &PgPool,
         a: &mut Affinity,
-        tier_drop: Option<AffinityLine>,
+        tier_drop: &[AffinityLine],
     ) -> bool {
         AffinityRepo { pool }
             .persist_with_event(
@@ -4159,11 +4229,11 @@ mod tests {
     async fn persist_with_event_reports_a_chemistry_tier_fall(pool: PgPool) {
         // Both lines at 0.45, tier 3.
         let mut a = relationship_at(&pool, (0.45, 0.45, 0.45, 0.45), 0).await;
-        assert!(neutral_turn(&pool, &mut a, Some(AffinityLine::Chemistry)).await);
+        assert!(neutral_turn(&pool, &mut a, &[AffinityLine::Chemistry]).await);
         assert_eq!(a.chem_tier(), 2);
 
         let mut a = relationship_at(&pool, (0.45, 0.45, 0.45, 0.45), 0).await;
-        assert!(!neutral_turn(&pool, &mut a, Some(AffinityLine::Bond)).await);
+        assert!(!neutral_turn(&pool, &mut a, &[AffinityLine::Bond]).await);
         assert_eq!((a.bond_tier(), a.chem_tier()), (2, 3));
 
         // Chemistry 0.355, stored at tier 3; four days of tension decay
@@ -4176,7 +4246,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, 3);
-        assert!(!neutral_turn(&pool, &mut a, None).await);
+        assert!(!neutral_turn(&pool, &mut a, &[]).await);
         assert_eq!(a.chem_tier(), 2);
     }
 
@@ -4223,7 +4293,7 @@ mod tests {
             None,
             None,
             None,
-            Some(AffinityLine::Chemistry),
+            &[AffinityLine::Chemistry],
             1.0,
             None,
         )
@@ -5220,7 +5290,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                &[],
                 growth_scale,
                 None,
             )
@@ -5614,7 +5684,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            &[],
             1.0,
             None,
         )
@@ -5688,7 +5758,7 @@ mod tests {
             None,
             None,
             None,
-            Some(AffinityLine::Bond),
+            &[AffinityLine::Bond],
             1.0,
             None,
         )

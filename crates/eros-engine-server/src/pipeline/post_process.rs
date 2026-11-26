@@ -321,7 +321,7 @@ pub(crate) async fn run_affinity_turn(
     user_message_id: Option<Uuid>,
     client_id: Option<&str>,
     action_turn: bool,
-    tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
+    tier_drop: &'static [eros_engine_core::affinity::AffinityLine],
     journal_tz: Option<chrono_tz::Tz>,
     activity_turn: bool,
 ) {
@@ -442,7 +442,7 @@ pub(crate) async fn run_affinity_turn(
     // all (absent = feature off, clause stays NULL) and on the request
     // actually injecting affinity (zero-axis scope ⇒ nothing would
     // render the clause).
-    if (movement_turn(&grades, &levels) || tier_drop.is_some())
+    if (movement_turn(&grades, &levels) || !tier_drop.is_empty())
         && affinity_scope.active_count() > 0
         && state.model_config.tasks.contains_key(SUMMARY_TASK)
     {
@@ -482,7 +482,7 @@ async fn persist_affinity(
     levels: eros_engine_core::affinity::EndpointLevelReads,
     eval_failures: &[eros_engine_llm::failure::AttemptFailure],
     user_message_id: Option<Uuid>,
-    tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
+    tier_drop: &'static [eros_engine_core::affinity::AffinityLine],
     journal_tz: Option<chrono_tz::Tz>,
 ) -> Option<bool> {
     let repo = AffinityRepo { pool: &state.pool };
@@ -1050,9 +1050,9 @@ fn tier_drop_for(
     event: &Event,
     plan: &ActionPlan,
     setting: eros_engine_core::events::Setting,
-) -> Option<eros_engine_core::affinity::AffinityLine> {
+) -> &'static [eros_engine_core::affinity::AffinityLine] {
     if plan.refusal_free || eros_engine_core::pde::world_ruled_out(event, setting) {
-        return None;
+        return &[];
     }
     match (event, plan.action_response) {
         (
@@ -1060,8 +1060,8 @@ fn tier_drop_for(
                 action: Some(a), ..
             },
             Some(eros_engine_core::types::ActionResponse::Refuse),
-        ) => a.refusal_line(),
-        _ => None,
+        ) => a.refusal_lines(),
+        _ => &[],
     }
 }
 
@@ -2804,7 +2804,7 @@ mod tests {
                 &plan(Some(ActionResponse::Refuse)),
                 Setting::Modern
             ),
-            Some(AffinityLine::Bond)
+            [AffinityLine::Bond]
         );
         assert_eq!(
             tier_drop_for(
@@ -2812,7 +2812,7 @@ mod tests {
                 &plan(Some(ActionResponse::Refuse)),
                 Setting::Modern
             ),
-            Some(AffinityLine::Chemistry)
+            [AffinityLine::Chemistry]
         );
         assert_eq!(
             tier_drop_for(
@@ -2820,11 +2820,11 @@ mod tests {
                 &plan(Some(ActionResponse::Accept)),
                 Setting::Modern
             ),
-            None
+            [] as [AffinityLine; 0]
         );
         assert_eq!(
             tier_drop_for(&event(None), &plan(None), Setting::Modern),
-            None
+            [] as [AffinityLine; 0]
         );
     }
 
@@ -2863,10 +2863,12 @@ mod tests {
             refusal_free: false,
         };
         let fight = event(UserAction::FightTogether);
-        assert_eq!(tier_drop_for(&fight, &refused, Setting::Modern), None);
+        assert_eq!(tier_drop_for(&fight, &refused, Setting::Modern), [] as [AffinityLine; 0]);
         assert_eq!(
             tier_drop_for(&fight, &refused, Setting::Fantasy),
-            Some(AffinityLine::Chemistry)
+            // A fight is a thrill action (spec 2026-11-27-together-action-
+            // groups-design.md §5.3).
+            [AffinityLine::Bond]
         );
         assert_eq!(
             tier_drop_for(
@@ -2874,13 +2876,13 @@ mod tests {
                 &refused,
                 Setting::Modern
             ),
-            Some(AffinityLine::Chemistry)
+            [AffinityLine::Chemistry]
         );
         for a in [UserAction::Challenge, UserAction::Bet] {
             for setting in [Setting::Modern, Setting::Fantasy] {
                 assert_eq!(
                     tier_drop_for(&event(a.clone()), &refused, setting),
-                    None,
+                    [] as [AffinityLine; 0],
                     "{a:?}"
                 );
             }
@@ -2923,16 +2925,16 @@ mod tests {
             refusal_free: false,
         };
         let cycle = event(UserAction::CycleTogether);
-        assert_eq!(tier_drop_for(&cycle, &refused, Setting::Fantasy), None);
+        assert_eq!(tier_drop_for(&cycle, &refused, Setting::Fantasy), [] as [AffinityLine; 0]);
         // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7.
         assert_eq!(
             tier_drop_for(&cycle, &refused, Setting::Modern),
-            Some(AffinityLine::Bond)
+            [AffinityLine::Bond]
         );
         let hike = event(UserAction::HikeTogether);
         assert_eq!(
             tier_drop_for(&hike, &refused, Setting::Fantasy),
-            Some(AffinityLine::Bond)
+            [AffinityLine::Bond]
         );
     }
 
@@ -2972,9 +2974,28 @@ mod tests {
         };
         assert_eq!(
             tier_drop_for(&sex, &refused(false), Setting::Modern),
-            Some(AffinityLine::Chemistry)
+            [AffinityLine::Chemistry]
         );
-        assert_eq!(tier_drop_for(&sex, &refused(true), Setting::Modern), None);
+        assert_eq!(tier_drop_for(&sex, &refused(true), Setting::Modern), [] as [AffinityLine; 0]);
+        // A naked hot spring her period ruled out is free too (spec
+        // 2026-11-27-together-action-groups-design.md §5.3).
+        let with_action = |a: UserAction| {
+            let mut e = sex.clone();
+            if let Event::UserMessage { action, .. } = &mut e {
+                *action = Some(a);
+            }
+            e
+        };
+        let naked_spring = with_action(UserAction::HotSpringNakedTogether);
+        assert_eq!(
+            tier_drop_for(&naked_spring, &refused(true), Setting::Modern),
+            [] as [AffinityLine; 0]
+        );
+        let streak = with_action(UserAction::StreakTogether);
+        assert_eq!(
+            tier_drop_for(&streak, &refused(false), Setting::Modern),
+            [AffinityLine::Bond, AffinityLine::Chemistry]
+        );
     }
 
     #[test]
@@ -3007,7 +3028,7 @@ mod tests {
             action_response: Some(ActionResponse::Refuse),
             refusal_free: false,
         };
-        assert_eq!(tier_drop_for(&event, &plan, Setting::Modern), None);
+        assert!(tier_drop_for(&event, &plan, Setting::Modern).is_empty());
     }
 
     #[test]
@@ -4384,7 +4405,7 @@ mod tests {
             Some(umid),
             None,
             false,
-            None,
+            &[],
             None,
             false,
         )
@@ -4454,7 +4475,7 @@ mod tests {
             },
             &[],
             None,
-            None,
+            &[],
             None,
         )
         .await;
@@ -5213,7 +5234,7 @@ mod tests {
             eros_engine_core::affinity::EndpointLevelReads::default(),
             &[],
             None,
-            None,
+            &[],
             None,
         )
         .await;
@@ -6097,7 +6118,7 @@ mod tests {
         eval: &'static str,
         (owner, instance_id, session_id): (Uuid, Uuid, Uuid),
         umid: Uuid,
-        tier_drop: Option<eros_engine_core::affinity::AffinityLine>,
+        tier_drop: &'static [eros_engine_core::affinity::AffinityLine],
     ) {
         let state = state_with_mock_openrouter(
             pool.clone(),
@@ -6118,7 +6139,7 @@ mod tests {
             Default::default(),
             Some(umid),
             None,
-            tier_drop.is_some(),
+            !tier_drop.is_empty(),
             tier_drop,
             None,
             false,
@@ -6142,7 +6163,7 @@ mod tests {
             NEUTRAL_EVAL,
             (owner, instance, session),
             umid,
-            Some(AffinityLine::Chemistry),
+            &[AffinityLine::Chemistry],
         )
         .await;
 
@@ -6172,7 +6193,7 @@ mod tests {
             NEUTRAL_EVAL,
             (owner, instance, here),
             umid,
-            Some(AffinityLine::Chemistry),
+            &[AffinityLine::Chemistry],
         )
         .await;
 
@@ -6204,7 +6225,7 @@ mod tests {
             CHEMISTRY_DOWN_EVAL,
             (owner, instance, session),
             umid,
-            None,
+            &[],
         )
         .await;
 
@@ -6230,7 +6251,7 @@ mod tests {
             NEUTRAL_EVAL,
             (owner, instance, session),
             umid,
-            Some(AffinityLine::Bond),
+            &[AffinityLine::Bond],
         )
         .await;
 
