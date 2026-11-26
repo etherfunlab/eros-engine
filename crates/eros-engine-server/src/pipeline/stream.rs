@@ -24450,6 +24450,30 @@ data: [DONE]\n\n"
         );
     }
 
+    /// A stored `custom_together` prints the user's words in the picture
+    /// state, not only the one being started (spec 2026-11-26-more-together-
+    /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md
+    /// §8.3).
+    #[test]
+    fn a_stored_custom_together_prints_its_text_in_the_picture_state() {
+        use eros_engine_core::events::EventKind::CustomTogether;
+        let stored = |text: Option<&str>| eros_engine_store::events::CurrentEvents {
+            foreground: Some(eros_engine_store::events::EventRecord {
+                text: text.map(Into::into),
+                ..live_event(CustomTogether)
+            }),
+            ..eros_engine_store::events::CurrentEvents::none(chrono::DateTime::UNIX_EPOCH)
+        };
+        assert_eq!(
+            picture_state_of(&stored(Some("去海边放烟花")), None),
+            Some("和对方一起：「去海边放烟花」".to_string())
+        );
+        assert_eq!(
+            picture_state_of(&stored(None), None),
+            Some("和对方一起做一件事".to_string())
+        );
+    }
+
     /// Only an accepted together action names a kind for the picture; on a
     /// date it takes `on_a_date`'s place there (spec 2026-11-20-together-
     /// actions-state-in-picture-and-genome-routes-design.md §5).

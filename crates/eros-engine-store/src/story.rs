@@ -422,7 +422,7 @@ impl<'a> StoryRepo<'a> {
         // design.md §4.3; spec 2026-11-26-more-together-actions-bath-outfit-
         // chemistry-drop-and-custom-together-design.md §4). So does a
         // `custom_together`: what it holds is unknown, and its `message_id`
-        // is the user's message, which the join above would read as her
+        // is the user's message, which the join below would read as her
         // telling (§8.2, §8.3).
         let kept_out: Vec<&str> = [
             EventKind::BathingTogether,
