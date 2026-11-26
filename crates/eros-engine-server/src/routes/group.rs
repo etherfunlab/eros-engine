@@ -2493,8 +2493,14 @@ mod tests {
             .and_then(|m| m.last())
             .and_then(|m| m["content"].as_str())
             .expect("the composer's user message");
-        assert!(payload.contains("[此刻穿着]\nBandeau bikini\n"), "{payload}");
-        assert!(payload.contains("[此刻状态]\n和对方一起游泳\n"), "{payload}");
+        assert!(
+            payload.contains("[此刻穿着]\nBandeau bikini\n"),
+            "{payload}"
+        );
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起游泳\n"),
+            "{payload}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

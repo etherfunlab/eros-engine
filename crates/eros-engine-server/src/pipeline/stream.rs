@@ -12170,8 +12170,14 @@ data: [DONE]\n\n";
         )
         .await;
         assert_eq!(action_response_of(&frames), "accept");
-        assert!(payload.contains("[此刻穿着]\nBandeau bikini\n"), "{payload}");
-        assert!(payload.contains("[此刻状态]\n和对方一起游泳\n"), "{payload}");
+        assert!(
+            payload.contains("[此刻穿着]\nBandeau bikini\n"),
+            "{payload}"
+        );
+        assert!(
+            payload.contains("[此刻状态]\n和对方一起游泳\n"),
+            "{payload}"
+        );
         assert_eq!(clothing, "Bandeau bikini");
         assert_eq!(answer, "accept");
     }
@@ -12213,7 +12219,10 @@ data: [DONE]\n\n";
             |_| {},
         )
         .await;
-        assert!(payload.contains("[此刻穿着]\nTriangle bikini\n"), "{payload}");
+        assert!(
+            payload.contains("[此刻穿着]\nTriangle bikini\n"),
+            "{payload}"
+        );
         assert_eq!(clothing, "Triangle bikini");
     }
 

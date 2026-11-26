@@ -592,12 +592,11 @@ impl EventKind {
             | NakedHorseRidingTogether
             | CustomTogether => EventCategory::Short,
             AsleepTogether | FightingTogether | HikingTogether | AdventuringTogether
-            | FishingTogether | TempWork
-            | ExMessage | GotHit | Breakup | WorkingOut | Reading | Gaming | AwayFromPhone
-            | Unwell | Irritable | Busy | InBattle | Asleep | OutShopping | BrosGathering
-            | SisGathering | OnTheRoad | WatchingShow | HavingSex | WantToGoOut | WantToGoHome
-            | TakingSpace | FellOut | OnABoat | OnACruise | OnABus | OnATrain | OnAPlane
-            | Driving => EventCategory::Mid,
+            | FishingTogether | TempWork | ExMessage | GotHit | Breakup | WorkingOut | Reading
+            | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
+            | OutShopping | BrosGathering | SisGathering | OnTheRoad | WatchingShow | HavingSex
+            | WantToGoOut | WantToGoHome | TakingSpace | FellOut | OnABoat | OnACruise | OnABus
+            | OnATrain | OnAPlane | Driving => EventCategory::Mid,
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
             BusinessTrip | ShortTrip | LongTrip | HometownVisit | TravelingTogether => {
                 EventCategory::Trip
