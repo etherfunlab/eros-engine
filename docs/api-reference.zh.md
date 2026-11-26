@@ -1180,7 +1180,7 @@ composer 会被告知这个事件是她此刻的状态（`[此刻状态]`），�
 | `propose` | 向用户求婚 | 这一对在浪漫上相容，状态是 `dating`、`fwb` 或 `situationship`，chemistry 和 bond 都在第 4 档或以上，且最新的 8 个被判官评过的回合里至少 5 个 warmth 和 patience 都高于 0.7 |
 | `break_up` | 提出分手 | 正在冷战，状态可分手（`dating`、`partner`、`fwb`、`situationship`、`engaged`），且最新的 3 个被判官评过的回合都在判官的最低耐心档。不读这一对的 scope |
 | `sleep_together` | 问用户愿不愿意和她上床 | 这一对在浪漫上相容，状态是 `dating`、`engaged`、`fwb` 或 `situationship`，或 chemistry 在第 4 档或以上的 `partner`，chemistry 在第 3 档或以上，最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7，她不在经期里，且没有 `bathing_together`、`showering_together`、`hot_spring_together`、`sauna_together` 或 `having_sex_together` 正在进行 |
-| `fall_asleep_together` | 问用户愿不愿意和她躺在一起睡觉 | 同 `sleep_together`，状态是 `none`、`peer` 或 `ex`，或 chemistry 在第 3 档的 `partner`，经期里也照样提出 |
+| `fall_asleep_together` | 问用户愿不愿意和她躺在一起睡觉 | 同 `sleep_together`，状态是 `none`、`peer` 或 `ex`，或 chemistry 在第 3 档的 `partner`，经期里、在水里或在床上时也照样提出 |
 | `travel_together` | 提议一起去旅行 | bond 在第 3 档或以上，最新的 3 个被判官评过的回合 warmth 和 patience 都高于 0.7，且没有背景事件在进行（她的经期不算）。不读这一对的 scope |
 | `bathe_together` | 问用户愿不愿意和她一起洗澡 | 这一对在浪漫上相容；chemistry 在第 2 档或以上（`hygienic` 为 `true` 的角色）或第 3 档或以上（不写 `hygienic` 的角色），`hygienic` 为 `false` 时从不提出；最新的 7 个被判官评过的回合里至少 3 个 warmth 达到 0.5，她不在经期里，且这五种都没有正在进行。不读 patience |
 

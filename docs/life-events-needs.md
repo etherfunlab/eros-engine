@@ -1161,7 +1161,7 @@ after the event started. The rule reads the kind, not who asked: a row her own a
 - **The effect.** The foreground event of one of these kinds under way ends there: its
   `ends_at` becomes the time of the write. A background and a cycle row keep running. Nothing is
   told and no message is written; from the next turn on her state block and her pictures no
-  longer carry the event. The cap runs in a write of its own after the affinity write commits,
+  longer carry the event. The ending runs in a write of its own after the affinity write commits,
   so a crash between the two leaves the event to run to its stored end.
 
 A client that scheduled anything on such an event's `ends_at` re-reads events after a turn
