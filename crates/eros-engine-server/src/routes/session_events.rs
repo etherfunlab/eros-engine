@@ -57,7 +57,9 @@ const MAX_EVENT_KEY_CHARS: usize = 128;
 /// `dancing_together`, `adventuring_together`, `playing_with_fire_together`,
 /// `singing_together`, `skinny_dipping_together`,
 /// `committing_crime_together`, `fishing_together`,
-/// `naked_horse_riding_together` and `custom_together` are placed by the
+/// `naked_horse_riding_together`, `naked_yoga_together`,
+/// `naked_hiking_together`, `naked_hot_spring_together` and
+/// `custom_together` are placed by the
 /// engine, never drawn: they appear in responses only, and a `kinds` filter
 /// that lists one is rejected. A `custom_together`'s `message_id` is the
 /// user's message that asked, not hers.
@@ -167,6 +169,9 @@ pub enum EventKindDto {
     CommittingCrimeTogether,
     FishingTogether,
     NakedHorseRidingTogether,
+    NakedYogaTogether,
+    NakedHikingTogether,
+    NakedHotSpringTogether,
     CustomTogether,
 }
 
@@ -292,6 +297,9 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::CommittingCrimeTogether => EventKind::CommittingCrimeTogether,
             EventKindDto::FishingTogether => EventKind::FishingTogether,
             EventKindDto::NakedHorseRidingTogether => EventKind::NakedHorseRidingTogether,
+            EventKindDto::NakedYogaTogether => EventKind::NakedYogaTogether,
+            EventKindDto::NakedHikingTogether => EventKind::NakedHikingTogether,
+            EventKindDto::NakedHotSpringTogether => EventKind::NakedHotSpringTogether,
             EventKindDto::CustomTogether => EventKind::CustomTogether,
         }
     }
@@ -403,6 +411,9 @@ impl From<EventKind> for EventKindDto {
             EventKind::CommittingCrimeTogether => EventKindDto::CommittingCrimeTogether,
             EventKind::FishingTogether => EventKindDto::FishingTogether,
             EventKind::NakedHorseRidingTogether => EventKindDto::NakedHorseRidingTogether,
+            EventKind::NakedYogaTogether => EventKindDto::NakedYogaTogether,
+            EventKind::NakedHikingTogether => EventKindDto::NakedHikingTogether,
+            EventKind::NakedHotSpringTogether => EventKindDto::NakedHotSpringTogether,
             EventKind::CustomTogether => EventKindDto::CustomTogether,
         }
     }
@@ -2973,6 +2984,13 @@ mod tests {
             (
                 EventKind::NakedHorseRidingTogether,
                 "naked_horse_riding_together",
+            ),
+            // Spec 2026-11-27-together-action-groups-design.md §6.
+            (EventKind::NakedYogaTogether, "naked_yoga_together"),
+            (EventKind::NakedHikingTogether, "naked_hiking_together"),
+            (
+                EventKind::NakedHotSpringTogether,
+                "naked_hot_spring_together",
             ),
         ] {
             let dto = EventKindDto::from(kind);

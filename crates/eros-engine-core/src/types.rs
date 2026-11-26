@@ -223,6 +223,13 @@ pub enum UserAction {
     /// `skinny_dip_together` is, a refusal drops chemistry, and her period
     /// does not roll it.
     RideHorseNakedTogether,
+    /// The user asks her to do yoga, hike or take a hot spring naked with
+    /// them (spec 2026-11-27-together-action-groups-design.md §6): nude
+    /// counterparts of `yoga_together`, `hike_together` and
+    /// `hot_spring_together`.
+    YogaNakedTogether,
+    HikeNakedTogether,
+    HotSpringNakedTogether,
     /// The user asks her to do something with them, in their own words (spec
     /// 2026-11-26 §8): behaves as `jog_together` does, placing
     /// `custom_together`. Neither romance-gated nor emotional, and a refusal
@@ -361,6 +368,9 @@ impl UserAction {
             UserAction::CommitCrimeTogether => Some(EventKind::CommittingCrimeTogether),
             UserAction::FishTogether => Some(EventKind::FishingTogether),
             UserAction::RideHorseNakedTogether => Some(EventKind::NakedHorseRidingTogether),
+            UserAction::YogaNakedTogether => Some(EventKind::NakedYogaTogether),
+            UserAction::HikeNakedTogether => Some(EventKind::NakedHikingTogether),
+            UserAction::HotSpringNakedTogether => Some(EventKind::NakedHotSpringTogether),
             UserAction::CustomTogether { .. } => Some(EventKind::CustomTogether),
             _ => None,
         }
@@ -1125,6 +1135,37 @@ mod tests {
         assert_eq!(a.together_text(), None);
     }
 
+    /// Spec 2026-11-27-together-action-groups-design.md §6.
+    #[test]
+    fn three_nude_actions_name_their_events() {
+        use EventKind::*;
+        for (a, wire, kind) in [
+            (
+                UserAction::YogaNakedTogether,
+                "yoga_naked_together",
+                NakedYogaTogether,
+            ),
+            (
+                UserAction::HikeNakedTogether,
+                "hike_naked_together",
+                NakedHikingTogether,
+            ),
+            (
+                UserAction::HotSpringNakedTogether,
+                "hot_spring_naked_together",
+                NakedHotSpringTogether,
+            ),
+        ] {
+            let v = serde_json::json!({ "type": wire });
+            assert_eq!(serde_json::to_value(&a).unwrap(), v);
+            assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+            assert_eq!(a.together_kind(), Some(kind), "{a:?}");
+            assert_eq!(a.consumed(), None, "{a:?}");
+            assert_eq!(a.status_ask(), None, "{a:?}");
+            assert_eq!(a.together_text(), None, "{a:?}");
+        }
+    }
+
     /// One of every action: each unit variant and one of each payload variant.
     fn all_actions() -> Vec<UserAction> {
         use UserAction::*;
@@ -1182,6 +1223,9 @@ mod tests {
             CommitCrimeTogether,
             FishTogether,
             RideHorseNakedTogether,
+            YogaNakedTogether,
+            HikeNakedTogether,
+            HotSpringNakedTogether,
             CustomTogether { text: "x".into() },
             Challenge,
             Bet,

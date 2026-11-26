@@ -857,6 +857,9 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::CommitCrimeTogether => "想和你一起去犯罪".into(),
         UserAction::FishTogether => "想和你一起钓鱼".into(),
         UserAction::RideHorseNakedTogether => "想和你一起裸体骑马".into(),
+        UserAction::YogaNakedTogether => "想和你一起裸体做瑜伽".into(),
+        UserAction::HikeNakedTogether => "想和你一起裸体爬山".into(),
+        UserAction::HotSpringNakedTogether => "想和你一起裸体泡温泉".into(),
         UserAction::CustomTogether { text } => format!("想和你一起：{text}"),
         UserAction::Challenge => "向你发起挑战".into(),
         UserAction::Bet => "想和你打个赌".into(),
@@ -1203,6 +1206,9 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         CommittingCrimeTogether => "和对方一起犯罪",
         FishingTogether => "和对方一起钓鱼",
         NakedHorseRidingTogether => "和对方一起裸体骑马",
+        NakedYogaTogether => "和对方一起裸体做瑜伽",
+        NakedHikingTogether => "和对方一起裸体爬山",
+        NakedHotSpringTogether => "和对方一起裸体泡温泉",
         CustomTogether => "和对方一起做一件事",
     }
 }
@@ -7567,6 +7573,22 @@ mod tests {
                 UserAction::RideHorseNakedTogether,
                 "想和你一起裸体骑马",
                 "和对方一起裸体骑马",
+            ),
+            // Spec 2026-11-27-together-action-groups-design.md §6.
+            (
+                UserAction::YogaNakedTogether,
+                "想和你一起裸体做瑜伽",
+                "和对方一起裸体做瑜伽",
+            ),
+            (
+                UserAction::HikeNakedTogether,
+                "想和你一起裸体爬山",
+                "和对方一起裸体爬山",
+            ),
+            (
+                UserAction::HotSpringNakedTogether,
+                "想和你一起裸体泡温泉",
+                "和对方一起裸体泡温泉",
             ),
         ] {
             assert!(action_marker(&a).contains(marker), "{a:?}");

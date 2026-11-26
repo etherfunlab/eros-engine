@@ -199,6 +199,9 @@ pub enum UserActionKind {
     CommitCrimeTogether,
     FishTogether,
     RideHorseNakedTogether,
+    YogaNakedTogether,
+    HikeNakedTogether,
+    HotSpringNakedTogether,
     CustomTogether,
     Challenge,
     Bet,
@@ -388,7 +391,10 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// `adventure_together` → `adventuring_together` (two to three hours).
 /// `fish_together` → `fishing_together` (two to three hours) and
 /// `ride_horse_naked_together` → `naked_horse_riding_together` (one hour)
-/// start an event the same way. A `skinny_dip_together` or
+/// start an event the same way, as do `yoga_naked_together` →
+/// `naked_yoga_together` and `hot_spring_naked_together` →
+/// `naked_hot_spring_together` (one hour each) and `hike_naked_together` →
+/// `naked_hiking_together` (two to three hours). A `skinny_dip_together` or
 /// `ride_horse_naked_together` to a pair whose scopes are not
 /// romance-compatible is refused. `custom_together` asks her to do something with the user in the
 /// user's own `text` (required): accepted, it starts a `custom_together`
@@ -530,6 +536,9 @@ impl UserActionDto {
             UserActionKind::CommitCrimeTogether => UserAction::CommitCrimeTogether,
             UserActionKind::FishTogether => UserAction::FishTogether,
             UserActionKind::RideHorseNakedTogether => UserAction::RideHorseNakedTogether,
+            UserActionKind::YogaNakedTogether => UserAction::YogaNakedTogether,
+            UserActionKind::HikeNakedTogether => UserAction::HikeNakedTogether,
+            UserActionKind::HotSpringNakedTogether => UserAction::HotSpringNakedTogether,
             UserActionKind::CustomTogether => UserAction::CustomTogether {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom_together")?,
@@ -5285,6 +5294,22 @@ mod validate_payload_tests {
                 "ride_horse_naked_together",
                 UserActionKind::RideHorseNakedTogether,
                 UserAction::RideHorseNakedTogether,
+            ),
+            // Spec 2026-11-27-together-action-groups-design.md §6.
+            (
+                "yoga_naked_together",
+                UserActionKind::YogaNakedTogether,
+                UserAction::YogaNakedTogether,
+            ),
+            (
+                "hike_naked_together",
+                UserActionKind::HikeNakedTogether,
+                UserAction::HikeNakedTogether,
+            ),
+            (
+                "hot_spring_naked_together",
+                UserActionKind::HotSpringNakedTogether,
+                UserAction::HotSpringNakedTogether,
             ),
         ] {
             let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))

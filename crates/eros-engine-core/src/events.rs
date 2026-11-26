@@ -241,6 +241,13 @@ pub enum EventKind {
     /// She and the user ride a horse naked together: written when she accepts
     /// the user's `ride_horse_naked_together` (spec 2026-11-27 §6.2).
     NakedHorseRidingTogether,
+    /// She and the user do yoga, hike or take a hot spring naked together:
+    /// written when she accepts the user's `yoga_naked_together`,
+    /// `hike_naked_together` or `hot_spring_naked_together` (spec
+    /// 2026-11-27-together-action-groups-design.md §6).
+    NakedYogaTogether,
+    NakedHikingTogether,
+    NakedHotSpringTogether,
     /// She and the user do the thing the user named: written when she
     /// accepts the user's `custom_together` (spec 2026-11-26 §8). The row's
     /// `message_id` is the user's message, which holds the text.
@@ -340,7 +347,7 @@ impl EventKind {
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 34] = [
+    pub const SPECIAL: [EventKind; 37] = [
         EventKind::TakingSpace,
         EventKind::FellOut,
         EventKind::TravelingTogether,
@@ -374,6 +381,9 @@ impl EventKind {
         EventKind::CommittingCrimeTogether,
         EventKind::FishingTogether,
         EventKind::NakedHorseRidingTogether,
+        EventKind::NakedYogaTogether,
+        EventKind::NakedHikingTogether,
+        EventKind::NakedHotSpringTogether,
         EventKind::CustomTogether,
     ];
 
@@ -516,6 +526,9 @@ impl EventKind {
             EventKind::CommittingCrimeTogether => "committing_crime_together",
             EventKind::FishingTogether => "fishing_together",
             EventKind::NakedHorseRidingTogether => "naked_horse_riding_together",
+            EventKind::NakedYogaTogether => "naked_yoga_together",
+            EventKind::NakedHikingTogether => "naked_hiking_together",
+            EventKind::NakedHotSpringTogether => "naked_hot_spring_together",
             EventKind::CustomTogether => "custom_together",
         }
     }
@@ -590,9 +603,11 @@ impl EventKind {
             | SkinnyDippingTogether
             | CommittingCrimeTogether
             | NakedHorseRidingTogether
+            | NakedYogaTogether
+            | NakedHotSpringTogether
             | CustomTogether => EventCategory::Short,
             AsleepTogether | FightingTogether | HikingTogether | AdventuringTogether
-            | FishingTogether | TempWork | ExMessage | GotHit | Breakup | WorkingOut | Reading
+            | FishingTogether | NakedHikingTogether | TempWork | ExMessage | GotHit | Breakup | WorkingOut | Reading
             | Gaming | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep
             | OutShopping | BrosGathering | SisGathering | OnTheRoad | WatchingShow | HavingSex
             | WantToGoOut | WantToGoHome | TakingSpace | FellOut | OnABoat | OnACruise | OnABus
@@ -708,6 +723,9 @@ impl EventKind {
                 | CommittingCrimeTogether
                 | FishingTogether
                 | NakedHorseRidingTogether
+                | NakedYogaTogether
+                | NakedHikingTogether
+                | NakedHotSpringTogether
                 | CustomTogether
         )
     }
@@ -923,6 +941,9 @@ fn rule(kind: EventKind) -> Rule {
         CommittingCrimeTogether => (0.0, 0, Lasts::Hours(1, 1)),
         FishingTogether => (0.0, 0, Lasts::Hours(2, 3)),
         NakedHorseRidingTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        NakedYogaTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        NakedHikingTogether => (0.0, 0, Lasts::Hours(2, 3)),
+        NakedHotSpringTogether => (0.0, 0, Lasts::Hours(1, 1)),
         CustomTogether => (0.0, 0, Lasts::Hours(1, 1)),
     };
     Rule {
@@ -2744,7 +2765,7 @@ mod tests {
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
         assert_eq!(EventKind::ALL.len(), 70);
-        assert_eq!(EventKind::SPECIAL.len(), 34);
+        assert_eq!(EventKind::SPECIAL.len(), 37);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -3816,6 +3837,28 @@ mod tests {
             (
                 NakedHorseRidingTogether,
                 "naked_horse_riding_together",
+                EventCategory::Short,
+                Duration::hours(1),
+                Duration::hours(1),
+            ),
+            // Spec 2026-11-27-together-action-groups-design.md §6.
+            (
+                NakedYogaTogether,
+                "naked_yoga_together",
+                EventCategory::Short,
+                Duration::hours(1),
+                Duration::hours(1),
+            ),
+            (
+                NakedHikingTogether,
+                "naked_hiking_together",
+                EventCategory::Mid,
+                Duration::hours(2),
+                Duration::hours(3),
+            ),
+            (
+                NakedHotSpringTogether,
+                "naked_hot_spring_together",
                 EventCategory::Short,
                 Duration::hours(1),
                 Duration::hours(1),
