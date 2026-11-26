@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::affinity::{Affinity, AffinityDeltas, AffinityLine};
-use crate::events::EventKind;
+use crate::events::{EventKind, TogetherGroup};
 use crate::persona::CompanionPersona;
 use crate::relationship::StatusAsk;
 use crate::scope::{AffinityScope, MemoryScope};
@@ -302,26 +302,29 @@ impl DateDuration {
 impl UserAction {
     /// Whether her reply to this action is written in the `emotional` tone,
     /// accepted or refused, when the deployment has the tone on (spec
-    /// 2026-11-12-emotional-action-replies-design.md §2).
+    /// 2026-11-12-emotional-action-replies-design.md §2): every nude together
+    /// action (spec 2026-11-27-together-action-groups-design.md §5.1) and
+    /// the gestures and status asks below.
     pub fn speaks_emotionally(&self) -> bool {
-        matches!(
-            self,
-            UserAction::FrenchKiss
-                | UserAction::Tease
-                | UserAction::HugFromBehind
-                | UserAction::Touch
-                | UserAction::Strip
-                | UserAction::ShowerTogether
-                | UserAction::BathTogether
-                | UserAction::SexTogether
-                | UserAction::StreakTogether
-                | UserAction::SkinnyDipTogether
-                | UserAction::RideHorseNakedTogether
-                | UserAction::Propose
-                | UserAction::BreakUp
-                | UserAction::Threaten
-                | UserAction::Tip { .. }
-        )
+        self.together_group() == Some(TogetherGroup::Nude)
+            || matches!(
+                self,
+                UserAction::FrenchKiss
+                    | UserAction::Tease
+                    | UserAction::HugFromBehind
+                    | UserAction::Touch
+                    | UserAction::Strip
+                    | UserAction::Propose
+                    | UserAction::BreakUp
+                    | UserAction::Threaten
+                    | UserAction::Tip { .. }
+            )
+    }
+
+    /// The group of the kind this together action places (spec 2026-11-27
+    /// §4.1); `None` for every other action.
+    pub fn together_group(&self) -> Option<TogetherGroup> {
+        self.together_kind().and_then(EventKind::together_group)
     }
 
     /// The status ask this action puts to her (spec 2026-11-23-affinity-50-
@@ -383,23 +386,6 @@ impl UserAction {
             UserAction::CustomTogether { text } => Some(text),
             _ => None,
         }
-    }
-
-    /// Whether only a romance-compatible pair can have this action accepted:
-    /// ruled out before the judge when the turn's scopes are not (spec
-    /// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
-    /// custom-together-design.md §4, §6). The kinds these place are
-    /// `EventKind::ENDS_ON_CHEMISTRY_DROP`.
-    pub fn romance_gated(&self) -> bool {
-        matches!(
-            self,
-            UserAction::ShowerTogether
-                | UserAction::BathTogether
-                | UserAction::SexTogether
-                | UserAction::StreakTogether
-                | UserAction::SkinnyDipTogether
-                | UserAction::RideHorseNakedTogether
-        )
     }
 
     /// What this action has her take, and how many: a `give` its item and
@@ -1037,7 +1023,7 @@ mod tests {
         assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
         assert_eq!(a.together_kind(), Some(EventKind::CustomTogether));
         assert_eq!(a.together_text(), Some("去海边放烟花"));
-        assert!(!a.romance_gated());
+        assert_eq!(a.together_group(), Some(TogetherGroup::General));
         assert!(!a.speaks_emotionally());
         assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry));
         assert_eq!(a.consumed(), None);
@@ -1116,18 +1102,18 @@ mod tests {
         assert_eq!(a.status_ask(), None);
         assert_eq!(a.together_text(), None);
         assert!(!a.speaks_emotionally());
-        assert!(!a.romance_gated());
+        assert_eq!(a.together_group(), Some(TogetherGroup::General));
     }
 
     /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6.2.
     #[test]
-    fn ride_horse_naked_together_is_gated_and_emotional() {
+    fn ride_horse_naked_together_is_nude_and_emotional() {
         let a = UserAction::RideHorseNakedTogether;
         let v = serde_json::json!({ "type": "ride_horse_naked_together" });
         assert_eq!(serde_json::to_value(&a).unwrap(), v);
         assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
         assert_eq!(a.together_kind(), Some(EventKind::NakedHorseRidingTogether));
-        assert!(a.romance_gated());
+        assert_eq!(a.together_group(), Some(TogetherGroup::Nude));
         assert!(a.speaks_emotionally());
         assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry));
         assert_eq!(a.consumed(), None);
@@ -1243,26 +1229,79 @@ mod tests {
         ]
     }
 
-    /// The kinds a chemistry drop ends are exactly the kinds the
-    /// romance-gated actions place (spec 2026-11-26 §6).
+    /// The kinds a chemistry drop ends are exactly the kinds the nude
+    /// actions place (spec 2026-11-27-together-action-groups-design.md §5.1).
     #[test]
-    fn romance_gated_actions_place_the_kinds_a_chemistry_drop_ends() {
+    fn nude_actions_place_the_kinds_a_chemistry_drop_ends() {
         let sorted = |mut kinds: Vec<EventKind>| {
             kinds.sort_by_key(|k| k.as_str());
             kinds
         };
-        let gated: Vec<EventKind> = all_actions()
+        let nude: Vec<EventKind> = all_actions()
             .iter()
-            .filter(|a| a.romance_gated())
+            .filter(|a| a.together_group() == Some(TogetherGroup::Nude))
             .filter_map(|a| a.together_kind())
             .collect();
         assert_eq!(
-            sorted(gated),
+            sorted(nude),
             sorted(EventKind::ENDS_ON_CHEMISTRY_DROP.to_vec())
         );
-        // `strip` has its own gate (`pde::strip_ruled_out`).
-        assert!(!UserAction::Strip.romance_gated());
-        assert!(!UserAction::SaunaTogether.romance_gated());
+    }
+
+    const NUDE_ACTIONS: [UserAction; 9] = [
+        UserAction::ShowerTogether,
+        UserAction::BathTogether,
+        UserAction::SexTogether,
+        UserAction::StreakTogether,
+        UserAction::SkinnyDipTogether,
+        UserAction::RideHorseNakedTogether,
+        UserAction::YogaNakedTogether,
+        UserAction::HikeNakedTogether,
+        UserAction::HotSpringNakedTogether,
+    ];
+
+    const THRILL_ACTIONS: [UserAction; 4] = [
+        UserAction::AdventureTogether,
+        UserAction::CommitCrimeTogether,
+        UserAction::PlayWithFireTogether,
+        UserAction::FightTogether,
+    ];
+
+    /// Spec 2026-11-27-together-action-groups-design.md §4.1.
+    #[test]
+    fn every_together_action_has_its_group() {
+        for a in all_actions() {
+            let want = if NUDE_ACTIONS.contains(&a) {
+                Some(TogetherGroup::Nude)
+            } else if THRILL_ACTIONS.contains(&a) {
+                Some(TogetherGroup::Thrill)
+            } else if a.together_kind().is_some() {
+                Some(TogetherGroup::General)
+            } else {
+                None
+            };
+            assert_eq!(a.together_group(), want, "{a:?}");
+        }
+        for a in [
+            UserAction::FallAsleepTogether,
+            UserAction::SwimTogether,
+            UserAction::HotSpringTogether,
+        ] {
+            assert_eq!(a.together_group(), Some(TogetherGroup::General), "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-27-together-action-groups-design.md §5.1: every nude
+    /// action speaks emotionally; no general or thrill one does.
+    #[test]
+    fn nude_actions_speak_emotionally() {
+        for a in all_actions().into_iter().filter(|a| a.together_kind().is_some()) {
+            assert_eq!(
+                a.speaks_emotionally(),
+                a.together_group() == Some(TogetherGroup::Nude),
+                "{a:?}"
+            );
+        }
     }
 
     /// Spec 2026-11-23-hot-spring-fight-challenge-bet-design.md §4: social

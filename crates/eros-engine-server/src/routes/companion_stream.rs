@@ -394,9 +394,8 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// start an event the same way, as do `yoga_naked_together` →
 /// `naked_yoga_together` and `hot_spring_naked_together` →
 /// `naked_hot_spring_together` (one hour each) and `hike_naked_together` →
-/// `naked_hiking_together` (two to three hours). A `skinny_dip_together` or
-/// `ride_horse_naked_together` to a pair whose scopes are not
-/// romance-compatible is refused. `custom_together` asks her to do something with the user in the
+/// `naked_hiking_together` (two to three hours). No together action is
+/// refused for the pair's scopes: the judge decides. `custom_together` asks her to do something with the user in the
 /// user's own `text` (required): accepted, it starts a `custom_together`
 /// event (one hour) whose `message_id` is the user's message, and nothing
 /// rules it out before the judge; refused, it costs chemistry.

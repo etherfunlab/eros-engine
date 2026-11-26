@@ -12610,11 +12610,11 @@ data: [DONE]\n\n";
         assert_eq!(context["tier_drop"], "chemistry", "{context}");
     }
 
-    /// An incompatible pair's shower is refused before the judge: with no
-    /// judge the rule engine would accept it. It drops chemistry, shows no
-    /// picture and places nothing.
+    /// Spec 2026-11-27-together-action-groups-design.md §5.1: an
+    /// incompatible pair's shower is no longer refused before the judge;
+    /// with no judge the rule engine accepts it and the kind is placed.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn an_incompatible_pair_never_showers_together(pool: PgPool) {
+    async fn an_incompatible_pairs_shower_reaches_the_judge(pool: PgPool) {
         let (frames, _, umid) = run_together_turn(
             &pool,
             eros_engine_core::types::UserAction::ShowerTogether,
@@ -12624,12 +12624,26 @@ data: [DONE]\n\n";
             true,
         )
         .await;
-        assert_eq!(action_response_of(&frames), "refuse");
-        assert_eq!(meta_action_type(&frames), FrameActionType::Reply);
-        assert_eq!(image_requests(&frames), 0);
-        assert!(events_of_kind(&pool, "showering_together").await.is_empty());
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_eq!(events_of_kind(&pool, "showering_together").await.len(), 1);
         let (context, _) = turn_affinity_row(&pool, umid).await;
-        assert_eq!(context["tier_drop"], "chemistry", "{context}");
+        assert!(context.get("tier_drop").is_none(), "{context}");
+    }
+
+    /// §5.1: so is an incompatible pair's sex.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incompatible_pairs_sex_reaches_the_judge(pool: PgPool) {
+        let (frames, _, _) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::SexTogether,
+            None,
+            false,
+            &[],
+            true,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_eq!(events_of_kind(&pool, "having_sex_together").await.len(), 1);
     }
 
     /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
