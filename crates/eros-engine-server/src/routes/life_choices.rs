@@ -552,8 +552,20 @@ async fn resolve_choice(
         None => None,
     };
     tx.commit().await?;
+    // A decline whose drop carried chemistry down a tier ends an intimate
+    // event of hers under way since before the answer (spec 2026-11-26-more-
+    // together-actions-bath-outfit-chemistry-drop-and-custom-together-
+    // design.md §6), in a write of its own: the answer is in either way.
+    if let (LifeChoiceAnswer::Decline, Some((_, true))) = (req.response, &dropped) {
+        if let Err(e) = (EventRepo { pool: &state.pool })
+            .end_intimate_after(instance_id, now, Utc::now())
+            .await
+        {
+            tracing::warn!(%session_id, choice_id = %choice.id, "ending an intimate event failed: {e}");
+        }
+    }
     let affinity = match dropped {
-        Some(a) => a,
+        Some((a, _)) => a,
         // Nothing changed: the relationship as it stands, read the way every
         // snapshot is. A choice is asked only once the row exists.
         None => match (AffinityRepo { pool: &state.pool })
@@ -1156,6 +1168,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(s.ends_at("reading").await, reading_ends);
+    }
+
+    /// A decline whose drop carries chemistry down a tier ends the intimate
+    /// event under way since before the answer, after the answer commits.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn declining_her_ask_during_a_shower_together_ends_it(pool: PgPool) {
+        let mock = companion_mock(Some(HURT)).await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("sleep_together", recent(30)).await;
+        let now = recent(0);
+        s.put(
+            "showering_together",
+            now - Duration::minutes(10),
+            now + Duration::minutes(20),
+        )
+        .await;
+
+        s.respond(&state, choice, LifeChoiceAnswer::Decline, now)
+            .await
+            .unwrap();
+
+        assert_eq!(s.tiers().await, (3, 3), "chemistry fell a tier");
+        let ends = s.ends_at("showering_together").await;
+        assert!(ends >= now && ends <= Utc::now(), "{ends}");
     }
 
     /// A bath together is an incident too: going to bed ends it.

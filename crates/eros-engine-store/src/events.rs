@@ -349,6 +349,74 @@ impl EventRepo<'_> {
         Ok(())
     }
 
+    /// A chemistry drop caused by the user message `message_id` (spec
+    /// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §6): every event of the instance of a kind in
+    /// [`EventKind::ENDS_ON_CHEMISTRY_DROP`] that started before the message
+    /// was sent and is under way at `at` ends at `at`; a background or a cycle
+    /// row keeps running. A message that is not there ends nothing. Returns
+    /// the rows ended.
+    ///
+    /// Its own transaction, the instance's lock first: never call it while an
+    /// affinity row is locked, as every writer takes the instance's lock
+    /// before the affinity row's.
+    pub async fn end_intimate_after_message(
+        &self,
+        instance_id: Uuid,
+        message_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<u64, sqlx::Error> {
+        self.end_intimate(instance_id, Some(message_id), None, at)
+            .await
+    }
+
+    /// [`Self::end_intimate_after_message`] for a drop caused at `after`
+    /// rather than by a message: what started before `after` ends.
+    pub async fn end_intimate_after(
+        &self,
+        instance_id: Uuid,
+        after: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> Result<u64, sqlx::Error> {
+        self.end_intimate(instance_id, None, Some(after), at).await
+    }
+
+    /// The cause is `after`, else the `sent_at` of `message_id`; neither
+    /// (`NULL`) ends nothing.
+    async fn end_intimate(
+        &self,
+        instance_id: Uuid,
+        message_id: Option<Uuid>,
+        after: Option<DateTime<Utc>>,
+        at: DateTime<Utc>,
+    ) -> Result<u64, sqlx::Error> {
+        let kinds: Vec<&str> = EventKind::ENDS_ON_CHEMISTRY_DROP
+            .into_iter()
+            .map(EventKind::as_str)
+            .collect();
+        let mut tx = self.pool.begin().await?;
+        lock_instance(&mut tx, instance_id).await?;
+        // `started_at < $4`: a row starting at the moment itself is not capped
+        // (its `ends_at` would equal its `started_at`, which the table forbids).
+        let ended = sqlx::query(
+            "UPDATE engine.persona_events SET ends_at = $4 \
+              WHERE instance_id = $1 AND kind = ANY($5) \
+                AND started_at < COALESCE($3, \
+                      (SELECT m.sent_at FROM engine.chat_messages m WHERE m.id = $2)) \
+                AND started_at < $4 AND ends_at > $4",
+        )
+        .bind(instance_id)
+        .bind(message_id)
+        .bind(after)
+        .bind(at)
+        .bind(kinds)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(ended)
+    }
+
     /// The event written in this session under `event_key`.
     pub async fn by_key(
         &self,
@@ -1993,6 +2061,107 @@ mod tests {
             (Some(TakingSpace), Some(trip.id)),
             "one incident at a time, the trip underneath"
         );
+    }
+
+    /// When the event `id` ends, as stored.
+    async fn ends_of(pool: &PgPool, id: Uuid) -> DateTime<Utc> {
+        sqlx::query_scalar("SELECT ends_at FROM engine.persona_events WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn end_intimate_after_message_ends_only_what_started_before_the_message(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let sex = repo
+            .insert_preempting(&ev(
+                i,
+                s,
+                "sex",
+                HavingSexTogether,
+                "2026-10-01T10:00:00Z",
+                "2026-10-01T11:00:00Z",
+            ))
+            .await
+            .unwrap();
+        let at = t("2026-10-01T10:30:00Z");
+
+        let before = row(&pool, s, "user", "2026-10-01T09:59:00Z", false).await;
+        assert_eq!(
+            repo.end_intimate_after_message(i, before, at)
+                .await
+                .unwrap(),
+            0,
+            "a message sent before it started ends nothing"
+        );
+        assert_eq!(
+            repo.end_intimate_after_message(i, Uuid::new_v4(), at)
+                .await
+                .unwrap(),
+            0,
+            "nor does a message that is not there"
+        );
+        assert_eq!(ends_of(&pool, sex.id).await, t("2026-10-01T11:00:00Z"));
+
+        let after = row(&pool, s, "user", "2026-10-01T10:01:00Z", false).await;
+        assert_eq!(
+            repo.end_intimate_after_message(i, after, at).await.unwrap(),
+            1
+        );
+        assert_eq!(ends_of(&pool, sex.id).await, at);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_chemistry_end_leaves_other_kinds_and_the_background(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let trip = repo
+            .insert(
+                &ev(
+                    i,
+                    s,
+                    "trip",
+                    ShortTrip,
+                    "2026-10-01T09:00:00Z",
+                    "2026-10-02T09:00:00Z",
+                ),
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("written")
+            .event;
+        let walk = repo
+            .insert_preempting(&ev(
+                i,
+                s,
+                "walk",
+                WalkingTogether,
+                "2026-10-01T10:00:00Z",
+                "2026-10-01T11:00:00Z",
+            ))
+            .await
+            .unwrap();
+        let at = t("2026-10-01T10:30:00Z");
+
+        assert_eq!(
+            repo.end_intimate_after(i, t("2026-10-01T10:20:00Z"), at)
+                .await
+                .unwrap(),
+            0
+        );
+        let message = row(&pool, s, "user", "2026-10-01T10:20:00Z", false).await;
+        assert_eq!(
+            repo.end_intimate_after_message(i, message, at)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(ends_of(&pool, walk.id).await, walk.ends_at);
+        assert_eq!(ends_of(&pool, trip.id).await, trip.ends_at);
     }
 
     /// (events of the instance, rows of the message id).
