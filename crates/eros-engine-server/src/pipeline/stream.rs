@@ -12088,31 +12088,69 @@ data: [DONE]\n\n";
         )
     }
 
-    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
-    /// custom-together-design.md §5: a hot spring she accepted draws a
-    /// romance-compatible pair's picture undressed, over a named outfit. Only
-    /// the composer's slot: the reply still wears the outfit.
+    /// Spec 2026-11-27-together-action-groups-design.md §7: a hot spring she
+    /// accepted draws a compatible female persona in her tier's swimsuit,
+    /// over a named outfit. Only the composer's slot: the reply still wears
+    /// the outfit.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn an_accepted_hot_spring_draws_her_undressed_for_a_compatible_pair(pool: PgPool) {
-        let (frames, payload, replies, clothing, answer) = water_picture_turn(
+    async fn an_accepted_hot_spring_draws_the_tiers_swimsuit(pool: PgPool) {
+        let (frames, payload, replies, clothing, answer) = water_picture_turn_with(
             &pool,
             eros_engine_core::types::UserAction::HotSpringTogether,
             "accept",
             true,
+            Some(serde_json::json!({"gender": "female"})),
+            Some(0.5),
+            &[],
             |m| m.outfit = Some("红色旗袍".into()),
         )
         .await;
         assert_eq!(action_response_of(&frames), "accept");
         assert_eq!(image_requests(&frames), 1);
-        assert!(payload.contains("[此刻穿着]\n什么都没穿\n"), "{payload}");
+        assert!(payload.contains("[此刻穿着]\nBandeau bikini\n"), "{payload}");
         assert!(
             payload.contains("[此刻状态]\n和对方一起泡温泉\n"),
             "{payload}"
         );
-        assert_eq!(clothing, "什么都没穿");
+        assert_eq!(clothing, "Bandeau bikini");
         assert_eq!(answer, "accept");
         assert!(replies.contains("红色旗袍"), "{replies}");
-        assert!(!replies.contains("什么都没穿"), "{replies}");
+        assert!(!replies.contains("Bandeau bikini"), "{replies}");
+    }
+
+    /// §7: a sauna she accepted draws a compatible pair in a loose towel.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_sauna_draws_a_loose_towel_for_a_compatible_pair(pool: PgPool) {
+        let (_, payload, _, clothing, _) = water_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::SaunaTogether,
+            "accept",
+            true,
+            |_| {},
+        )
+        .await;
+        assert!(
+            payload.contains("[此刻穿着]\n身上只松松地裹着一条浴巾\n"),
+            "{payload}"
+        );
+        assert_eq!(clothing, "身上只松松地裹着一条浴巾");
+    }
+
+    /// §7: a shower she accepted draws her with nothing on, the nude
+    /// group's line.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_shower_draws_her_with_nothing_on(pool: PgPool) {
+        let (frames, payload, _, clothing, _) = water_picture_turn(
+            &pool,
+            eros_engine_core::types::UserAction::ShowerTogether,
+            "accept",
+            false,
+            |_| {},
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(payload.contains("[此刻穿着]\n什么都没穿\n"), "{payload}");
+        assert_eq!(clothing, "什么都没穿");
     }
 
     /// §5: a sauna she accepted draws a pair that is not romance-compatible
@@ -12430,6 +12468,41 @@ data: [DONE]\n\n";
         assert_eq!(picture.clothing_override, Some("身上只裹着一条浴巾"));
         assert_eq!(picture.state.as_deref(), Some("和对方一起蒸桑拿"));
         let picture = read(romance_compatible(AffinityScope::full())).await;
+        // A loose towel for a compatible pair (spec 2026-11-27-together-
+        // action-groups-design.md §7).
+        assert_eq!(picture.clothing_override, Some("身上只松松地裹着一条浴巾"));
+    }
+
+    /// Spec 2026-11-27-together-action-groups-design.md §7: a bath her own
+    /// accepted ask placed is a nude kind like any other: nothing on.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn her_own_bath_reads_nothing_on(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        seed_events(
+            &pool,
+            user_id,
+            instance_id,
+            session_id,
+            &[ev("bathing_together", 10, 20)],
+        )
+        .await;
+        let picture = state_for_picture(
+            &pool,
+            instance_id,
+            None,
+            chrono::Utc::now(),
+            None,
+            None,
+            crate::prompt::WaterWear {
+                romance_compatible: false,
+                wearer: crate::prompt::Wearer::Other,
+                virgin: false,
+                chemistry: 0.0,
+                coin: true,
+            },
+        )
+        .await;
         assert_eq!(picture.clothing_override, Some("什么都没穿"));
     }
 

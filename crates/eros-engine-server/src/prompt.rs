@@ -1683,15 +1683,20 @@ impl WaterWear {
         }
     }
 
-    /// Whether her sex history can change the line: a swim, a female
-    /// persona, a romance-compatible pair, the card saying virgin, and tier 3
+    /// Whether her sex history can change the line: a swim or a hot spring,
+    /// a female persona, a romance-compatible pair, the card saying virgin, and tier 3
     /// or below.
     pub(crate) fn virginity_matters(
         &self,
         foreground: Option<eros_engine_core::events::EventKind>,
     ) -> bool {
-        foreground == Some(eros_engine_core::events::EventKind::SwimmingTogether)
-            && self.wearer == Wearer::Female
+        matches!(
+            foreground,
+            Some(
+                eros_engine_core::events::EventKind::SwimmingTogether
+                    | eros_engine_core::events::EventKind::HotSpringTogether
+            )
+        ) && self.wearer == Wearer::Female
             && self.romance_compatible
             && self.virgin
             && eros_engine_core::affinity::tier_index(self.chemistry) <= 3
@@ -1699,27 +1704,33 @@ impl WaterWear {
 }
 
 /// What the composer's `[此刻穿着]` says when the foreground of a picture is
-/// in the water or naked with the user, over the judge's clothing and a
-/// named outfit. A hot spring or a sauna: nothing on for a romance-compatible
-/// pair, a towel otherwise (spec 2026-11-26-more-together-actions-bath-
-/// outfit-chemistry-drop-and-custom-together-design.md §5). A skinny dip or a
-/// naked ride: nothing on (spec 2026-11-27 §5). A swim: the swimsuit of her
-/// gender, compatibility, virginity and chemistry tier (spec 2026-11-27 §4),
-/// nothing for a gender other than female or male. `None` for any other
-/// foreground.
+/// naked or in the water with the user, over the judge's clothing and a
+/// named outfit (spec 2026-11-27-together-action-groups-design.md §7): any
+/// nude kind, nothing on; a swim or a hot spring, the swimsuit of her
+/// gender, compatibility, virginity and chemistry tier (spec 2026-11-27-
+/// swim-outfit-ladder-and-fish-together-design.md §4), a hot spring falling
+/// back to the sauna's towel where the ladder writes nothing; a sauna, a
+/// towel, loose for a compatible pair. `None` for any other foreground.
 pub(crate) fn water_clothing(
     foreground: Option<eros_engine_core::events::EventKind>,
     wear: &WaterWear,
 ) -> Option<&'static str> {
-    use eros_engine_core::events::EventKind::{
-        HotSpringTogether, NakedHorseRidingTogether, SaunaTogether, SkinnyDippingTogether,
-        SwimmingTogether,
+    use eros_engine_core::events::{
+        EventKind::{HotSpringTogether, SaunaTogether, SwimmingTogether},
+        TogetherGroup,
+    };
+    let towel = || {
+        Some(if wear.romance_compatible {
+            "身上只松松地裹着一条浴巾"
+        } else {
+            "身上只裹着一条浴巾"
+        })
     };
     match foreground? {
-        HotSpringTogether | SaunaTogether if wear.romance_compatible => Some("什么都没穿"),
-        HotSpringTogether | SaunaTogether => Some("身上只裹着一条浴巾"),
-        SkinnyDippingTogether | NakedHorseRidingTogether => Some("什么都没穿"),
+        k if k.together_group() == Some(TogetherGroup::Nude) => Some("什么都没穿"),
         SwimmingTogether => swimsuit(wear),
+        HotSpringTogether => swimsuit(wear).or_else(towel),
+        SaunaTogether => towel(),
         _ => None,
     }
 }
@@ -5846,16 +5857,23 @@ mod tests {
     fn water_clothing_by_kind_wearer_and_chemistry() {
         use eros_engine_core::events::EventKind::*;
         use Wearer::{Female, Male, Other};
+        const LOOSE: &str = "身上只松松地裹着一条浴巾";
+        const TOWEL: &str = "身上只裹着一条浴巾";
         let at = |k, w: WaterWear| water_clothing(Some(k), &w);
         for w in [Female, Male, Other] {
-            for k in [HotSpringTogether, SaunaTogether] {
-                assert_eq!(at(k, wear(true, w, false, 0.5, true)), Some("什么都没穿"));
-                assert_eq!(
-                    at(k, wear(false, w, false, 0.5, true)),
-                    Some("身上只裹着一条浴巾")
-                );
-            }
-            for k in [SkinnyDippingTogether, NakedHorseRidingTogether] {
+            // Every nude kind: nothing on (spec 2026-11-27-together-action-
+            // groups-design.md §7).
+            for k in [
+                ShoweringTogether,
+                BathingTogether,
+                HavingSexTogether,
+                StreakingTogether,
+                SkinnyDippingTogether,
+                NakedHorseRidingTogether,
+                NakedYogaTogether,
+                NakedHikingTogether,
+                NakedHotSpringTogether,
+            ] {
                 for compatible in [true, false] {
                     assert_eq!(
                         at(k, wear(compatible, w, false, 0.0, true)),
@@ -5864,8 +5882,12 @@ mod tests {
                     );
                 }
             }
+            // A sauna: a towel, loose for a compatible pair.
+            assert_eq!(at(SaunaTogether, wear(true, w, false, 0.97, true)), Some(LOOSE));
+            assert_eq!(at(SaunaTogether, wear(false, w, false, 0.97, true)), Some(TOWEL));
         }
-        for k in [BathingTogether, ShoweringTogether, Bathing] {
+        // Her own bath or shower, and no foreground: nothing written.
+        for k in [Bathing, Showering] {
             assert_eq!(at(k, wear(true, Female, false, 0.5, true)), None);
         }
         assert_eq!(
@@ -5873,58 +5895,71 @@ mod tests {
             None
         );
 
-        // Female, compatible, not a virgin: the ladder, each cut on the higher tier.
-        let swim = |w: WaterWear| at(SwimmingTogether, w);
-        let her = |c: f64, coin: bool| swim(wear(true, Female, false, c, coin));
-        assert_eq!(her(0.0, true), Some("Tankini top"));
-        assert_eq!(her(0.0, false), Some("Bralette bikini"));
-        assert_eq!(her(0.149, false), Some("Bralette bikini"));
-        assert_eq!(her(0.15, true), Some("Triangle bikini"));
-        assert_eq!(her(0.349, true), Some("Triangle bikini"));
-        assert_eq!(her(0.35, true), Some("Bandeau bikini"));
-        assert_eq!(her(0.62, true), Some("Halter bikini"));
-        assert_eq!(her(0.899, true), Some("Halter bikini"));
-        assert_eq!(her(0.9, true), Some("String bikini"));
-        assert_eq!(her(0.949, true), Some("String bikini"));
-        assert_eq!(her(0.95, true), Some("什么都没穿"));
-        assert_eq!(her(1.0, true), Some("什么都没穿"));
+        // A swim and a hot spring wear the ladder (§7).
+        for k in [SwimmingTogether, HotSpringTogether] {
+            let swim = |w: WaterWear| at(k, w);
 
-        // Female, compatible, a virgin: the navy suit through tier 3 only.
-        let virgin = |c: f64| swim(wear(true, Female, true, c, true));
-        assert_eq!(virgin(0.0), Some(NAVY));
-        assert_eq!(virgin(0.2), Some(NAVY));
-        assert_eq!(virgin(0.5), Some(NAVY));
-        assert_eq!(virgin(0.62), Some("Halter bikini"));
-        assert_eq!(virgin(0.9), Some("String bikini"));
-        assert_eq!(virgin(0.95), Some("什么都没穿"));
+            // Female, compatible, not a virgin: each cut on the higher tier.
+            let her = |c: f64, coin: bool| swim(wear(true, Female, false, c, coin));
+            assert_eq!(her(0.0, true), Some("Tankini top"), "{k:?}");
+            assert_eq!(her(0.0, false), Some("Bralette bikini"), "{k:?}");
+            assert_eq!(her(0.149, false), Some("Bralette bikini"), "{k:?}");
+            assert_eq!(her(0.15, true), Some("Triangle bikini"), "{k:?}");
+            assert_eq!(her(0.349, true), Some("Triangle bikini"), "{k:?}");
+            assert_eq!(her(0.35, true), Some("Bandeau bikini"), "{k:?}");
+            assert_eq!(her(0.62, true), Some("Halter bikini"), "{k:?}");
+            assert_eq!(her(0.899, true), Some("Halter bikini"), "{k:?}");
+            assert_eq!(her(0.9, true), Some("String bikini"), "{k:?}");
+            assert_eq!(her(0.949, true), Some("String bikini"), "{k:?}");
+            assert_eq!(her(0.95, true), Some("什么都没穿"), "{k:?}");
+            assert_eq!(her(1.0, true), Some("什么都没穿"), "{k:?}");
 
-        // Female, not compatible.
-        for v in [true, false] {
-            for c in [0.0, 0.97] {
+            // Female, compatible, a virgin: the navy suit through tier 3 only.
+            let virgin = |c: f64| swim(wear(true, Female, true, c, true));
+            assert_eq!(virgin(0.0), Some(NAVY), "{k:?}");
+            assert_eq!(virgin(0.2), Some(NAVY), "{k:?}");
+            assert_eq!(virgin(0.5), Some(NAVY), "{k:?}");
+            assert_eq!(virgin(0.62), Some("Halter bikini"), "{k:?}");
+            assert_eq!(virgin(0.9), Some("String bikini"), "{k:?}");
+            assert_eq!(virgin(0.95), Some("什么都没穿"), "{k:?}");
+
+            // Female, not compatible.
+            for v in [true, false] {
+                for c in [0.0, 0.97] {
+                    assert_eq!(
+                        swim(wear(false, Female, v, c, true)),
+                        Some("plain one-piece swimsuit"),
+                        "{k:?}"
+                    );
+                }
+            }
+
+            // Male: no virginity variant.
+            for v in [true, false] {
+                let him = |c: f64| swim(wear(true, Male, v, c, false));
+                assert_eq!(him(0.0), Some("rash guard with board shorts"), "{k:?}");
+                assert_eq!(him(0.15), Some("board shorts"), "{k:?}");
+                assert_eq!(him(0.35), Some("swim trunks"), "{k:?}");
+                assert_eq!(him(0.62), Some("square-cut swim trunks"), "{k:?}");
+                assert_eq!(him(0.9), Some("swim briefs"), "{k:?}");
+                assert_eq!(him(0.95), Some("什么都没穿"), "{k:?}");
                 assert_eq!(
-                    swim(wear(false, Female, v, c, true)),
-                    Some("plain one-piece swimsuit")
+                    swim(wear(false, Male, v, 0.97, true)),
+                    Some("board shorts"),
+                    "{k:?}"
                 );
             }
         }
 
-        // Male: no virginity variant.
-        for v in [true, false] {
-            let him = |c: f64| swim(wear(true, Male, v, c, false));
-            assert_eq!(him(0.0), Some("rash guard with board shorts"));
-            assert_eq!(him(0.15), Some("board shorts"));
-            assert_eq!(him(0.35), Some("swim trunks"));
-            assert_eq!(him(0.62), Some("square-cut swim trunks"));
-            assert_eq!(him(0.9), Some("swim briefs"));
-            assert_eq!(him(0.95), Some("什么都没穿"));
-            assert_eq!(swim(wear(false, Male, v, 0.97, true)), Some("board shorts"));
-        }
-
-        // Any other gender: the composer decides, as before.
-        for compatible in [true, false] {
-            for c in [0.0, 0.97] {
-                assert_eq!(swim(wear(compatible, Other, false, c, true)), None);
+        // Any other gender: a swim is left to the composer; a hot spring
+        // wears the sauna's towel (spec 2026-11-27-together-action-groups-
+        // design.md §7).
+        for c in [0.0, 0.97] {
+            for compatible in [true, false] {
+                assert_eq!(at(SwimmingTogether, wear(compatible, Other, false, c, true)), None);
             }
+            assert_eq!(at(HotSpringTogether, wear(true, Other, false, c, true)), Some(LOOSE));
+            assert_eq!(at(HotSpringTogether, wear(false, Other, false, c, true)), Some(TOWEL));
         }
     }
 
@@ -5940,7 +5975,11 @@ mod tests {
         assert!(!wear(true, Male, true, 0.5, true).virginity_matters(swim));
         assert!(!wear(false, Female, true, 0.5, true).virginity_matters(swim));
         assert!(!wear(true, Female, false, 0.5, true).virginity_matters(swim));
-        assert!(!wear(true, Female, true, 0.5, true).virginity_matters(Some(HotSpringTogether)));
+        // A hot spring wears the ladder too (spec 2026-11-27-together-action-
+        // groups-design.md §7).
+        assert!(wear(true, Female, true, 0.5, true).virginity_matters(Some(HotSpringTogether)));
+        assert!(!wear(true, Female, true, 0.5, true)
+            .virginity_matters(Some(eros_engine_core::events::EventKind::SaunaTogether)));
         assert!(!wear(true, Female, true, 0.5, true).virginity_matters(None));
     }
 
