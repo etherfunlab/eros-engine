@@ -124,7 +124,7 @@ chat session（`channel = 'activity'`），隶属于发出邀约的那条 1:1 �
   跳过的回合本来还会加的长消息、长间隔微调也归零。逐轮 delta 路由显示它什么都没挪动。约会在[结算](#结算)时整场评一次。
 - **从不 ghost。** 她和用户在一起：判官给出 ghost 时改为回复。
 - **没有生活选择。** 约会回合既不触发生活选择，也不回答生活选择。跳过的回合既不计入、也不打断一个选择的连续计数。
-- **动作照各自的规则。** 被拒的 `give`、`gift` 或身体动作照样让父会话上对应的线降一档，`strip`、`shower_together`、`bath_together`、`sex_together` 和 `streak_together` 照样要求性向相容的一对。她在约会里接受的一起做的动作不写事件：约会的 `on_a_date` 保持原样，约会继续，这一回合的图把这个动作只当作这一回合她的状态来画（见 [life-events-needs.zh.md](life-events-needs.zh.md#一起淋浴泡澡和蒸桑拿)）。
+- **动作照各自的规则。** 被拒的 `give`、`gift` 或身体动作照样让父会话上对应的线降一档，`strip`、`shower_together`、`bath_together`、`sex_together`、`streak_together` 和 `skinny_dip_together` 照样要求性向相容的一对。她在约会里接受的一起做的动作不写事件：约会的 `on_a_date` 保持原样，约会继续，这一回合的图把这个动作只当作这一回合她的状态来画（见 [life-events-needs.zh.md](life-events-needs.zh.md#一起淋浴泡澡和蒸桑拿)）。
   约会中再带 `date` 动作返回 `409 activity_in_progress`。
 - **不写逐轮原文。** 用户这句话不 embed 进任何一层记忆。
 - **不进 dreaming。** 这一回合不计入关系扫描，扫描也从不读子会话的行（见[记忆](#记忆)）。

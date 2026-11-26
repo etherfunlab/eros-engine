@@ -377,7 +377,9 @@ appearance and personality, and the line
 `这张图里有两个人：{speaker} 和 {companion}。`; the built-in composer prompt
 knows the section. A picture also carries `[此刻状态]` after `[身体状态]` while the
 speaker has an event live: the speaker's own state, never the companion's
-([life-events-needs.md](life-events-needs.md#while-it-lasts)). The `image_request` frame and
+([life-events-needs.md](life-events-needs.md#while-it-lasts)). When that state is a hot
+spring or a sauna together, the engine writes the speaker's `[此刻穿着]` by the speaker's own
+`member_scopes` from the send ([life-events-needs.md](life-events-needs.md#what-she-wears-in-the-water)). The `image_request` frame and
 [`GET …/image-request`](api-reference.md#get-compchatsession_idmessagesmessage_idimage-request)
 then carry `companion: {member_session_id, instance_id}`, so the client
 fetches a second face reference and draws with both. When the composer chain
