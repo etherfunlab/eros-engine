@@ -128,7 +128,8 @@ pub fn period_refuses(event: &Event, on_period: bool, roll: f64) -> bool {
                 action: Some(a), ..
             } => {
                 matches!(a, UserAction::SexTogether)
-                    || a.together_kind().is_some_and(crate::events::EventKind::is_wet)
+                    || a.together_kind()
+                        .is_some_and(crate::events::EventKind::is_wet)
             }
             _ => false,
         }

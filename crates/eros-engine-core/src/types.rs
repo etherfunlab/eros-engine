@@ -1127,7 +1127,10 @@ mod tests {
             UserAction::HikeNakedTogether,
             UserAction::RideHorseNakedTogether,
         ];
-        for a in all_actions().into_iter().filter(|a| a.together_kind().is_some()) {
+        for a in all_actions()
+            .into_iter()
+            .filter(|a| a.together_kind().is_some())
+        {
             let want: &[AffinityLine] = if BOTH.contains(&a) {
                 &[Bond, Chemistry]
             } else if OUTDOOR.contains(&a) || THRILL_ACTIONS.contains(&a) {
@@ -1357,7 +1360,10 @@ mod tests {
     /// action speaks emotionally; no general or thrill one does.
     #[test]
     fn nude_actions_speak_emotionally() {
-        for a in all_actions().into_iter().filter(|a| a.together_kind().is_some()) {
+        for a in all_actions()
+            .into_iter()
+            .filter(|a| a.together_kind().is_some())
+        {
             assert_eq!(
                 a.speaks_emotionally(),
                 a.together_group() == Some(TogetherGroup::Nude),
@@ -1817,7 +1823,10 @@ mod tests {
 
     #[test]
     fn a_refused_tip_drops_no_line() {
-        assert_eq!(UserAction::Tip { amount_usd: 20.0 }.refusal_lines(), [] as [AffinityLine; 0]);
+        assert_eq!(
+            UserAction::Tip { amount_usd: 20.0 }.refusal_lines(),
+            [] as [AffinityLine; 0]
+        );
     }
 
     #[test]

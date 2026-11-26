@@ -12107,7 +12107,10 @@ data: [DONE]\n\n";
         .await;
         assert_eq!(action_response_of(&frames), "accept");
         assert_eq!(image_requests(&frames), 1);
-        assert!(payload.contains("[此刻穿着]\nBandeau bikini\n"), "{payload}");
+        assert!(
+            payload.contains("[此刻穿着]\nBandeau bikini\n"),
+            "{payload}"
+        );
         assert!(
             payload.contains("[此刻状态]\n和对方一起泡温泉\n"),
             "{payload}"

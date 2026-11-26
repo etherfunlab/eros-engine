@@ -2863,7 +2863,10 @@ mod tests {
             refusal_free: false,
         };
         let fight = event(UserAction::FightTogether);
-        assert_eq!(tier_drop_for(&fight, &refused, Setting::Modern), [] as [AffinityLine; 0]);
+        assert_eq!(
+            tier_drop_for(&fight, &refused, Setting::Modern),
+            [] as [AffinityLine; 0]
+        );
         assert_eq!(
             tier_drop_for(&fight, &refused, Setting::Fantasy),
             // A fight is a thrill action (spec 2026-11-27-together-action-
@@ -2925,7 +2928,10 @@ mod tests {
             refusal_free: false,
         };
         let cycle = event(UserAction::CycleTogether);
-        assert_eq!(tier_drop_for(&cycle, &refused, Setting::Fantasy), [] as [AffinityLine; 0]);
+        assert_eq!(
+            tier_drop_for(&cycle, &refused, Setting::Fantasy),
+            [] as [AffinityLine; 0]
+        );
         // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7.
         assert_eq!(
             tier_drop_for(&cycle, &refused, Setting::Modern),
@@ -2976,7 +2982,10 @@ mod tests {
             tier_drop_for(&sex, &refused(false), Setting::Modern),
             [AffinityLine::Chemistry]
         );
-        assert_eq!(tier_drop_for(&sex, &refused(true), Setting::Modern), [] as [AffinityLine; 0]);
+        assert_eq!(
+            tier_drop_for(&sex, &refused(true), Setting::Modern),
+            [] as [AffinityLine; 0]
+        );
         // A naked hot spring her period ruled out is free too (spec
         // 2026-11-27-together-action-groups-design.md §5.3).
         let with_action = |a: UserAction| {

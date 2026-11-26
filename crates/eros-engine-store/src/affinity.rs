@@ -4195,11 +4195,7 @@ mod tests {
     }
 
     /// One turn with neutral grades and `tier_drop`; whether chemistry fell.
-    async fn neutral_turn(
-        pool: &PgPool,
-        a: &mut Affinity,
-        tier_drop: &[AffinityLine],
-    ) -> bool {
+    async fn neutral_turn(pool: &PgPool, a: &mut Affinity, tier_drop: &[AffinityLine]) -> bool {
         AffinityRepo { pool }
             .persist_with_event(
                 a,

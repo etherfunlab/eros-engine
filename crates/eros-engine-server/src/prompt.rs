@@ -5883,8 +5883,14 @@ mod tests {
                 }
             }
             // A sauna: a towel, loose for a compatible pair.
-            assert_eq!(at(SaunaTogether, wear(true, w, false, 0.97, true)), Some(LOOSE));
-            assert_eq!(at(SaunaTogether, wear(false, w, false, 0.97, true)), Some(TOWEL));
+            assert_eq!(
+                at(SaunaTogether, wear(true, w, false, 0.97, true)),
+                Some(LOOSE)
+            );
+            assert_eq!(
+                at(SaunaTogether, wear(false, w, false, 0.97, true)),
+                Some(TOWEL)
+            );
         }
         // Her own bath or shower, and no foreground: nothing written.
         for k in [Bathing, Showering] {
@@ -5956,10 +5962,19 @@ mod tests {
         // design.md §7).
         for c in [0.0, 0.97] {
             for compatible in [true, false] {
-                assert_eq!(at(SwimmingTogether, wear(compatible, Other, false, c, true)), None);
+                assert_eq!(
+                    at(SwimmingTogether, wear(compatible, Other, false, c, true)),
+                    None
+                );
             }
-            assert_eq!(at(HotSpringTogether, wear(true, Other, false, c, true)), Some(LOOSE));
-            assert_eq!(at(HotSpringTogether, wear(false, Other, false, c, true)), Some(TOWEL));
+            assert_eq!(
+                at(HotSpringTogether, wear(true, Other, false, c, true)),
+                Some(LOOSE)
+            );
+            assert_eq!(
+                at(HotSpringTogether, wear(false, Other, false, c, true)),
+                Some(TOWEL)
+            );
         }
     }
 
