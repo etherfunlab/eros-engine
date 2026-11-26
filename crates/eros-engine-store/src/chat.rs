@@ -1176,7 +1176,7 @@ impl<'a> ChatRepo<'a> {
     /// design.md §5), written in the same transaction by
     /// [`crate::events::EventRepo::place_together_in_tx`]: once per
     /// `event_key`, and never while a date of the instance is on. A refusal
-    /// places nothing.
+    /// places nothing. A `custom_together`'s row points at `user_message_id`.
     ///
     /// `relationship` is the affinity session and the status ask the action
     /// puts (spec 2026-11-23-affinity-50-design.md §8): the answer settles
@@ -1198,7 +1198,7 @@ impl<'a> ChatRepo<'a> {
         let mut tx = self.pool.begin().await?;
         // First, as it takes the instance's lock.
         if let (ActionResponse::Accept, Some(e)) = (response, place) {
-            crate::events::EventRepo::place_together_in_tx(&mut tx, e).await?;
+            crate::events::EventRepo::place_together_in_tx(&mut tx, e, user_message_id).await?;
         }
         // After the instance's lock, as everywhere: then the affinity row's.
         if let Some((session_id, ask)) = relationship {
@@ -4199,6 +4199,88 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response, "accept", "her answer is stored all the same");
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.3: an accepted `custom_together` places a
+    /// row that points at the user's own message; every other together kind
+    /// leaves `message_id` empty, as it was.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_accepted_custom_together_points_at_the_user_row(pool: PgPool) {
+        use crate::events::NewEvent;
+        use eros_engine_core::events::EventKind;
+        use eros_engine_core::types::ActionResponse::Accept;
+        let s = throwaway_session(&pool).await;
+        let instance = s.instance_id.unwrap();
+        let t = together_at();
+        let m = chrono::Duration::minutes;
+        let repo = ChatRepo { pool: &pool };
+        let message_of = |kind: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<Uuid>>(
+                    "SELECT message_id FROM engine.persona_events WHERE kind = $1",
+                )
+                .bind(kind)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        let custom = gift_row(
+            &pool,
+            s.id,
+            serde_json::json!({"type": "custom_together", "text": "去海边放烟花"}),
+        )
+        .await;
+        let key = format!("action:{custom}:custom_together");
+        let place = NewEvent {
+            instance_id: instance,
+            session_id: s.id,
+            event_key: &key,
+            kind: EventKind::CustomTogether,
+            started_at: t,
+            ends_at: t + m(60),
+        };
+        // A second write of the same turn changes nothing.
+        for _ in 0..2 {
+            repo.set_action_response(custom, Accept, instance, None, Some(&place), None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            events_of(&pool, "custom_together").await,
+            vec![(key, t, t + m(60))]
+        );
+        assert_eq!(message_of("custom_together").await, Some(custom));
+
+        // The next turn's `jog_together` ends it, and points at nothing.
+        let jog = gift_row(&pool, s.id, serde_json::json!({"type": "jog_together"})).await;
+        let jog_key = format!("action:{jog}:jogging_together");
+        repo.set_action_response(
+            jog,
+            Accept,
+            instance,
+            None,
+            Some(&NewEvent {
+                instance_id: instance,
+                session_id: s.id,
+                event_key: &jog_key,
+                kind: EventKind::JoggingTogether,
+                started_at: t + m(5),
+                ends_at: t + m(65),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(message_of("jogging_together").await, None);
+        assert_eq!(
+            message_of("custom_together").await,
+            Some(custom),
+            "the earlier row keeps its pointer"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

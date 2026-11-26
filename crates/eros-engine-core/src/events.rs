@@ -234,6 +234,10 @@ pub enum EventKind {
     /// She and the user commit a crime together: written when she accepts
     /// the user's `commit_crime_together`; it names no crime.
     CommittingCrimeTogether,
+    /// She and the user do the thing the user named: written when she
+    /// accepts the user's `custom_together` (spec 2026-11-26 §8). The row's
+    /// `message_id` is the user's message, which holds the text.
+    CustomTogether,
 }
 
 /// Where a row under way sits: at most one event is live in each slot.
@@ -329,7 +333,7 @@ impl EventKind {
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 31] = [
+    pub const SPECIAL: [EventKind; 32] = [
         EventKind::TakingSpace,
         EventKind::FellOut,
         EventKind::TravelingTogether,
@@ -361,6 +365,7 @@ impl EventKind {
         EventKind::SingingTogether,
         EventKind::SkinnyDippingTogether,
         EventKind::CommittingCrimeTogether,
+        EventKind::CustomTogether,
     ];
 
     /// The kinds a chemistry drop ends while they are under way: the ones the
@@ -499,6 +504,7 @@ impl EventKind {
             EventKind::SingingTogether => "singing_together",
             EventKind::SkinnyDippingTogether => "skinny_dipping_together",
             EventKind::CommittingCrimeTogether => "committing_crime_together",
+            EventKind::CustomTogether => "custom_together",
         }
     }
 
@@ -570,7 +576,8 @@ impl EventKind {
             | PlayingWithFireTogether
             | SingingTogether
             | SkinnyDippingTogether
-            | CommittingCrimeTogether => EventCategory::Short,
+            | CommittingCrimeTogether
+            | CustomTogether => EventCategory::Short,
             AsleepTogether | FightingTogether | HikingTogether | AdventuringTogether | TempWork
             | ExMessage | GotHit | Breakup | WorkingOut | Reading | Gaming | AwayFromPhone
             | Unwell | Irritable | Busy | InBattle | Asleep | OutShopping | BrosGathering
@@ -686,6 +693,7 @@ impl EventKind {
                 | SingingTogether
                 | SkinnyDippingTogether
                 | CommittingCrimeTogether
+                | CustomTogether
         )
     }
 
@@ -898,6 +906,7 @@ fn rule(kind: EventKind) -> Rule {
         SingingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         SkinnyDippingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         CommittingCrimeTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        CustomTogether => (0.0, 0, Lasts::Hours(1, 1)),
     };
     Rule {
         weight,
@@ -2718,7 +2727,7 @@ mod tests {
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
         assert_eq!(EventKind::ALL.len(), 70);
-        assert_eq!(EventKind::SPECIAL.len(), 31);
+        assert_eq!(EventKind::SPECIAL.len(), 32);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -3774,6 +3783,36 @@ mod tests {
             }
             assert!(k.fits(Setting::Modern) && k.fits(Setting::Fantasy), "{k:?}");
         }
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.2.
+    #[test]
+    fn custom_together_is_a_placed_kind_in_neither_intimate_list() {
+        let k = CustomTogether;
+        assert!(
+            EventKind::SPECIAL.contains(&k) && !EventKind::ALL.contains(&k),
+            "{k:?}"
+        );
+        assert_eq!(k.as_str(), "custom_together");
+        assert_eq!(EventKind::parse("custom_together"), Some(k));
+        assert_eq!(serde_json::to_value(k).unwrap(), "custom_together");
+        assert_eq!(k.category(), EventCategory::Short);
+        assert_eq!(lasts(k, 0.0), Duration::hours(1));
+        assert_eq!(lasts(k, 0.999_999), Duration::hours(1));
+        let r = rule(k);
+        assert_eq!((r.weight, r.cooldown_hours), (0.0, 0));
+        assert_eq!(k.place(), Place::Neutral);
+        assert!(k.is_shared());
+        assert!(!k.may_be_offline() && !k.is_offline(&female()));
+        assert!(!k.speaks_emotionally());
+        for rung in 0..=5 {
+            assert!(!is_told(k, rung, &PersonaTraits::default()), "rung {rung}");
+        }
+        assert!(k.fits(Setting::Modern) && k.fits(Setting::Fantasy));
+        assert!(!EventKind::ENDS_ON_CHEMISTRY_DROP.contains(&k));
+        assert!(!EventKind::HOLDS_BACK_INTIMATE_ASKS.contains(&k));
+        assert!(!EventKind::SEX.contains(&k));
     }
 
     /// Spec 2026-11-26 §6, §7.

@@ -292,14 +292,25 @@ impl EventRepo<'_> {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         e: &NewEvent<'_>,
     ) -> Result<EventRecord, sqlx::Error> {
+        Self::insert_preempting_pointing_in_tx(tx, e, None).await
+    }
+
+    /// [`Self::insert_preempting_in_tx`] with the row's `message_id` set to
+    /// `message_id`: the message the event is about. At most one row points at
+    /// a message (`persona_events_message_uidx`).
+    async fn insert_preempting_pointing_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        e: &NewEvent<'_>,
+        message_id: Option<Uuid>,
+    ) -> Result<EventRecord, sqlx::Error> {
         // The cap and the insert are two statements: no other writer of the
         // instance may land between them. The lock is held to the caller's
         // commit.
         Self::end_foreground_in_tx(tx, e.instance_id, e.started_at).await?;
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO engine.persona_events \
-               (instance_id, session_id, event_key, kind, started_at, ends_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+               (instance_id, session_id, event_key, kind, started_at, ends_at, message_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              RETURNING id",
         )
         .bind(e.instance_id)
@@ -308,6 +319,7 @@ impl EventRepo<'_> {
         .bind(e.kind.as_str())
         .bind(e.started_at)
         .bind(e.ends_at)
+        .bind(message_id)
         .fetch_one(&mut **tx)
         .await?;
         Ok(EventRecord {
@@ -316,7 +328,7 @@ impl EventRepo<'_> {
             session_id: Some(e.session_id),
             started_at: e.started_at,
             ends_at: e.ends_at,
-            message_id: None,
+            message_id,
         })
     }
 
@@ -328,9 +340,17 @@ impl EventRepo<'_> {
     /// it is. Takes the instance's lock first, so a second driver of the turn,
     /// or a date being opened, is waited for and then seen. Nothing here
     /// commits.
+    ///
+    /// `user_message_id` is the user's message that asked. A `custom_together`
+    /// row points at it (`message_id`), as the user's words live there (spec
+    /// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.3); a row of any other kind points at no
+    /// message. One message places at most one row, so
+    /// `persona_events_message_uidx` holds.
     pub async fn place_together_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         e: &NewEvent<'_>,
+        user_message_id: Uuid,
     ) -> Result<(), sqlx::Error> {
         lock_instance(tx, e.instance_id).await?;
         let written: bool = sqlx::query_scalar(
@@ -345,7 +365,8 @@ impl EventRepo<'_> {
         {
             return Ok(());
         }
-        Self::insert_preempting_in_tx(tx, e).await?;
+        let message_id = (e.kind == EventKind::CustomTogether).then_some(user_message_id);
+        Self::insert_preempting_pointing_in_tx(tx, e, message_id).await?;
         Ok(())
     }
 

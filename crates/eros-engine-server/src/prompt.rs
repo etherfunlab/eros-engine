@@ -800,7 +800,8 @@ fn tip_value_noun(amount_usd: f64) -> &'static str {
 /// the user wants to do, since the persona may not let it happen. A give's
 /// user-supplied name is quoted with 「」 so it reads as data. So is a gift's
 /// name; a gift reads the same whichever list it joins. `custom` is the
-/// user's own text, unquoted: it feeds only the user-role history marker.
+/// user's own text, unquoted, and so is a `custom_together`'s after its
+/// 「想和你一起：」: both feed only the user-role history marker.
 pub(crate) fn action_phrase(a: &UserAction) -> String {
     match a {
         UserAction::Give {
@@ -854,6 +855,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::SingTogether => "想和你一起唱歌".into(),
         UserAction::SkinnyDipTogether => "想和你一起裸泳".into(),
         UserAction::CommitCrimeTogether => "想和你一起去犯罪".into(),
+        UserAction::CustomTogether { text } => format!("想和你一起：{text}"),
         UserAction::Challenge => "向你发起挑战".into(),
         UserAction::Bet => "想和你打个赌".into(),
         UserAction::Custom { text } => text.clone(),
@@ -870,11 +872,13 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
 /// The action as the judge's `[用户动作]` line and `[user_action]` state it:
 /// 「对方凑过来想亲你」. `custom` reads 「对方的动作：「{text}」」, because the
 /// user's text is not guaranteed to read as a verb phrase; it is quoted with 「」
-/// so it reads as data. A tip adds how much it feels like to the persona; the
-/// amount itself never appears.
+/// so it reads as data. `custom_together` reads
+/// 「对方想和你一起做一件事：「{text}」」 for the same reason. A tip adds how
+/// much it feels like to the persona; the amount itself never appears.
 pub(crate) fn action_subject(a: &UserAction) -> String {
     match a {
         UserAction::Custom { text } => format!("对方的动作：「{text}」"),
+        UserAction::CustomTogether { text } => format!("对方想和你一起做一件事：「{text}」"),
         UserAction::Tip { amount_usd } => format!(
             "对方{}，对你来说算「{}」的一笔",
             action_phrase(a),
@@ -1195,6 +1199,7 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         SingingTogether => "和对方一起唱歌",
         SkinnyDippingTogether => "和对方一起裸泳",
         CommittingCrimeTogether => "和对方一起犯罪",
+        CustomTogether => "和对方一起做一件事",
     }
 }
 
@@ -7228,6 +7233,31 @@ mod tests {
             assert_eq!(action_marker(&a), format!("（{marker}）"), "{a:?}");
             assert_eq!(event_label(a.together_kind().unwrap()), label, "{a:?}");
         }
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.1: the user's words stay unquoted in the
+    /// history marker and are quoted with 「」 on the judge's line.
+    #[test]
+    fn custom_together_marker_and_judge_line() {
+        let a = UserAction::CustomTogether {
+            text: "去海边放烟花".into(),
+        };
+        assert_eq!(action_phrase(&a), "想和你一起：去海边放烟花");
+        assert_eq!(action_marker(&a), "（想和你一起：去海边放烟花）");
+        assert_eq!(
+            action_subject(&a),
+            "对方想和你一起做一件事：「去海边放烟花」"
+        );
+        assert_eq!(
+            action_outcome(&a, ActionResponse::Refuse),
+            "对方想和你一起做一件事：「去海边放烟花」，你没有接受。"
+        );
+        // Until the next task prints the text, the event reads as a fallback.
+        assert_eq!(
+            event_label(a.together_kind().unwrap()),
+            "和对方一起做一件事"
+        );
     }
 
     /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-

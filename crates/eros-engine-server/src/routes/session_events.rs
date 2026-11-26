@@ -55,9 +55,11 @@ const MAX_EVENT_KEY_CHARS: usize = 128;
 /// `hot_spring_together`, `fighting_together`, `working_out_together`,
 /// `swimming_together`, `cycling_together`, `hiking_together`,
 /// `dancing_together`, `adventuring_together`, `playing_with_fire_together`,
-/// `singing_together`, `skinny_dipping_together` and
-/// `committing_crime_together` are placed by the engine, never drawn: they
-/// appear in responses only, and a `kinds` filter that lists one is rejected.
+/// `singing_together`, `skinny_dipping_together`,
+/// `committing_crime_together` and `custom_together` are placed by the
+/// engine, never drawn: they appear in responses only, and a `kinds` filter
+/// that lists one is rejected. A `custom_together`'s `message_id` is the
+/// user's message that asked, not hers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKindDto {
@@ -162,6 +164,7 @@ pub enum EventKindDto {
     SingingTogether,
     SkinnyDippingTogether,
     CommittingCrimeTogether,
+    CustomTogether,
 }
 
 /// Reads the drawable kinds only: a request names kinds to draw, and the
@@ -284,6 +287,7 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::SingingTogether => EventKind::SingingTogether,
             EventKindDto::SkinnyDippingTogether => EventKind::SkinnyDippingTogether,
             EventKindDto::CommittingCrimeTogether => EventKind::CommittingCrimeTogether,
+            EventKindDto::CustomTogether => EventKind::CustomTogether,
         }
     }
 }
@@ -392,6 +396,7 @@ impl From<EventKind> for EventKindDto {
             EventKind::SingingTogether => EventKindDto::SingingTogether,
             EventKind::SkinnyDippingTogether => EventKindDto::SkinnyDippingTogether,
             EventKind::CommittingCrimeTogether => EventKindDto::CommittingCrimeTogether,
+            EventKind::CustomTogether => EventKindDto::CustomTogether,
         }
     }
 }
@@ -2955,6 +2960,19 @@ mod tests {
                 "{wire}"
             );
         }
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.4.
+    #[test]
+    fn custom_together_is_a_placed_kind_on_the_wire() {
+        let dto = EventKindDto::from(EventKind::CustomTogether);
+        assert_eq!(serde_json::to_value(dto).unwrap(), json!("custom_together"));
+        assert_eq!(EventKind::from(dto), EventKind::CustomTogether);
+        assert!(serde_json::from_value::<DrawEventRequest>(
+            json!({"event_key": "k", "kinds": ["custom_together"]})
+        )
+        .is_err());
     }
 
     #[test]

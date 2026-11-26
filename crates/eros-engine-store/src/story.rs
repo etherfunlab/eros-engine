@@ -396,10 +396,11 @@ impl<'a> StoryRepo<'a> {
     /// belongs to that relationship), a false alarm still under way (she
     /// does not know yet), and every `bathing_together`, `showering_together`,
     /// `having_sex_together`, `streaking_together`, `using_toilet_together`,
-    /// `asleep_together` and `on_a_date`: a romantic choice's or action's
-    /// outcome lives in the conversation only (spec 2026-10-30 §4.7,
-    /// 2026-11-23 §4.3), and a date in its own sub-session. The narration is dropped when its session is archived; the
-    /// event stays, as her own life.
+    /// `asleep_together`, `custom_together` and `on_a_date`: a romantic
+    /// choice's or action's outcome lives in the conversation only (spec
+    /// 2026-10-30 §4.7, 2026-11-23 §4.3), and a date in its own sub-session.
+    /// The narration is dropped when its session is archived; the event
+    /// stays, as her own life.
     pub async fn life_events(
         &self,
         instance_id: Uuid,
@@ -419,7 +420,10 @@ impl<'a> StoryRepo<'a> {
         // Romantic outcomes and the private together kinds stay in the
         // conversation (spec 2026-11-23-twelve-together-actions-and-propose-
         // design.md §4.3; spec 2026-11-26-more-together-actions-bath-outfit-
-        // chemistry-drop-and-custom-together-design.md §4).
+        // chemistry-drop-and-custom-together-design.md §4). So does a
+        // `custom_together`: what it holds is unknown, and its `message_id`
+        // is the user's message, which the join above would read as her
+        // telling (§8.2, §8.3).
         let kept_out: Vec<&str> = [
             EventKind::BathingTogether,
             EventKind::ShoweringTogether,
@@ -429,6 +433,7 @@ impl<'a> StoryRepo<'a> {
             EventKind::SkinnyDippingTogether,
             EventKind::UsingToiletTogether,
             EventKind::AsleepTogether,
+            EventKind::CustomTogether,
         ]
         .into_iter()
         .map(EventKind::as_str)
@@ -1720,6 +1725,57 @@ mod tests {
                 "singing_together",
             ]
         );
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.2: what a `custom_together` holds is
+    /// unknown, and its `message_id` names the user's message, which the
+    /// story would read as her telling.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_keep_custom_together_out(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let user_row: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'user', '', \
+                     '{\"action\":{\"type\":\"custom_together\",\"text\":\"去海边放烟花\"}}') \
+             RETURNING id",
+        )
+        .bind(s)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        seed_event(
+            &pool,
+            inst,
+            Some(s),
+            "custom",
+            EventKind::CustomTogether.as_str(),
+            now - chrono::Duration::minutes(30),
+            now + chrono::Duration::minutes(30),
+            Some(user_row),
+        )
+        .await;
+        seed_event(
+            &pool,
+            inst,
+            Some(s),
+            "sing",
+            EventKind::SingingTogether.as_str(),
+            now - chrono::Duration::hours(3),
+            now - chrono::Duration::hours(2),
+            None,
+        )
+        .await;
+        let got = repo
+            .life_events(inst, now - chrono::Duration::days(7), now, 30)
+            .await
+            .unwrap();
+        let kinds: Vec<EventKind> = got.iter().map(|e| e.event.kind).collect();
+        assert_eq!(kinds, vec![EventKind::SingingTogether]);
     }
 
     /// A date is its own sub-session's affair: it never reaches her story,

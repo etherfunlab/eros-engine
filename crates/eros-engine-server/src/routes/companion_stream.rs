@@ -197,6 +197,7 @@ pub enum UserActionKind {
     SingTogether,
     SkinnyDipTogether,
     CommitCrimeTogether,
+    CustomTogether,
     Challenge,
     Bet,
     Custom,
@@ -382,7 +383,10 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// `commit_crime_together` → `committing_crime_together` (one hour each);
 /// `adventure_together` → `adventuring_together` (two to three hours). A
 /// `skinny_dip_together` to a pair whose scopes are not romance-compatible is
-/// refused.
+/// refused. `custom_together` asks her to do something with the user in the
+/// user's own `text` (required): accepted, it starts a `custom_together`
+/// event (one hour) whose `message_id` is the user's message, and nothing
+/// rules it out before the judge; refused, it costs chemistry.
 /// `propose` asks her to marry the user and starts no event: it
 /// is refused unless the pair is `dating`, `fwb` or `situationship`, and
 /// accepted, the pair is `engaged`. `break_up` ends the relationship and
@@ -412,8 +416,8 @@ pub struct UserActionDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(minimum = 1, maximum = 99)]
     pub quantity: Option<u32>,
-    /// `custom` only, and required there: the action in the user's own
-    /// words, 1–100 chars.
+    /// `custom` and `custom_together` only, and required there: the action
+    /// in the user's own words, 1–100 chars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 100)]
     pub text: Option<String>,
@@ -517,6 +521,10 @@ impl UserActionDto {
             UserActionKind::SingTogether => UserAction::SingTogether,
             UserActionKind::SkinnyDipTogether => UserAction::SkinnyDipTogether,
             UserActionKind::CommitCrimeTogether => UserAction::CommitCrimeTogether,
+            UserActionKind::CustomTogether => UserAction::CustomTogether {
+                text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
+                    .ok_or("action.text is required for custom_together")?,
+            },
             UserActionKind::Challenge => UserAction::Challenge,
             UserActionKind::Bet => UserAction::Bet,
             UserActionKind::Custom => UserAction::Custom {
@@ -5066,6 +5074,45 @@ mod validate_payload_tests {
         );
         c.text = Some("x".repeat(101));
         assert!(c.to_core().is_err());
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §8.1: `text` is validated as `custom`'s is.
+    #[test]
+    fn custom_together_requires_text_within_bounds() {
+        let mut c = bare(UserActionKind::CustomTogether);
+        assert!(c.to_core().is_err(), "custom_together requires text");
+        c.text = Some(String::new());
+        assert!(c.to_core().is_err(), "empty");
+        c.text = Some("   ".into());
+        assert!(c.to_core().is_err(), "blank after trim");
+        c.text = Some("x".repeat(101));
+        assert!(c.to_core().is_err(), "101 chars");
+        c.text = Some("去海边\n放烟花".into());
+        assert!(c.to_core().is_err(), "a line break");
+        c.text = Some("去海边\u{2028}放烟花".into());
+        assert!(c.to_core().is_err(), "a line separator");
+        c.text = Some("x".repeat(100));
+        assert!(c.to_core().is_ok(), "100 chars");
+        c.text = Some("  去海边放烟花 ".into());
+        assert_eq!(
+            c.to_core().unwrap(),
+            UserAction::CustomTogether {
+                text: "去海边放烟花".into()
+            }
+        );
+        // On the wire, and as history reports it.
+        let dto: UserActionDto = serde_json::from_value(
+            serde_json::json!({"type": "custom_together", "text": "去海边放烟花"}),
+        )
+        .unwrap();
+        assert_eq!(dto.kind, UserActionKind::CustomTogether);
+        let view = UserActionView::from_metadata_action(&serde_json::json!(
+            {"type": "custom_together", "text": "去海边放烟花", "response": "accept"}
+        ))
+        .expect("history parses a stored custom_together");
+        assert_eq!(view.response, Some(ActionResponseDto::Accept));
+        assert_eq!(view.action.text.as_deref(), Some("去海边放烟花"));
     }
 
     #[test]
