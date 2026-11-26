@@ -243,12 +243,13 @@ cooldowns and ranges are in `rule`, and the category values in `category_rule`, 
 
 A duration written as a range is drawn uniformly in whole hours when the event starts.
 
-Twenty-five more kinds are never drawn: `taking_space` (说好暂时分开), `fell_out`
+Thirty-two more kinds are never drawn: `taking_space` (说好暂时分开), `fell_out`
 (为分开的事闹得不愉快), `traveling_together` (和对方一起旅行), `bathing_together`
 (和对方一起洗澡), `on_a_date` (和对方约会), `showering_together` (和对方一起淋浴),
-`sauna_together` (和对方一起蒸桑拿) and the eighteen kinds of the other together actions, from
-`using_toilet_together` to `hiking_together`
-([together actions](#showering-bathing-and-the-sauna-together)). The first two belong to the
+`sauna_together` (和对方一起蒸桑拿), the twenty-four kinds of the other together actions, from
+`using_toilet_together` to `committing_crime_together`
+([together actions](#showering-bathing-and-the-sauna-together)), and `custom_together`
+(和对方一起做一件事, [below](#together-in-the-users-own-words)). The first two belong to the
 retired ask for space: the engine no longer writes them, and they remain only in stored data
 ([where the choice is stored](#where-the-choice-is-stored)). They are
 `mid` incidents by shape, and `taking_space` is the one that outlasts the category's four
@@ -258,14 +259,15 @@ user accepts her suggestion ([going away together](#going-away-together)),
 accepts her ask for a bath, one or the other at even odds ([a bath together](#a-bath-together)),
 or when she accepts the user's `shower_together` or `bath_together`, `sauna_together` a 1-hour
 `short` incident it writes when she accepts the user's `sauna_together`
-([together actions](#showering-bathing-and-the-sauna-together)), the eighteen others the incidents
+([together actions](#showering-bathing-and-the-sauna-together)), the twenty-four others the incidents
 it writes when she accepts the user's other together actions, all `short` but the `mid`
-`asleep_together`, `fighting_together` and `hiking_together` (`having_sex_together` and
+`asleep_together`, `fighting_together`, `hiking_together` and `adventuring_together` (`having_sex_together` and
 `asleep_together` are also written when the user accepts her `sleep_together` or `fall_asleep_together`,
-[the romantic choices](#the-romantic-choices)), and `on_a_date` a `short`
+[the romantic choices](#the-romantic-choices)), `custom_together` a 1-hour `short` incident it
+writes when she accepts the user's `custom_together`, and `on_a_date` a `short`
 incident of 1 or 4 hours it writes when she accepts the user's date invitation
 ([activities.md](activities.md#the-event)).
-None of the twenty-five has a draw rule, and the caller's `kinds` rejects them.
+None of the thirty-two has a draw rule, and the caller's `kinds` rejects them.
 
 ### The draw
 
@@ -530,14 +532,14 @@ In the object, `allow` absent or `null` allows every kind and `[]` none; `disall
 kinds out without freezing the rest, so a kind the engine adds later is drawn too. An unknown
 key in the object or an unknown kind anywhere rejects the request, so a misspelt `disallow`
 cannot quietly serve a kind it meant to exclude; a caller lists a new kind only once the
-engine knows it. `taking_space`, `fell_out`, `traveling_together`, `bathing_together`, `on_a_date`, `showering_together`, `sauna_together` and the eighteen kinds of the other together actions are never drawn, so naming one anywhere in
+engine knows it. `taking_space`, `fell_out`, `traveling_together`, `bathing_together`, `on_a_date`, `showering_together`, `sauna_together`, the twenty-four kinds of the other together actions and `custom_together` are never drawn, so naming one anywhere in
 `kinds` is rejected the same way.
 
 Seven kinds carry adult themes: `sudden_desire`, `strip`, `streaking`, `having_sex`, `just_have_sex`, `masturbating`, and `pregnancy_scare`, which implies sex. The
 engine keeps no group of them; a caller that serves them only to some users lists them under
-`disallow`. `having_sex_together` and `streaking_together` carry them too, but no draw yields
-them: only an accepted `sex_together` or `streak_together` does, so such a caller does not send
-those actions. `scolded_by_superior` and `scolded_superior` assume someone above her, read in her
+`disallow`. `having_sex_together`, `streaking_together` and `skinny_dipping_together` carry them
+too, but no draw yields them: only an accepted `sex_together`, `streak_together` or
+`skinny_dip_together` does, so such a caller does not send those actions. `scolded_by_superior` and `scolded_superior` assume someone above her, read in her
 world as a boss, a manager, a master or a sovereign; a persona with no one above her is a
 case for `disallow` too.
 
@@ -650,7 +652,9 @@ on, the story and world directors read them too ([Beyond the chat](#beyond-the-c
   When the chat request carries a `user_gender` of `male` or `female` and a kind the section
   names is one she shares with the user (`traveling_together`, `on_a_date` or any `…_together`
   kind, the one an accepted together action places this turn included), a `[对方]` section after
-  it gives the user's gender, so a picture that shows the user draws them as it.
+  it gives the user's gender, so a picture that shows the user draws them as it. While the
+  foreground is `hot_spring_together` or `sauna_together`, the engine also writes the composer's
+  `[此刻穿着]` itself ([what she wears in the water](#what-she-wears-in-the-water)).
 - **The caller** gets them from `GET …/effects`: `event` is the incident under way,
   `background_event` the background, and `cycle_event` her period or a late period. An offline
   kind under way is reported as `event` like any incident, with `"offline": true`; how a client
@@ -887,8 +891,8 @@ Her period reads `月经中`; a late period under way is its label alone, `月�
 - `irritable` and `unwell` weigh 3 times while it lasts and for 48 hours after
   ([follow-on factors](#follow-on-factors));
 - an incident drawn during it is told from inside it ([how she tells it](#how-she-tells-it));
-- the user's `sex_together`, `bath_together`, `hot_spring_together`, `sauna_together` and
-  `swim_together` are refused two times in three before the judge, at no cost
+- the user's `sex_together`, `bath_together`, `hot_spring_together`, `sauna_together`,
+  `swim_together` and `skinny_dip_together` are refused two times in three before the judge, at no cost
   ([together actions](#showering-bathing-and-the-sauna-together));
 - she does not ask `sleep_together` or `bathe_together`
   ([the romantic choices](#the-romantic-choices), [a bath together](#a-bath-together)).
@@ -992,22 +996,25 @@ see. Her clothing in the message is 刚把衣服脱了, or 刚把「{outfit}」�
 
 The user can ask to take a shower, a bath or a sauna with her: the `shower_together`,
 `bath_together` and `sauna_together` actions, none of which carries a field
-([the send route](api-reference.md#post-compchatsession_idmessagestream)). Eighteen more together
-actions, also without a field, ask her to do something else with the user (the table below). The
-judge decides, as for any action. Before it, a shower, a bath, a `sex_together` or a
-`streak_together` is ruled out for a pair whose `affinity_scope` is not romance-compatible, as
+([the send route](api-reference.md#post-compchatsession_idmessagestream)). Twenty-four more
+together actions, also without a field, ask her to do something else with the user (the table
+below), and `custom_together` asks her to do something the user puts in words
+([below](#together-in-the-users-own-words)). The
+judge decides, as for any action. Before it, a shower, a bath, a `sex_together`, a
+`streak_together` or a `skinny_dip_together` is ruled out for a pair whose `affinity_scope` is not romance-compatible, as
 `strip` is, a `toilet_together` for a machine persona ([persona settings](#persona-settings)),
 and an action whose event does not fit her world ([her world](#her-world)): a `fight_together`
 for a persona that is not `fantasy`, a `cycle_together` for one that is. She refuses whatever
 the judge answers, with or without the LLM judge. The other together actions
 have no such rule; `smoke_together`, `smoke_weed_together` and `drink_together` take the habit
-roll (below). A refusal places nothing and drops the chemistry line a tier, but an action her
+roll (below). A refusal places nothing and drops the chemistry line a tier, except a refused
+`commit_crime_together`, which drops the bond line; an action her
 world rules out, or one her period refuses (below), drops no line; her own
 `bathe_together` ask ([a bath together](#a-bath-together)) and its cooldown neither read these
 actions nor are read by them.
 
 During her period ([her cycle](#her-cycle)), a `sex_together`, `bath_together`,
-`hot_spring_together`, `sauna_together` or `swim_together` that the rules above have not
+`hot_spring_together`, `sauna_together`, `swim_together` or `skinny_dip_together` that the rules above have not
 refused is rolled before the judge. Two times in three she refuses, whatever the judge answers
 and with or without the LLM judge: the judge's `[用户动作]` line ends with `，这次你不会答应`,
 and the refusal places nothing and drops no line. The other third goes to the judge as on any
@@ -1038,17 +1045,35 @@ An accepted one puts her in an event, written in the same transaction as the sto
 | `swim_together` | `swimming_together` | 和对方一起游泳 | 1 h |
 | `cycle_together` | `cycling_together` | 和对方一起骑单车 | 1 h |
 | `hike_together` | `hiking_together` | 和对方一起爬山 | 2–3 h |
+| `dance_together` | `dancing_together` | 和对方一起跳舞 | 1 h |
+| `adventure_together` | `adventuring_together` | 和对方一起冒险 | 2–3 h |
+| `play_with_fire_together` | `playing_with_fire_together` | 和对方一起玩火 | 1 h |
+| `sing_together` | `singing_together` | 和对方一起唱歌 | 1 h |
+| `skinny_dip_together` | `skinny_dipping_together` | 和对方一起裸泳 | 1 h |
+| `commit_crime_together` | `committing_crime_together` | 和对方一起犯罪 | 1 h |
 
-Each is a `short` incident but `asleep_together`, `fighting_together` and `hiking_together`,
-`mid` ones whose length is drawn in whole hours. Starting it ends an incident under way and leaves a background going, as the bath she asks for
+Each is a `short` incident but `asleep_together`, `fighting_together`, `hiking_together` and
+`adventuring_together`, `mid` ones whose length is drawn in whole hours. Starting it ends an incident under way and leaves a background going, as the bath she asks for
 does. The event is keyed on the user's message, so a re-driven turn places it once. While a date
 of hers is on, nothing is placed: the date's `on_a_date` stays as it is and the date goes on.
 She does not tell the event, since her reply to the action already does; none is offline, so she
-still answers during `asleep_together`, and none of the twenty-one is drawn. While it lasts it is the
+still answers during `asleep_together`, and none of the twenty-seven is drawn. While it lasts it is the
 incident under way, so `正在经历`, the judge and the picture composer read it like any incident.
 `showering_together`, `bathing_together`, `having_sex_together`, `streaking_together`,
-`using_toilet_together` and `asleep_together` stay out of the story director's events, as the
-outcome of her sleep ask does; the other fifteen reach it.
+`skinny_dipping_together`, `using_toilet_together` and `asleep_together` stay out of the story
+director's events, as the outcome of her sleep ask does; the other twenty reach it.
+
+`dance_together`, `adventure_together`, `play_with_fire_together`, `sing_together`,
+`skinny_dip_together` and `commit_crime_together` ask her to dance, go adventuring, play with
+fire, sing, swim naked or commit a crime with the user. Each behaves as `jog_together` does: no
+romance gate except for `skinny_dip_together`, no world rule, no period roll except for
+`skinny_dip_together`. `play_with_fire_together` is literal fire: a campfire, torches, sparklers.
+`commit_crime_together` names no crime: what the pair does, the user says in the turn's text,
+and nothing follows from the event (no `police_encounter`, no other kind); a refusal drops bond,
+not chemistry. `skinny_dip_together` is ruled out before the judge for a pair that is not
+romance-compatible, as `streak_together` is, and that refusal drops chemistry; it is rolled
+during her period as `swim_together` is; and her reply to it is `emotional` (below). Its event
+is one of the five a chemistry drop ends ([below](#when-chemistry-falls-the-intimate-event-ends)).
 
 `smoke_together`, `smoke_weed_together` and `drink_together` have her take one `cigarette`,
 `herb` or `alcohol`, and count as a give of it for three things only: the habit roll
@@ -1071,8 +1096,76 @@ deployment has the composer, like an accepted `photo`, `strip` or `ask_dancing`:
 one `image_request`. The composer is told the event as her state, so the picture shows it; inside
 a date, where nothing is placed, the action's kind is her state for that turn only. A refused one
 is text. While the deployment has [`tones.emotional`](model-config.md#tones--chat-tones-chat-task-only)
-above 0, the reply to a shower, a bath, a `sex_together` or a `streak_together` is in the
-`emotional` tone, accepted or refused; the other together actions' is not.
+above 0, the reply to a shower, a bath, a `sex_together`, a `streak_together` or a
+`skinny_dip_together` is in the `emotional` tone, accepted or refused; the other together
+actions' is not.
+
+### Together, in the user's own words
+
+`custom_together` carries a `text`, 1 to 100 characters, validated as `custom`'s is
+([the send route](api-reference.md#post-compchatsession_idmessagestream)). It asks her to do
+that with the user. Nothing rules it out before the judge: no romance gate, no world rule and no
+period roll. A refusal drops chemistry, and her reply is not `emotional`. The text reaches the
+judge quoted, as `[用户动作] 对方想和你一起做一件事：「{text}」`, and stays unquoted in the user-role
+history marker, `（想和你一起：{text}）`, as `custom`'s does.
+
+Accepted, it places `custom_together` (`short`, 1 h, both worlds, never told, not offline) as
+every together action's event is placed: in the write that stores the answer, ending an incident
+under way, and none inside a date. The accepted turn is a picture turn like the others. The row's
+`message_id` is the user's message that asked, where a told event's is hers, and the words live
+there: the engine reads them from that row's `metadata.action.text` and stores them nowhere
+else. Wherever the event's label is printed (`正在经历`, `[近期事件]`, `[此刻状态]`) it reads
+和对方一起：「{text}」; on the accepted turn, a date's too, the text comes from the action in hand.
+The event view carries it as `text`. Once the message is gone, `text` is `null` and the label reads
+和对方一起做一件事. The kind stays out of the story director's events: what it holds is unknown,
+and its `message_id` is not her telling. It is neither one of the kinds a chemistry drop ends nor
+one that holds her asks back.
+
+### What she wears in the water
+
+While the foreground of a picture is `hot_spring_together` or `sauna_together`, the engine writes
+the composer's `[此刻穿着]` itself, over the judge's `clothing` and a named `outfit`:
+
+| the pair | `[此刻穿着]` |
+|---|---|
+| romance-compatible | 什么都没穿 |
+| not romance-compatible | 身上只裹着一条浴巾 |
+
+- **Romance-compatible** is the test `strip` uses: a chemistry axis in the scopes. A picture reads
+  its request's own: the turn's `affinity_scope`, a group speaker's `member_scopes`, an event
+  request's `affinity_scope`. A request that names none reads as not compatible.
+- **Which pictures.** Every picture the chat pipeline draws while either kind is under way:
+  the accepted turn's own (the kind being placed counts as under way), any later picture while
+  the event lasts, and the accepted turn's picture inside a date, where the kind is her state for
+  that turn only.
+- **Only the composer's slot.** Her reply's clothing line, the judge's `clothing` and her
+  wardrobe are not touched, and the composer's audit row carries the clothing as sent in
+  `inputs.clothing`. No other kind is covered: `showering_together`, `bathing_together` and her own `showering` and
+  `bathing` read as "the state wins".
+
+### When chemistry falls, the intimate event ends
+
+`showering_together`, `bathing_together`, `having_sex_together`, `streaking_together` and
+`skinny_dipping_together` end when the pair's chemistry tier falls from something the user did
+after the event started. The rule reads the kind, not who asked: a row her own accepted
+`bathe_together` or `sleep_together` ask placed ends the same way.
+
+- **What counts.** A chat turn's affinity write, when the turn's user message was sent after the
+  event started: a refused action's tier drop is the common case, and a graded turn that carries
+  chemistry across a tier edge counts the same. The drop of an ask of hers that the user
+  declined, when the answer came after the event started.
+- **What does not.** A tier that time decay alone carried down; the turn that placed the event,
+  and an earlier turn whose write lands late; a turn inside a date and a date's settlement; a drop on the bond line; a
+  refusal her world or her period ruled, which drops nothing. Another together event, a walk or
+  a hike, is not ended this way.
+- **The effect.** The foreground event of one of these kinds under way ends there: its
+  `ends_at` becomes the time of the write. A background and a cycle row keep running. Nothing is
+  told and no message is written; from the next turn on her state block and her pictures no
+  longer carry the event. The ending runs in a write of its own after the affinity write commits,
+  so a crash between the two leaves the event to run to its stored end.
+
+A client that scheduled anything on such an event's `ends_at` re-reads events after a turn
+([`GET …/effects`](api-reference.md#get-v2compsessionsession_ideffects)).
 
 ### Small things in her day
 
@@ -1231,7 +1324,8 @@ offline kind or a date is under way.
 - `engine.persona_events` holds one row per event: `instance_id` (cascades with the instance),
   `session_id` (where it was drawn and told; set to NULL if the session goes), `event_key`
   (unique within the session), `kind`, `started_at`, `ends_at` and `message_id` (the message
-  that tells it; NULL for an offline kind she does not announce, and set to NULL if the message goes). Category and
+  that tells it, or on a `custom_together` the user's message that asked; NULL for an offline kind
+  she does not announce, and set to NULL if the message goes). Category and
   background-ness derive from the kind and are not stored. A row whose kind the build does not
   know is skipped on read. Her periods after the first have no row
   ([her cycle](#her-cycle)); a partial index, `persona_events_cycle_idx`, finds an instance's
@@ -1251,8 +1345,8 @@ instance's events directly, each with its label, a relative time and the message
 in, plus the background under way, the pair's relationship status and cold war, and its
 `confess`, `partner_up`, `propose` and `break_up` choices (and stored `ask_for_space` ones) with
 their outcome. It takes them as settled fact. A bath together, a shower together, a date, and
-`having_sex_together`, `streaking_together`, `using_toilet_together` and `asleep_together` are
-left out: like the outcome of her sleep, bath and trip asks, they live in the conversation only. The messages she sends on her own are not part of its chat evidence, so
+`having_sex_together`, `streaking_together`, `skinny_dipping_together`, `using_toilet_together`,
+`asleep_together` and `custom_together` are left out: like the outcome of her sleep, bath and trip asks, they live in the conversation only. The messages she sends on her own are not part of its chat evidence, so
 an event is never read as her answer to an unrelated line. The World Memories director reads a
 background under way for every persona in the roster, stories or not, so a persona in hospital
 is not scripted into a party. Both read event rows only: they hear of her first period, as of
@@ -1560,7 +1654,10 @@ decline or an ignore; a lapse is not. The turn that starts a cold war moves the 
 both qualify on one turn, `propose` fires. While her period is under way
 ([her cycle](#her-cycle)) she does not ask `sleep_together`, nor `fall_asleep_together` in its
 place; the ask waits for a turn after her period. `propose`, and `fall_asleep_together` where
-the status calls for it, are asked as on any day.
+the status calls for it, are asked as on any day. The same holds while the pair is in the water
+or in bed, a foreground `bathing_together`, `showering_together`, `hot_spring_together`,
+`sauna_together` or `having_sex_together` under way: she does not ask `sleep_together`, and the
+ask waits for a judged turn after the event ends.
 
 The four status kinds can be asked again whenever their status, wait and streak allow, so after a
 break-up the pair can go round again. Her sleep ask is once only, each kind on its own: a kind the
@@ -1666,7 +1763,12 @@ right session, and never while a cold war is on. It needs all of:
 - at least 3 of the newest 7 judged turns with `warmth` 0.5 or more, read from the turn's
   `state_after`. Patience is not read, and 0.5 is a rule threshold the engine owns, not a judge
   band. As for every choice, only judged turns after the session's streak anchor count;
-- her period not under way ([her cycle](#her-cycle)).
+- her period not under way ([her cycle](#her-cycle));
+- none of `bathing_together`, `showering_together`, `hot_spring_together`, `sauna_together` or
+  `having_sex_together` under way as the foreground.
+
+Held back for either reason, the ask only waits: nothing is settled and no cooldown starts, so
+the next judged turn that qualifies may ask. An ask already pending when the event starts stands.
 
 An accepted or ignored `bathe_together` holds the next ask back for 7 days from its answer;
 after a decline or a lapse she asks again on the next turn that qualifies.

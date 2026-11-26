@@ -261,8 +261,8 @@ roll can refuse whatever the judge says
 
 - **Accepted:** nothing special. The affinity judge sees the action in the
   user text and grades the turn as usual.
-- **Refused:** the line the action touches (`give` and `gift` → Bond, every physical
-  action → Chemistry) drops one tier, landing at the same relative position
+- **Refused:** the line the action touches (`give`, `gift` and `commit_crime_together` → Bond,
+  every physical action → Chemistry) drops one tier, landing at the same relative position
   inside the lower tier; a tier-1 line goes to `0`. Both axes of the line are
   scaled by the same factor, so their ratio is kept. The drop is computed from
   the pre-turn snapshot inside the row lock and replaces whatever the judge's
@@ -277,15 +277,19 @@ roll can refuse whatever the judge says
   drops a line; the turn is graded like any other.
 - **Strip:** a `strip` from a pair whose `affinity_scope` is not romance-compatible is
   refused whatever the judge says, and drops Chemistry like any refused
-  physical action. So is a `shower_together`, `bath_together`, `sex_together` or
-  `streak_together` from such a pair, and a `toilet_together` to a machine persona. A
+  physical action. So is a `shower_together`, `bath_together`, `sex_together`,
+  `streak_together` or `skinny_dip_together` from such a pair, and a `toilet_together` to a machine persona. A
   `fight_together` to a persona whose `setting` is not `fantasy`, and a `cycle_together` to one
   whose `setting` is, are refused the same way and drop no line. The other together actions have no such rule. A `smoke_together`, `smoke_weed_together` or
   `drink_together` the roll refuses drops Chemistry too, not Bond.
 - **Her period:** during her period a `sex_together`, `bath_together`, `hot_spring_together`,
-  `sauna_together` or `swim_together` that the rules above did not refuse is refused before the
+  `sauna_together`, `swim_together` or `skinny_dip_together` that the rules above did not refuse is refused before the
   judge two times in three by a roll ([her cycle](life-events-needs.md#her-cycle)), and drops no
   line; the other third is judged as usual.
+- **An intimate event under way:** a fall of the Chemistry tier from something the user did after
+  it started, a refused action's drop included, ends a `showering_together`, `bathing_together`,
+  `having_sex_together`, `streaking_together` or `skinny_dipping_together` at once
+  ([life-events-needs.md](life-events-needs.md#when-chemistry-falls-the-intimate-event-ends)).
 - **Proposal and break-up:** a refused `propose` or `break_up` drops no line; the turn is
   graded like any other. Before the judge, a `propose` from a status other than `dating`,
   `fwb` or `situationship`, and a `break_up` from a status that is not breakable, are refused

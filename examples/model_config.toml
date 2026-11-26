@@ -173,8 +173,9 @@ model_name_display_override = true
 #   third when false), times 3 when she is craving or wants to be cared
 #   about, times 2 when the pair is romantically compatible, capped at 1;
 # - a reply to french_kiss, tease, hug_from_behind, touch, strip,
-#   shower_together, bath_together, sex_together, streak_together, propose,
-#   break_up, threaten or tip, accepted or refused, and
+#   shower_together, bath_together, sex_together, streak_together,
+#   skinny_dip_together, propose, break_up, threaten or tip, accepted or
+#   refused, and
 #   the start message of sixteen life-event kinds, are ALWAYS emotional,
 #   whatever the value (see docs/model-config.md, "tones").
 # An emotional reply is written without the chat history, the user profile or
@@ -368,7 +369,9 @@ model_name_display_override = true
 # While an event is live, one more labeled section ([此刻状态]) says what she is
 # doing (the background, then the incident, joined by "；"); a custom prompt
 # should show it, and let it win over [此刻穿着] where the two disagree. The
-# section is absent when nothing is live.
+# section is absent when nothing is live. While the state is a hot spring or a
+# sauna together, the engine writes [此刻穿着] itself (什么都没穿 for a
+# romance-compatible pair, 身上只裹着一条浴巾 otherwise).
 # When the chat request carries user_gender and an event she shares with the
 # user is live, one more labeled section ([对方]) gives the partner's gender
 # (男性 / 女性). A custom prompt should say the partner is drawn as that gender.
