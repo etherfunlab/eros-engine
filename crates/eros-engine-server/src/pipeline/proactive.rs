@@ -768,13 +768,17 @@ async fn store(
         };
         // The events at the instant the reply prompt read them; the event
         // itself is not stored yet, so the kind it starts counts as live.
-        let current_state = state_for_picture(
+        // What she wears in a hot spring or a sauna reads the request's scopes
+        // (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-
+        // and-custom-together-design.md §5).
+        let shown = state_for_picture(
             &state.pool,
             g.instance_id,
             None,
             g.now.now,
             Some(*kind),
             crate::prompt::persona_traits(&g.persona).cycle_health(),
+            eros_engine_core::scope::romance_compatible(g.affinity_scope),
         )
         .await;
         let img = build_delegated_image_prompt_for(
@@ -787,10 +791,11 @@ async fn store(
             g.user_id,
             g.session_id,
             body_state.as_deref(),
-            current_state.as_deref(),
+            shown.state.as_deref(),
             None,
             None,
             "event",
+            shown.clothing_override,
         )
         .await;
         metadata.insert(

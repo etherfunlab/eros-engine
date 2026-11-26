@@ -1599,6 +1599,23 @@ pub(crate) fn stripped_clothing(outfit: Option<&str>) -> String {
     }
 }
 
+/// What the composer's `[此刻穿着]` says when the foreground of a picture is
+/// a hot spring or a sauna with the user, over the judge's clothing and a
+/// named outfit (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-
+/// drop-and-custom-together-design.md §5): nothing on for a romance-compatible
+/// pair, a towel otherwise. `None` for any other foreground.
+pub(crate) fn water_clothing(
+    foreground: Option<eros_engine_core::events::EventKind>,
+    romance_compatible: bool,
+) -> Option<&'static str> {
+    use eros_engine_core::events::EventKind::{HotSpringTogether, SaunaTogether};
+    match foreground? {
+        HotSpringTogether | SaunaTogether if romance_compatible => Some("什么都没穿"),
+        HotSpringTogether | SaunaTogether => Some("身上只裹着一条浴巾"),
+        _ => None,
+    }
+}
+
 /// Her clothing on a `strip` event (spec 2026-11-08-strip-and-world-setting-
 /// design.md §3): 「刚把衣服脱了」, or 「刚把「{outfit}」脱了」.
 pub(crate) fn undressed_clothing(outfit: Option<&str>) -> String {
@@ -5664,6 +5681,26 @@ mod tests {
             event_when_text(now - h(5), now - h(5) + m(40), now),
             "5 小时前开始，持续不到 1 小时"
         );
+    }
+
+    /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
+    /// custom-together-design.md §5.
+    #[test]
+    fn water_clothing_by_kind_and_pair() {
+        use eros_engine_core::events::EventKind::*;
+        for k in [HotSpringTogether, SaunaTogether] {
+            assert_eq!(water_clothing(Some(k), true), Some("什么都没穿"));
+            assert_eq!(water_clothing(Some(k), false), Some("身上只裹着一条浴巾"));
+        }
+        for k in [
+            BathingTogether,
+            ShoweringTogether,
+            Bathing,
+            SwimmingTogether,
+        ] {
+            assert_eq!(water_clothing(Some(k), true), None);
+        }
+        assert_eq!(water_clothing(None, true), None);
     }
 
     #[test]
