@@ -194,7 +194,10 @@ pub enum UserAction {
     /// The user asks her to work out, swim, cycle or hike with them (spec
     /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-
     /// design.md §6): each behaves as `jog_together` does. `cycle_together`
-    /// is refused, and costs nothing, to a `fantasy` persona.
+    /// is refused, and costs nothing, to a `fantasy` persona. A refused
+    /// `cycle_together` or `hike_together` drops bond, as a refused
+    /// `jog_together` or `ride_horse_together` does (spec 2026-11-27-swim-
+    /// outfit-ladder-and-fish-together-design.md §7).
     WorkoutTogether,
     SwimTogether,
     CycleTogether,
@@ -412,9 +415,17 @@ impl UserAction {
     /// proposal, a break-up, a challenge or a bet.
     pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
-            UserAction::Give { .. } | UserAction::Gift { .. } | UserAction::CommitCrimeTogether => {
-                Some(AffinityLine::Bond)
-            }
+            // A refused jog, hike, fishing trip, bike ride or horse ride may
+            // only mean she does not care for the outdoors (spec 2026-11-27-
+            // swim-outfit-ladder-and-fish-together-design.md §7).
+            UserAction::Give { .. }
+            | UserAction::Gift { .. }
+            | UserAction::CommitCrimeTogether
+            | UserAction::JogTogether
+            | UserAction::HikeTogether
+            | UserAction::FishTogether
+            | UserAction::CycleTogether
+            | UserAction::RideHorseTogether => Some(AffinityLine::Bond),
             UserAction::Tip { .. }
             | UserAction::Bluff
             | UserAction::Threaten
@@ -823,7 +834,13 @@ mod tests {
             assert_eq!(serde_json::to_value(&a).unwrap(), v);
             assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
             assert_eq!(a.together_kind(), Some(kind), "{a:?}");
-            assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
+            // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7.
+            let line = if matches!(a, UserAction::JogTogether | UserAction::RideHorseTogether) {
+                AffinityLine::Bond
+            } else {
+                AffinityLine::Chemistry
+            };
+            assert_eq!(a.refusal_line(), Some(line), "{a:?}");
         }
         for a in [
             UserAction::Kiss,
@@ -945,7 +962,13 @@ mod tests {
             assert_eq!(serde_json::to_value(&a).unwrap(), v);
             assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
             assert_eq!(a.together_kind(), Some(kind), "{a:?}");
-            assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
+            // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7.
+            let line = if matches!(a, UserAction::CycleTogether | UserAction::HikeTogether) {
+                AffinityLine::Bond
+            } else {
+                AffinityLine::Chemistry
+            };
+            assert_eq!(a.refusal_line(), Some(line), "{a:?}");
             assert!(!a.speaks_emotionally(), "{a:?}");
             assert_eq!(a.consumed(), None, "{a:?}");
             assert_eq!(a.status_ask(), None, "{a:?}");
@@ -1039,6 +1062,34 @@ mod tests {
             UserAction::SingTogether.refusal_line(),
             Some(AffinityLine::Chemistry)
         );
+    }
+
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7: she
+    /// may simply not care for the outdoors.
+    #[test]
+    fn outdoor_together_refusals_drop_bond() {
+        for a in [
+            UserAction::JogTogether,
+            UserAction::HikeTogether,
+            UserAction::FishTogether,
+            UserAction::CycleTogether,
+            UserAction::RideHorseTogether,
+        ] {
+            assert_eq!(a.refusal_line(), Some(AffinityLine::Bond), "{a:?}");
+        }
+        for a in [
+            UserAction::AdventureTogether,
+            UserAction::WalkTogether,
+            UserAction::SwimTogether,
+            UserAction::WorkoutTogether,
+            UserAction::YogaTogether,
+            UserAction::StargazeTogether,
+            UserAction::DanceTogether,
+            UserAction::SingTogether,
+            UserAction::RideHorseNakedTogether,
+        ] {
+            assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
+        }
     }
 
     /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6.1.

@@ -2923,14 +2923,15 @@ mod tests {
         };
         let cycle = event(UserAction::CycleTogether);
         assert_eq!(tier_drop_for(&cycle, &refused, Setting::Fantasy), None);
+        // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7.
         assert_eq!(
             tier_drop_for(&cycle, &refused, Setting::Modern),
-            Some(AffinityLine::Chemistry)
+            Some(AffinityLine::Bond)
         );
         let hike = event(UserAction::HikeTogether);
         assert_eq!(
             tier_drop_for(&hike, &refused, Setting::Fantasy),
-            Some(AffinityLine::Chemistry)
+            Some(AffinityLine::Bond)
         );
     }
 
