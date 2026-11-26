@@ -2,8 +2,8 @@
 
 - **Date:** 2026-11-27
 - **Status:** Approved
-- **Type:** Engine change. No migration. Additive wire change: one new action
-  type and one new event kind (placed, never drawn). Two behaviour changes:
+- **Type:** Engine change. No migration. Additive wire change: two new action
+  types and two new event kinds (placed, never drawn). Two behaviour changes:
   the composer's `[此刻穿着]` is written by the engine while she swims or
   skinny-dips with the user; refusing five outdoor together actions drops
   bond instead of chemistry.
@@ -27,7 +27,8 @@ Four changes:
    ladder, instead of whatever the composer picks.
 2. A picture drawn while she skinny-dips with the user shows her with
    nothing on.
-3. The user can ask her to go fishing together.
+3. The user can ask her to go fishing together, or to ride a horse naked
+   together.
 4. Turning down a jog, a hike, a fishing trip, a bike ride or a horse ride
    costs bond, not chemistry: she may simply not care for the outdoors,
    which says nothing about how she feels about the user.
@@ -35,8 +36,9 @@ Four changes:
 ## 2. Goals, non-goals, anti-goals
 
 **Goals.** The clothing table of §4 for `swimming_together`; the fixed
-clothing of §5 for `skinny_dipping_together`; the action and kind of §6;
-the refusal line of §7.
+clothing of §5 for `skinny_dipping_together` and
+`naked_horse_riding_together`; the actions and kinds of §6; the refusal
+line of §7.
 
 **Non-goals.** Swimwear per persona or per deployment (no config key, no
 card field); a virginity variant for a male persona; any change to the hot
@@ -123,20 +125,24 @@ tiers 1–3 only; the virgin wording with the drain flap and without
 - Garment names go into the slot in English, verbatim; the naked line
   reuses the hot spring's 什么都没穿. *(Engine's call.)*
 
-## 5. What she wears skinny-dipping
+## 5. What she wears skinny-dipping or riding naked
 
-When the `[此刻状态]` of a picture names `skinny_dipping_together`, the
-engine writes 什么都没穿 into `[此刻穿着]`, for any gender and either way
-on romance compatibility (the action is ruled out before the judge for a
-pair that is not compatible, so the event only starts for one that is).
-Which pictures, and "only the composer's slot", as in §4. *(Owner's
-ruling.)*
+When the `[此刻状态]` of a picture names `skinny_dipping_together` or
+`naked_horse_riding_together`, the engine writes 什么都没穿 into
+`[此刻穿着]`, for any gender and either way on romance compatibility (both
+actions are ruled out before the judge for a pair that is not compatible,
+so the events only start for one that is). Which pictures, and "only the
+composer's slot", as in §4. *(Owner's ruling for skinny-dipping; the
+naked ride follows it, engine's call.)*
 
-## 6. `fish_together`
+## 6. `fish_together` and `ride_horse_naked_together`
 
 | action `type` | marker | places | label | category | lasts | fits |
 |---|---|---|---|---|---|---|
 | `fish_together` | 想和你一起钓鱼 | `fishing_together` | 和对方一起钓鱼 | `mid` | 2–3 h | both |
+| `ride_horse_naked_together` | 想和你一起裸体骑马 | `naked_horse_riding_together` | 和对方一起裸体骑马 | `short` | 1 h | both |
+
+### 6.1 `fish_together`
 
 It behaves as `hike_together` and `adventure_together` do: no payload; the
 judge decides; an accept places the kind in the write that stores the
@@ -151,6 +157,32 @@ other outings do. No clothing rule.
 *(Owner's rulings: the action, `mid` 2–3 hours, and the bond refusal.
 Engine's calls: the marker, the label, both worlds, and every other rule
 that follows `hike_together`.)*
+
+### 6.2 `ride_horse_naked_together`
+
+It behaves as `skinny_dip_together` does, except for the period roll:
+
+- ruled out before the judge when the turn's scopes are not
+  romance-compatible (`UserAction::romance_gated`); that refusal drops
+  chemistry;
+- a refusal by the judge drops chemistry, not bond: what she turns down is
+  being naked with the user, not the outdoors;
+- answered in the `emotional` tone when the deployment has it on, accepted
+  or refused;
+- no period roll, as `streak_together` has none;
+- `naked_horse_riding_together` joins `EventKind::ENDS_ON_CHEMISTRY_DROP`
+  (the kinds the romance-gated actions place) and not
+  `HOLDS_BACK_INTIMATE_ASKS`;
+- it stays out of the story director's `life_events`, as
+  `streaking_together` and `skinny_dipping_together` do;
+- otherwise as §6.1's common rules: no payload, an accept places the kind
+  and ends the incident under way (no event inside a date), a picture turn,
+  `SPECIAL`, `Neutral` place, never told, not offline, shared.
+
+*(Owner's rulings: the action, the chemistry refusal, no period roll.
+Engine's calls: the names, the marker and label (spelled out as 裸体骑马 so
+a model reads it plainly), `short` 1 hour, both worlds, the gate, the
+emotional tone, the two kind lists and the story director.)*
 
 ## 7. Refusals that drop bond
 
@@ -183,6 +215,12 @@ chemistry drop does.
 - `fish_together`: the action round-trips on the wire, maps to
   `fishing_together`, is `mid` 2–3 h, `SPECIAL`, shared, fits both worlds,
   and reaches the story director's `life_events`.
+- `ride_horse_naked_together`: round-trips, maps to
+  `naked_horse_riding_together` (`short` 1 h, `SPECIAL`, shared, both
+  worlds); romance-gated, emotional, refusal on chemistry, no period roll;
+  the kind is in `ENDS_ON_CHEMISTRY_DROP`, not in
+  `HOLDS_BACK_INTIMATE_ASKS`, and kept out of `life_events`; an accepted
+  one's picture carries 什么都没穿.
 - `types.rs`: `refusal_line` is `Bond` for the five actions of §7 and
   stays `Chemistry` for the other together actions.
 
@@ -196,9 +234,11 @@ code PR is merged.
 
 ## 10. Migrating notes to write
 
-One new action type, `fish_together`, and one new event kind,
-`fishing_together`, both additive; a client that lists together actions adds
-it. Refusing `jog_together`, `hike_together`, `cycle_together` or
+Two new action types, `fish_together` and `ride_horse_naked_together`, and
+two new event kinds, `fishing_together` and `naked_horse_riding_together`,
+all additive; a client that lists together actions adds them. A
+`ride_horse_naked_together` from a pair that is not romance-compatible is
+refused before the judge, and its event ends on a chemistry drop. Refusing `jog_together`, `hike_together`, `cycle_together` or
 `ride_horse_together` now moves the bond line instead of the chemistry line,
 which a client showing tier changes will see. No migration. These changes
 reach every user the moment the image is deployed; rolling back is
