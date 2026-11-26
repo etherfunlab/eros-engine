@@ -4448,10 +4448,10 @@ pub(crate) struct PictureState {
 }
 
 /// [`crate::prompt::water_clothing`] for the persona `instance_id`, her card
-/// virginity narrowed by her sex history when that can change the line: any
-/// `having_sex` or `just_have_sex` row, in any session, ends it, as the event
-/// draw reads it (spec 2026-11-27-swim-outfit-ladder-and-fish-together-
-/// design.md §4). Fail-open: a failed read is warned and the card stands.
+/// virginity narrowed by her sex history when that can change the line: a row
+/// of any `EventKind::SEX` kind, in any session, ends it, as the event draw
+/// reads it (spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md
+/// §4). Fail-open: a failed read is warned and the card stands.
 pub(crate) async fn water_clothing_for(
     pool: &sqlx::PgPool,
     instance_id: Uuid,
@@ -6329,18 +6329,26 @@ pub(crate) fn run_stream_with(
                 // clothing (spec 2026-11-26-more-together-actions-bath-outfit-
                 // chemistry-drop-and-custom-together-design.md §5; spec
                 // 2026-11-27-swim-outfit-ladder-and-fish-together-design.md
-                // §4, §5).
-                let clothing_override = water_clothing_for(
-                    &state.pool,
-                    user_msg.instance_id,
-                    picture_kinds(&current, doing).2.map(|(kind, _)| kind),
-                    crate::prompt::WaterWear::of(
-                        &input.persona,
-                        eros_engine_core::scope::romance_compatible(user_msg.affinity_scope),
-                        input.affinity.chemistry_score(),
-                    ),
-                )
-                .await;
+                // §4, §5). Read only for a turn that draws, as a group turn
+                // does: a text reply has no slot to fill.
+                let clothing_override = if matches!(
+                    plan.action_type,
+                    ActionType::ReplyImage | ActionType::ReplyTextImage
+                ) {
+                    water_clothing_for(
+                        &state.pool,
+                        user_msg.instance_id,
+                        picture_kinds(&current, doing).2.map(|(kind, _)| kind),
+                        crate::prompt::WaterWear::of(
+                            &input.persona,
+                            eros_engine_core::scope::romance_compatible(user_msg.affinity_scope),
+                            input.affinity.chemistry_score(),
+                        ),
+                    )
+                    .await
+                } else {
+                    None
+                };
                 let mut image_only_done = false;
                 let mut image_only_produced: Vec<crate::pipeline::post_process::ProducedMessage> =
                     Vec::new();

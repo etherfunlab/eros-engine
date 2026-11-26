@@ -395,7 +395,8 @@ impl<'a> StoryRepo<'a> {
     /// `taking_space` / `fell_out` whose session is gone or archived (it
     /// belongs to that relationship), a false alarm still under way (she
     /// does not know yet), and every `bathing_together`, `showering_together`,
-    /// `having_sex_together`, `streaking_together`, `using_toilet_together`,
+    /// `having_sex_together`, `streaking_together`, `skinny_dipping_together`,
+    /// `naked_horse_riding_together`, `using_toilet_together`,
     /// `asleep_together`, `custom_together` and `on_a_date`: a romantic
     /// choice's or action's outcome lives in the conversation only (spec
     /// 2026-10-30 §4.7, 2026-11-23 §4.3), and a date in its own sub-session.

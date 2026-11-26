@@ -205,9 +205,9 @@ pub enum UserAction {
     /// The user asks her to dance, go adventuring, play with fire, sing,
     /// skinny-dip or commit a crime with them (spec 2026-11-26-more-together-
     /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md §4): each
-    /// behaves as `jog_together` does. `skinny_dip_together` is romance-gated
-    /// and answered in the `emotional` tone; a refused `commit_crime_together`
-    /// drops bond, not chemistry.
+    /// behaves as `jog_together` does, except that a refusal drops chemistry
+    /// (a refused `commit_crime_together` drops bond). `skinny_dip_together`
+    /// is romance-gated and answered in the `emotional` tone.
     DanceTogether,
     AdventureTogether,
     PlayWithFireTogether,
@@ -408,8 +408,10 @@ impl UserAction {
     }
 
     /// The line a refusal of this action drops: handing something over,
-    /// giving something to keep or asking her into a crime is friendship,
-    /// every other physical gesture is romance. A refused tip drops nothing
+    /// giving something to keep, asking her into a crime, or out on a jog, a
+    /// hike, a fishing trip, a bike ride or a horse ride is friendship (spec
+    /// 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7); every
+    /// other physical gesture is romance. A refused tip drops nothing
     /// (spec 2026-10-11 §6), nor does seeing through a bluff, a threat or a
     /// trick (spec 2026-11-08 §2.2), nor does turning down a date, a
     /// proposal, a break-up, a challenge or a bet.

@@ -58,7 +58,8 @@ and sauna clothing; hand the composer the chemistry tier and her virginity
 and let it choose; swimwear set per persona in `art_metadata`. The first is
 taken. The owner named the garment for each tier, so a model choosing would
 drift from it, and one ladder for every persona was asked for, which a card
-field would split and would make web work for no stated need.
+field would split, while putting work on the card's owner for no stated
+need.
 
 ## 4. What she wears swimming
 
@@ -113,8 +114,9 @@ tiers 1–3 only; the virgin wording with the drain flap and without
   turn's deltas; in a group, the speaker's seat; for an event picture, the
   decayed affinity the proactive path loads. *(Engine's call.)*
 - **Romance-compatible** is read as for a hot spring (2026-11-26 §5).
-- **A virgin** is `art_metadata.is_virgin` and no `having_sex` or
-  `just_have_sex` row ever (`EventRepo::ever(instance_id, EventKind::SEX)`),
+- **A virgin** is `art_metadata.is_virgin` and no row of an
+  `EventKind::SEX` kind ever (`having_sex`, `just_have_sex`,
+  `having_sex_together`; `EventRepo::ever(instance_id, EventKind::SEX)`),
   the reading the event draw already uses; the first time with the user ends
   it. *(Engine's call.)* The read is made only when its answer can change
   the line: a female persona, romance-compatible, `is_virgin` set, tier 3 or
