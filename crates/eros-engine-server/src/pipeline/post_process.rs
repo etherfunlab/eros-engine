@@ -425,7 +425,8 @@ pub(crate) async fn run_affinity_turn(
     // actions-bath-outfit-chemistry-drop-and-custom-together-design.md §6). A
     // write of its own, after the affinity commit: it takes the instance's
     // lock, which is never taken while the affinity row's is held. A date
-    // turn placed no event, so it ends none.
+    // turn ends none: the date's settlement scores it, and opening the date
+    // already ended whatever she was doing.
     if let (Some(true), Some(message_id), false) = (committed, user_message_id, activity_turn) {
         if let Err(e) = (EventRepo { pool: &state.pool })
             .end_intimate_after_message(instance_id, message_id, chrono::Utc::now())

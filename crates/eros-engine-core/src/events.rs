@@ -364,9 +364,10 @@ impl EventKind {
     ];
 
     /// The kinds a chemistry drop ends while they are under way: the ones the
-    /// romance-gated actions place, and her own `bathe_together` and
-    /// `sleep_together` asks (spec 2026-11-26-more-together-actions-bath-
-    /// outfit-chemistry-drop-and-custom-together-design.md §6).
+    /// romance-gated actions place, whoever asked, so a row her accepted
+    /// `bathe_together` or `sleep_together` ask placed ends too (spec
+    /// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-custom-
+    /// together-design.md §6).
     pub const ENDS_ON_CHEMISTRY_DROP: [EventKind; 5] = [
         EventKind::ShoweringTogether,
         EventKind::BathingTogether,
