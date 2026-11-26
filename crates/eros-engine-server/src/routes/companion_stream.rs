@@ -353,7 +353,7 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 
 /// An action the user does to the persona this turn, besides talking. The
 /// persona accepts or does not; a refusal costs the relationship one tier on
-/// the line the action touches (`give`, `gift`, the thrill actions
+/// each line the action touches (`give`, `gift`, the thrill actions
 /// `adventure_together`, `commit_crime_together`, `play_with_fire_together`
 /// and `fight_together`, and `jog_together`, `hike_together`,
 /// `fish_together`, `cycle_together` and `ride_horse_together` → bond;
