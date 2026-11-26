@@ -1676,6 +1676,20 @@ impl WaterWear {
             coin: rand::thread_rng().gen(),
         }
     }
+
+    /// Whether her sex history can change the line: a swim, a female
+    /// persona, a romance-compatible pair, the card saying virgin, and tier 3
+    /// or below.
+    pub(crate) fn virginity_matters(
+        &self,
+        foreground: Option<eros_engine_core::events::EventKind>,
+    ) -> bool {
+        foreground == Some(eros_engine_core::events::EventKind::SwimmingTogether)
+            && self.wearer == Wearer::Female
+            && self.romance_compatible
+            && self.virgin
+            && eros_engine_core::affinity::tier_index(self.chemistry) <= 3
+    }
 }
 
 /// What the composer's `[此刻穿着]` says when the foreground of a picture is
@@ -5906,6 +5920,22 @@ mod tests {
                 assert_eq!(swim(wear(compatible, Other, false, c, true)), None);
             }
         }
+    }
+
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §4: the
+    /// sex-history read is made only when its answer can change the line.
+    #[test]
+    fn virginity_matters_only_where_it_can_change_the_line() {
+        use eros_engine_core::events::EventKind::{HotSpringTogether, SwimmingTogether};
+        use Wearer::{Female, Male};
+        let swim = Some(SwimmingTogether);
+        assert!(wear(true, Female, true, 0.5, true).virginity_matters(swim));
+        assert!(!wear(true, Female, true, 0.62, true).virginity_matters(swim));
+        assert!(!wear(true, Male, true, 0.5, true).virginity_matters(swim));
+        assert!(!wear(false, Female, true, 0.5, true).virginity_matters(swim));
+        assert!(!wear(true, Female, false, 0.5, true).virginity_matters(swim));
+        assert!(!wear(true, Female, true, 0.5, true).virginity_matters(Some(HotSpringTogether)));
+        assert!(!wear(true, Female, true, 0.5, true).virginity_matters(None));
     }
 
     /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §4.

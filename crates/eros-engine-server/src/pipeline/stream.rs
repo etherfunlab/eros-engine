@@ -4447,14 +4447,28 @@ pub(crate) struct PictureState {
     pub clothing_override: Option<&'static str>,
 }
 
-/// [`crate::prompt::water_clothing`] for the persona `instance_id` (spec
-/// 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §4).
+/// [`crate::prompt::water_clothing`] for the persona `instance_id`, her card
+/// virginity narrowed by her sex history when that can change the line: any
+/// `having_sex` or `just_have_sex` row, in any session, ends it, as the event
+/// draw reads it (spec 2026-11-27-swim-outfit-ladder-and-fish-together-
+/// design.md §4). Fail-open: a failed read is warned and the card stands.
 pub(crate) async fn water_clothing_for(
-    _pool: &sqlx::PgPool,
-    _instance_id: Uuid,
+    pool: &sqlx::PgPool,
+    instance_id: Uuid,
     foreground: Option<eros_engine_core::events::EventKind>,
-    wear: crate::prompt::WaterWear,
+    mut wear: crate::prompt::WaterWear,
 ) -> Option<&'static str> {
+    if wear.virginity_matters(foreground) {
+        match (eros_engine_store::events::EventRepo { pool })
+            .ever(instance_id, &eros_engine_core::events::EventKind::SEX)
+            .await
+        {
+            Ok(had_sex) => wear.virgin = !had_sex,
+            Err(e) => {
+                tracing::warn!(%instance_id, "image-compose: sex history read failed: {e}")
+            }
+        }
+    }
     crate::prompt::water_clothing(foreground, &wear)
 }
 
@@ -12160,6 +12174,47 @@ data: [DONE]\n\n";
         assert!(payload.contains("[此刻状态]\n和对方一起游泳\n"), "{payload}");
         assert_eq!(clothing, "Bandeau bikini");
         assert_eq!(answer, "accept");
+    }
+
+    /// §4: a virgin swims in the navy suit through tier 3.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_virgin_swims_in_the_navy_suit(pool: PgPool) {
+        let (_, payload, _, clothing, _) = water_picture_turn_with(
+            &pool,
+            eros_engine_core::types::UserAction::SwimTogether,
+            "accept",
+            true,
+            Some(serde_json::json!({"gender": "female", "is_virgin": true})),
+            Some(0.25),
+            &[],
+            |_| {},
+        )
+        .await;
+        let navy = "navy one-piece swimsuit with name patch and a front drain flap";
+        assert!(
+            payload.contains(&format!("[此刻穿着]\n{navy}\n")),
+            "{payload}"
+        );
+        assert_eq!(clothing, navy);
+    }
+
+    /// §4: a `having_sex` row, here one written in another session of hers,
+    /// ends the card's virginity: her tier's bikini.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_virgin_who_has_had_sex_swims_in_her_tiers_bikini(pool: PgPool) {
+        let (_, payload, _, clothing, _) = water_picture_turn_with(
+            &pool,
+            eros_engine_core::types::UserAction::SwimTogether,
+            "accept",
+            true,
+            Some(serde_json::json!({"gender": "female", "is_virgin": true})),
+            Some(0.25),
+            &[ev("having_sex", 600, -540)],
+            |_| {},
+        )
+        .await;
+        assert!(payload.contains("[此刻穿着]\nTriangle bikini\n"), "{payload}");
+        assert_eq!(clothing, "Triangle bikini");
     }
 
     /// §4: a male persona's first tier.
