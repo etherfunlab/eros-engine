@@ -2889,7 +2889,8 @@ mod tests {
 
     /// Spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-
     /// design.md §6: a cycle a fantasy persona's world rules out costs
-    /// nothing; any other refusal of a together action still drops chemistry.
+    /// nothing; the judge's refusal of a cycle or a hike drops bond (spec
+    /// 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7).
     #[test]
     fn a_cycle_the_world_rules_out_drops_nothing() {
         use eros_engine_core::affinity::AffinityLine;
@@ -2923,14 +2924,15 @@ mod tests {
         };
         let cycle = event(UserAction::CycleTogether);
         assert_eq!(tier_drop_for(&cycle, &refused, Setting::Fantasy), None);
+        // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7.
         assert_eq!(
             tier_drop_for(&cycle, &refused, Setting::Modern),
-            Some(AffinityLine::Chemistry)
+            Some(AffinityLine::Bond)
         );
         let hike = event(UserAction::HikeTogether);
         assert_eq!(
             tier_drop_for(&hike, &refused, Setting::Fantasy),
-            Some(AffinityLine::Chemistry)
+            Some(AffinityLine::Bond)
         );
     }
 

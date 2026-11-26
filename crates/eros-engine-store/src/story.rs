@@ -395,7 +395,8 @@ impl<'a> StoryRepo<'a> {
     /// `taking_space` / `fell_out` whose session is gone or archived (it
     /// belongs to that relationship), a false alarm still under way (she
     /// does not know yet), and every `bathing_together`, `showering_together`,
-    /// `having_sex_together`, `streaking_together`, `using_toilet_together`,
+    /// `having_sex_together`, `streaking_together`, `skinny_dipping_together`,
+    /// `naked_horse_riding_together`, `using_toilet_together`,
     /// `asleep_together`, `custom_together` and `on_a_date`: a romantic
     /// choice's or action's outcome lives in the conversation only (spec
     /// 2026-10-30 §4.7, 2026-11-23 §4.3), and a date in its own sub-session.
@@ -420,7 +421,9 @@ impl<'a> StoryRepo<'a> {
         // Romantic outcomes and the private together kinds stay in the
         // conversation (spec 2026-11-23-twelve-together-actions-and-propose-
         // design.md §4.3; spec 2026-11-26-more-together-actions-bath-outfit-
-        // chemistry-drop-and-custom-together-design.md §4). So does a
+        // chemistry-drop-and-custom-together-design.md §4; the naked ride,
+        // spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md
+        // §6.2). So does a
         // `custom_together`: what it holds is unknown, and its `message_id`
         // is the user's message, which the join below would read as her
         // telling (§8.2, §8.3).
@@ -431,6 +434,7 @@ impl<'a> StoryRepo<'a> {
             EventKind::HavingSexTogether,
             EventKind::StreakingTogether,
             EventKind::SkinnyDippingTogether,
+            EventKind::NakedHorseRidingTogether,
             EventKind::UsingToiletTogether,
             EventKind::AsleepTogether,
             EventKind::CustomTogether,
@@ -1726,6 +1730,42 @@ mod tests {
                 "singing_together",
             ]
         );
+    }
+
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6:
+    /// fishing reaches her story; a naked ride stays in the conversation as
+    /// a skinny dip does.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn life_events_take_fishing_and_keep_the_naked_ride_out(pool: PgPool) {
+        let repo = StoryRepo { pool: &pool };
+        let owner = Uuid::new_v4();
+        let inst = seed_instance(&pool, owner, "A", "active").await;
+        let s = seed_session(&pool, owner, inst).await;
+        let now = Utc::now();
+        let kinds = [
+            EventKind::FishingTogether,
+            EventKind::NakedHorseRidingTogether,
+        ];
+        for (i, k) in kinds.iter().enumerate() {
+            let from = now - chrono::Duration::hours(3 * (i as i64 + 1));
+            seed_event(
+                &pool,
+                inst,
+                Some(s),
+                k.as_str(),
+                k.as_str(),
+                from,
+                from + chrono::Duration::hours(1),
+                None,
+            )
+            .await;
+        }
+        let got = repo
+            .life_events(inst, now - chrono::Duration::days(7), now, 30)
+            .await
+            .unwrap();
+        let got: Vec<&str> = got.iter().map(|e| e.event.kind.as_str()).collect();
+        assert_eq!(got, vec!["fishing_together"]);
     }
 
     /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-

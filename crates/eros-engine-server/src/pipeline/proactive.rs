@@ -461,6 +461,8 @@ fn kind_cue(
         | SingingTogether
         | SkinnyDippingTogether
         | CommittingCrimeTogether
+        | FishingTogether
+        | NakedHorseRidingTogether
         | CustomTogether => {
             unreachable!("{kind:?} is never told")
         }
@@ -576,6 +578,10 @@ struct Prepared {
     /// `Some(Emotional)` on an event message written in the `emotional`
     /// tone, stored as the row's `metadata.tone`; `None` otherwise.
     tone: Option<eros_engine_core::tone::Tone>,
+    /// The pair's chemistry after decay, as the prompt read it: what her
+    /// picture's swimsuit follows (spec 2026-11-27-swim-outfit-ladder-and-
+    /// fish-together-design.md §4).
+    chemistry: f64,
 }
 
 /// What `store` wrote. `row` is `None` when the insert yielded: for a
@@ -599,6 +605,7 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
     affinity.apply_time_decay();
     affinity.refresh_endpoints(&state.config.affinity_tuning);
     let rung = affinity.intimacy_rung();
+    let chemistry = affinity.chemistry_score();
     let traits = crate::prompt::persona_traits(&g.persona);
     let signals = compute_signals_for_session(&state.pool, g.session_id, &affinity, None).await?;
 
@@ -725,6 +732,7 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
         plan,
         injected_tags,
         tone: emotional.then_some(eros_engine_core::tone::Tone::Emotional),
+        chemistry,
     })
 }
 
@@ -769,9 +777,11 @@ async fn store(
         };
         // The events at the instant the reply prompt read them; the event
         // itself is not stored yet, so the kind it starts counts as live.
-        // What she wears in a hot spring or a sauna reads the request's scopes
-        // (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-
-        // and-custom-together-design.md §5).
+        // What she wears in the water or naked reads the request's scopes and
+        // the chemistry her message was written with (spec 2026-11-26-more-
+        // together-actions-bath-outfit-chemistry-drop-and-custom-together-
+        // design.md §5; spec 2026-11-27-swim-outfit-ladder-and-fish-together-
+        // design.md §4).
         let shown = state_for_picture(
             &state.pool,
             g.instance_id,
@@ -779,7 +789,11 @@ async fn store(
             g.now.now,
             Some(*kind),
             crate::prompt::persona_traits(&g.persona).cycle_health(),
-            eros_engine_core::scope::romance_compatible(g.affinity_scope),
+            crate::prompt::WaterWear::of(
+                &g.persona,
+                eros_engine_core::scope::romance_compatible(g.affinity_scope),
+                prep.chemistry,
+            ),
         )
         .await;
         let img = build_delegated_image_prompt_for(

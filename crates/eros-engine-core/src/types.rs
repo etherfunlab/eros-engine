@@ -194,7 +194,10 @@ pub enum UserAction {
     /// The user asks her to work out, swim, cycle or hike with them (spec
     /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-
     /// design.md §6): each behaves as `jog_together` does. `cycle_together`
-    /// is refused, and costs nothing, to a `fantasy` persona.
+    /// is refused, and costs nothing, to a `fantasy` persona. A refused
+    /// `cycle_together` or `hike_together` drops bond, as a refused
+    /// `jog_together` or `ride_horse_together` does (spec 2026-11-27-swim-
+    /// outfit-ladder-and-fish-together-design.md §7).
     WorkoutTogether,
     SwimTogether,
     CycleTogether,
@@ -202,15 +205,24 @@ pub enum UserAction {
     /// The user asks her to dance, go adventuring, play with fire, sing,
     /// skinny-dip or commit a crime with them (spec 2026-11-26-more-together-
     /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md §4): each
-    /// behaves as `jog_together` does. `skinny_dip_together` is romance-gated
-    /// and answered in the `emotional` tone; a refused `commit_crime_together`
-    /// drops bond, not chemistry.
+    /// behaves as `jog_together` does, except that a refusal drops chemistry
+    /// (a refused `commit_crime_together` drops bond). `skinny_dip_together`
+    /// is romance-gated and answered in the `emotional` tone.
     DanceTogether,
     AdventureTogether,
     PlayWithFireTogether,
     SingTogether,
     SkinnyDipTogether,
     CommitCrimeTogether,
+    /// The user asks her to go fishing with them (spec 2026-11-27-swim-
+    /// outfit-ladder-and-fish-together-design.md §6.1): behaves as
+    /// `hike_together` does, two to three hours.
+    FishTogether,
+    /// The user asks her to ride a horse naked with them (spec 2026-11-27
+    /// §6.2): romance-gated and answered in the `emotional` tone as
+    /// `skinny_dip_together` is, a refusal drops chemistry, and her period
+    /// does not roll it.
+    RideHorseNakedTogether,
     /// The user asks her to do something with them, in their own words (spec
     /// 2026-11-26 §8): behaves as `jog_together` does, placing
     /// `custom_together`. Neither romance-gated nor emotional, and a refusal
@@ -297,6 +309,7 @@ impl UserAction {
                 | UserAction::SexTogether
                 | UserAction::StreakTogether
                 | UserAction::SkinnyDipTogether
+                | UserAction::RideHorseNakedTogether
                 | UserAction::Propose
                 | UserAction::BreakUp
                 | UserAction::Threaten
@@ -346,6 +359,8 @@ impl UserAction {
             UserAction::SingTogether => Some(EventKind::SingingTogether),
             UserAction::SkinnyDipTogether => Some(EventKind::SkinnyDippingTogether),
             UserAction::CommitCrimeTogether => Some(EventKind::CommittingCrimeTogether),
+            UserAction::FishTogether => Some(EventKind::FishingTogether),
+            UserAction::RideHorseNakedTogether => Some(EventKind::NakedHorseRidingTogether),
             UserAction::CustomTogether { .. } => Some(EventKind::CustomTogether),
             _ => None,
         }
@@ -373,6 +388,7 @@ impl UserAction {
                 | UserAction::SexTogether
                 | UserAction::StreakTogether
                 | UserAction::SkinnyDipTogether
+                | UserAction::RideHorseNakedTogether
         )
     }
 
@@ -392,16 +408,26 @@ impl UserAction {
     }
 
     /// The line a refusal of this action drops: handing something over,
-    /// giving something to keep or asking her into a crime is friendship,
-    /// every other physical gesture is romance. A refused tip drops nothing
+    /// giving something to keep, asking her into a crime, or out on a jog, a
+    /// hike, a fishing trip, a bike ride or a horse ride is friendship (spec
+    /// 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7); every
+    /// other physical gesture is romance. A refused tip drops nothing
     /// (spec 2026-10-11 §6), nor does seeing through a bluff, a threat or a
     /// trick (spec 2026-11-08 §2.2), nor does turning down a date, a
     /// proposal, a break-up, a challenge or a bet.
     pub fn refusal_line(&self) -> Option<AffinityLine> {
         match self {
-            UserAction::Give { .. } | UserAction::Gift { .. } | UserAction::CommitCrimeTogether => {
-                Some(AffinityLine::Bond)
-            }
+            // A refused jog, hike, fishing trip, bike ride or horse ride may
+            // only mean she does not care for the outdoors (spec 2026-11-27-
+            // swim-outfit-ladder-and-fish-together-design.md §7).
+            UserAction::Give { .. }
+            | UserAction::Gift { .. }
+            | UserAction::CommitCrimeTogether
+            | UserAction::JogTogether
+            | UserAction::HikeTogether
+            | UserAction::FishTogether
+            | UserAction::CycleTogether
+            | UserAction::RideHorseTogether => Some(AffinityLine::Bond),
             UserAction::Tip { .. }
             | UserAction::Bluff
             | UserAction::Threaten
@@ -810,7 +836,13 @@ mod tests {
             assert_eq!(serde_json::to_value(&a).unwrap(), v);
             assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
             assert_eq!(a.together_kind(), Some(kind), "{a:?}");
-            assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
+            // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7.
+            let line = if matches!(a, UserAction::JogTogether | UserAction::RideHorseTogether) {
+                AffinityLine::Bond
+            } else {
+                AffinityLine::Chemistry
+            };
+            assert_eq!(a.refusal_line(), Some(line), "{a:?}");
         }
         for a in [
             UserAction::Kiss,
@@ -932,7 +964,13 @@ mod tests {
             assert_eq!(serde_json::to_value(&a).unwrap(), v);
             assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
             assert_eq!(a.together_kind(), Some(kind), "{a:?}");
-            assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
+            // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7.
+            let line = if matches!(a, UserAction::CycleTogether | UserAction::HikeTogether) {
+                AffinityLine::Bond
+            } else {
+                AffinityLine::Chemistry
+            };
+            assert_eq!(a.refusal_line(), Some(line), "{a:?}");
             assert!(!a.speaks_emotionally(), "{a:?}");
             assert_eq!(a.consumed(), None, "{a:?}");
             assert_eq!(a.status_ask(), None, "{a:?}");
@@ -1028,6 +1066,65 @@ mod tests {
         );
     }
 
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §7: she
+    /// may simply not care for the outdoors.
+    #[test]
+    fn outdoor_together_refusals_drop_bond() {
+        for a in [
+            UserAction::JogTogether,
+            UserAction::HikeTogether,
+            UserAction::FishTogether,
+            UserAction::CycleTogether,
+            UserAction::RideHorseTogether,
+        ] {
+            assert_eq!(a.refusal_line(), Some(AffinityLine::Bond), "{a:?}");
+        }
+        for a in [
+            UserAction::AdventureTogether,
+            UserAction::WalkTogether,
+            UserAction::SwimTogether,
+            UserAction::WorkoutTogether,
+            UserAction::YogaTogether,
+            UserAction::StargazeTogether,
+            UserAction::DanceTogether,
+            UserAction::SingTogether,
+            UserAction::RideHorseNakedTogether,
+        ] {
+            assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry), "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6.1.
+    #[test]
+    fn fish_together_names_its_event() {
+        let a = UserAction::FishTogether;
+        let v = serde_json::json!({ "type": "fish_together" });
+        assert_eq!(serde_json::to_value(&a).unwrap(), v);
+        assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+        assert_eq!(a.together_kind(), Some(EventKind::FishingTogether));
+        assert_eq!(a.consumed(), None);
+        assert_eq!(a.status_ask(), None);
+        assert_eq!(a.together_text(), None);
+        assert!(!a.speaks_emotionally());
+        assert!(!a.romance_gated());
+    }
+
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6.2.
+    #[test]
+    fn ride_horse_naked_together_is_gated_and_emotional() {
+        let a = UserAction::RideHorseNakedTogether;
+        let v = serde_json::json!({ "type": "ride_horse_naked_together" });
+        assert_eq!(serde_json::to_value(&a).unwrap(), v);
+        assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+        assert_eq!(a.together_kind(), Some(EventKind::NakedHorseRidingTogether));
+        assert!(a.romance_gated());
+        assert!(a.speaks_emotionally());
+        assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry));
+        assert_eq!(a.consumed(), None);
+        assert_eq!(a.status_ask(), None);
+        assert_eq!(a.together_text(), None);
+    }
+
     /// One of every action: each unit variant and one of each payload variant.
     fn all_actions() -> Vec<UserAction> {
         use UserAction::*;
@@ -1083,6 +1180,8 @@ mod tests {
             SingTogether,
             SkinnyDipTogether,
             CommitCrimeTogether,
+            FishTogether,
+            RideHorseNakedTogether,
             CustomTogether { text: "x".into() },
             Challenge,
             Bet,
