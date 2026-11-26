@@ -197,6 +197,8 @@ pub enum UserActionKind {
     SingTogether,
     SkinnyDipTogether,
     CommitCrimeTogether,
+    FishTogether,
+    RideHorseNakedTogether,
     CustomTogether,
     Challenge,
     Bet,
@@ -381,9 +383,12 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// `playing_with_fire_together`, `sing_together` → `singing_together`,
 /// `skinny_dip_together` → `skinny_dipping_together` and
 /// `commit_crime_together` → `committing_crime_together` (one hour each);
-/// `adventure_together` → `adventuring_together` (two to three hours). A
-/// `skinny_dip_together` to a pair whose scopes are not romance-compatible is
-/// refused. `custom_together` asks her to do something with the user in the
+/// `adventure_together` → `adventuring_together` (two to three hours).
+/// `fish_together` → `fishing_together` (two to three hours) and
+/// `ride_horse_naked_together` → `naked_horse_riding_together` (one hour)
+/// start an event the same way. A `skinny_dip_together` or
+/// `ride_horse_naked_together` to a pair whose scopes are not
+/// romance-compatible is refused. `custom_together` asks her to do something with the user in the
 /// user's own `text` (required): accepted, it starts a `custom_together`
 /// event (one hour) whose `message_id` is the user's message, and nothing
 /// rules it out before the judge; refused, it costs chemistry.
@@ -521,6 +526,8 @@ impl UserActionDto {
             UserActionKind::SingTogether => UserAction::SingTogether,
             UserActionKind::SkinnyDipTogether => UserAction::SkinnyDipTogether,
             UserActionKind::CommitCrimeTogether => UserAction::CommitCrimeTogether,
+            UserActionKind::FishTogether => UserAction::FishTogether,
+            UserActionKind::RideHorseNakedTogether => UserAction::RideHorseNakedTogether,
             UserActionKind::CustomTogether => UserAction::CustomTogether {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom_together")?,
@@ -5265,6 +5272,17 @@ mod validate_payload_tests {
                 "hike_together",
                 UserActionKind::HikeTogether,
                 UserAction::HikeTogether,
+            ),
+            // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6.
+            (
+                "fish_together",
+                UserActionKind::FishTogether,
+                UserAction::FishTogether,
+            ),
+            (
+                "ride_horse_naked_together",
+                UserActionKind::RideHorseNakedTogether,
+                UserAction::RideHorseNakedTogether,
             ),
         ] {
             let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))

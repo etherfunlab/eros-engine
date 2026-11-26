@@ -21695,10 +21695,18 @@ data: [DONE]\n\n";
         use eros_engine_core::types::ActionResponse::{Accept, Refuse};
         use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
         use eros_engine_core::types::UserAction::{
-            CycleTogether, HikeTogether, SwimTogether, WorkoutTogether,
+            CycleTogether, FishTogether, HikeTogether, RideHorseNakedTogether, SwimTogether,
+            WorkoutTogether,
         };
         let mut cases = Vec::new();
-        for a in [WorkoutTogether, SwimTogether, CycleTogether, HikeTogether] {
+        for a in [
+            WorkoutTogether,
+            SwimTogether,
+            CycleTogether,
+            HikeTogether,
+            FishTogether,
+            RideHorseNakedTogether,
+        ] {
             assert!(is_picture_action(&a), "{a:?}");
             cases.extend([
                 (a.clone(), Accept, ReplyText, true, Some(ReplyTextImage)),

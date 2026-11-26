@@ -234,6 +234,13 @@ pub enum EventKind {
     /// She and the user commit a crime together: written when she accepts
     /// the user's `commit_crime_together`; it names no crime.
     CommittingCrimeTogether,
+    /// She and the user go fishing together: written when she accepts the
+    /// user's `fish_together` (spec 2026-11-27-swim-outfit-ladder-and-fish-
+    /// together-design.md §6.1).
+    FishingTogether,
+    /// She and the user ride a horse naked together: written when she accepts
+    /// the user's `ride_horse_naked_together` (spec 2026-11-27 §6.2).
+    NakedHorseRidingTogether,
     /// She and the user do the thing the user named: written when she
     /// accepts the user's `custom_together` (spec 2026-11-26 §8). The row's
     /// `message_id` is the user's message, which holds the text.
@@ -333,7 +340,7 @@ impl EventKind {
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 32] = [
+    pub const SPECIAL: [EventKind; 34] = [
         EventKind::TakingSpace,
         EventKind::FellOut,
         EventKind::TravelingTogether,
@@ -365,6 +372,8 @@ impl EventKind {
         EventKind::SingingTogether,
         EventKind::SkinnyDippingTogether,
         EventKind::CommittingCrimeTogether,
+        EventKind::FishingTogether,
+        EventKind::NakedHorseRidingTogether,
         EventKind::CustomTogether,
     ];
 
@@ -372,13 +381,14 @@ impl EventKind {
     /// romance-gated actions place, whoever asked, so a row her accepted
     /// `bathe_together` or `sleep_together` ask placed ends too (spec
     /// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-custom-
-    /// together-design.md §6).
-    pub const ENDS_ON_CHEMISTRY_DROP: [EventKind; 5] = [
+    /// together-design.md §6; the naked ride, spec 2026-11-27 §6.2).
+    pub const ENDS_ON_CHEMISTRY_DROP: [EventKind; 6] = [
         EventKind::ShoweringTogether,
         EventKind::BathingTogether,
         EventKind::HavingSexTogether,
         EventKind::StreakingTogether,
         EventKind::SkinnyDippingTogether,
+        EventKind::NakedHorseRidingTogether,
     ];
 
     /// The kinds under which she holds back her `bathe_together` and
@@ -504,6 +514,8 @@ impl EventKind {
             EventKind::SingingTogether => "singing_together",
             EventKind::SkinnyDippingTogether => "skinny_dipping_together",
             EventKind::CommittingCrimeTogether => "committing_crime_together",
+            EventKind::FishingTogether => "fishing_together",
+            EventKind::NakedHorseRidingTogether => "naked_horse_riding_together",
             EventKind::CustomTogether => "custom_together",
         }
     }
@@ -577,8 +589,10 @@ impl EventKind {
             | SingingTogether
             | SkinnyDippingTogether
             | CommittingCrimeTogether
+            | NakedHorseRidingTogether
             | CustomTogether => EventCategory::Short,
-            AsleepTogether | FightingTogether | HikingTogether | AdventuringTogether | TempWork
+            AsleepTogether | FightingTogether | HikingTogether | AdventuringTogether
+            | FishingTogether | TempWork
             | ExMessage | GotHit | Breakup | WorkingOut | Reading | Gaming | AwayFromPhone
             | Unwell | Irritable | Busy | InBattle | Asleep | OutShopping | BrosGathering
             | SisGathering | OnTheRoad | WatchingShow | HavingSex | WantToGoOut | WantToGoHome
@@ -693,6 +707,8 @@ impl EventKind {
                 | SingingTogether
                 | SkinnyDippingTogether
                 | CommittingCrimeTogether
+                | FishingTogether
+                | NakedHorseRidingTogether
                 | CustomTogether
         )
     }
@@ -906,6 +922,8 @@ fn rule(kind: EventKind) -> Rule {
         SingingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         SkinnyDippingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         CommittingCrimeTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        FishingTogether => (0.0, 0, Lasts::Hours(2, 3)),
+        NakedHorseRidingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         CustomTogether => (0.0, 0, Lasts::Hours(1, 1)),
     };
     Rule {
@@ -2727,7 +2745,7 @@ mod tests {
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
         assert_eq!(EventKind::ALL.len(), 70);
-        assert_eq!(EventKind::SPECIAL.len(), 32);
+        assert_eq!(EventKind::SPECIAL.len(), 34);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -3785,6 +3803,51 @@ mod tests {
         }
     }
 
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6.
+    #[test]
+    fn fishing_and_naked_horse_riding_are_placed_kinds() {
+        for (k, wire, category, short, long) in [
+            (
+                FishingTogether,
+                "fishing_together",
+                EventCategory::Mid,
+                Duration::hours(2),
+                Duration::hours(3),
+            ),
+            (
+                NakedHorseRidingTogether,
+                "naked_horse_riding_together",
+                EventCategory::Short,
+                Duration::hours(1),
+                Duration::hours(1),
+            ),
+        ] {
+            assert!(
+                EventKind::SPECIAL.contains(&k) && !EventKind::ALL.contains(&k),
+                "{k:?}"
+            );
+            assert_eq!(k.as_str(), wire);
+            assert_eq!(EventKind::parse(wire), Some(k));
+            assert_eq!(serde_json::to_value(k).unwrap(), wire);
+            assert_eq!(k.category(), category, "{k:?}");
+            assert_eq!(lasts(k, 0.0), short, "{k:?}");
+            assert_eq!(lasts(k, 0.999_999), long, "{k:?}");
+            let r = rule(k);
+            assert_eq!((r.weight, r.cooldown_hours), (0.0, 0), "{k:?}");
+            assert_eq!(k.place(), Place::Neutral, "{k:?}");
+            assert!(k.is_shared(), "{k:?}");
+            assert!(!k.may_be_offline() && !k.is_offline(&female()), "{k:?}");
+            assert!(!k.speaks_emotionally(), "{k:?}");
+            for rung in 0..=5 {
+                assert!(
+                    !is_told(k, rung, &PersonaTraits::default()),
+                    "{k:?} rung {rung}"
+                );
+            }
+            assert!(k.fits(Setting::Modern) && k.fits(Setting::Fantasy), "{k:?}");
+        }
+    }
+
     /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
     /// custom-together-design.md §8.2.
     #[test]
@@ -3825,7 +3888,8 @@ mod tests {
                 BathingTogether,
                 HavingSexTogether,
                 StreakingTogether,
-                SkinnyDippingTogether
+                SkinnyDippingTogether,
+                NakedHorseRidingTogether
             ]
         );
         assert_eq!(

@@ -83,8 +83,9 @@ pub fn strip_ruled_out(event: &Event) -> bool {
 /// 2026-11-20-together-actions-state-in-picture-and-genome-routes-design.md
 /// §5, 2026-11-23-twelve-together-actions-and-propose-design.md §4.1): a
 /// romance-gated action (`UserAction::romance_gated`: `shower_together`,
-/// `bath_together`, `sex_together`, `streak_together` or
-/// `skinny_dip_together`) when the turn's scopes are not romance-compatible,
+/// `bath_together`, `sex_together`, `streak_together`, `skinny_dip_together`
+/// or `ride_horse_naked_together`) when the turn's scopes are not
+/// romance-compatible,
 /// as for `strip`; a `toilet_together` when the persona is a `machine`. No
 /// other action is.
 pub fn together_ruled_out(event: &Event, machine: bool) -> bool {
@@ -1405,6 +1406,7 @@ mod tests {
             UserAction::PlayWithFireTogether,
             UserAction::SingTogether,
             UserAction::CommitCrimeTogether,
+            UserAction::FishTogether,
         ] {
             assert!(
                 !together_ruled_out(&scoped(a.clone(), false), true),
@@ -1419,6 +1421,22 @@ mod tests {
             &action_msg(UserAction::SkinnyDipTogether),
             Setting::Fantasy
         ));
+        // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md
+        // §6.2: the naked ride is gated as the skinny dip is, and never rolled.
+        let ride = |compatible| scoped(UserAction::RideHorseNakedTogether, compatible);
+        assert!(together_ruled_out(&ride(false), false));
+        assert!(!together_ruled_out(&ride(true), false));
+        assert!(!period_refuses(
+            &action_msg(UserAction::RideHorseNakedTogether),
+            true,
+            0.9
+        ));
+        for s in [Setting::Modern, Setting::Fantasy] {
+            assert!(!world_ruled_out(
+                &action_msg(UserAction::RideHorseNakedTogether),
+                s
+            ));
+        }
     }
 
     /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-

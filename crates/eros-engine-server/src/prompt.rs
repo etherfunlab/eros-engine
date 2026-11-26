@@ -855,6 +855,8 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::SingTogether => "想和你一起唱歌".into(),
         UserAction::SkinnyDipTogether => "想和你一起裸泳".into(),
         UserAction::CommitCrimeTogether => "想和你一起去犯罪".into(),
+        UserAction::FishTogether => "想和你一起钓鱼".into(),
+        UserAction::RideHorseNakedTogether => "想和你一起裸体骑马".into(),
         UserAction::CustomTogether { text } => format!("想和你一起：{text}"),
         UserAction::Challenge => "向你发起挑战".into(),
         UserAction::Bet => "想和你打个赌".into(),
@@ -1199,6 +1201,8 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         SingingTogether => "和对方一起唱歌",
         SkinnyDippingTogether => "和对方一起裸泳",
         CommittingCrimeTogether => "和对方一起犯罪",
+        FishingTogether => "和对方一起钓鱼",
+        NakedHorseRidingTogether => "和对方一起裸体骑马",
         CustomTogether => "和对方一起做一件事",
     }
 }
@@ -7343,6 +7347,13 @@ mod tests {
                 "和对方一起骑单车",
             ),
             (UserAction::HikeTogether, "想和你一起爬山", "和对方一起爬山"),
+            // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6.
+            (UserAction::FishTogether, "想和你一起钓鱼", "和对方一起钓鱼"),
+            (
+                UserAction::RideHorseNakedTogether,
+                "想和你一起裸体骑马",
+                "和对方一起裸体骑马",
+            ),
         ] {
             assert!(action_marker(&a).contains(marker), "{a:?}");
             assert_eq!(event_label(a.together_kind().unwrap()), label, "{a:?}");

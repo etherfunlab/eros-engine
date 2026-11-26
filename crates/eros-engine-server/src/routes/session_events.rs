@@ -56,7 +56,8 @@ const MAX_EVENT_KEY_CHARS: usize = 128;
 /// `swimming_together`, `cycling_together`, `hiking_together`,
 /// `dancing_together`, `adventuring_together`, `playing_with_fire_together`,
 /// `singing_together`, `skinny_dipping_together`,
-/// `committing_crime_together` and `custom_together` are placed by the
+/// `committing_crime_together`, `fishing_together`,
+/// `naked_horse_riding_together` and `custom_together` are placed by the
 /// engine, never drawn: they appear in responses only, and a `kinds` filter
 /// that lists one is rejected. A `custom_together`'s `message_id` is the
 /// user's message that asked, not hers.
@@ -164,6 +165,8 @@ pub enum EventKindDto {
     SingingTogether,
     SkinnyDippingTogether,
     CommittingCrimeTogether,
+    FishingTogether,
+    NakedHorseRidingTogether,
     CustomTogether,
 }
 
@@ -287,6 +290,8 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::SingingTogether => EventKind::SingingTogether,
             EventKindDto::SkinnyDippingTogether => EventKind::SkinnyDippingTogether,
             EventKindDto::CommittingCrimeTogether => EventKind::CommittingCrimeTogether,
+            EventKindDto::FishingTogether => EventKind::FishingTogether,
+            EventKindDto::NakedHorseRidingTogether => EventKind::NakedHorseRidingTogether,
             EventKindDto::CustomTogether => EventKind::CustomTogether,
         }
     }
@@ -396,6 +401,8 @@ impl From<EventKind> for EventKindDto {
             EventKind::SingingTogether => EventKindDto::SingingTogether,
             EventKind::SkinnyDippingTogether => EventKindDto::SkinnyDippingTogether,
             EventKind::CommittingCrimeTogether => EventKindDto::CommittingCrimeTogether,
+            EventKind::FishingTogether => EventKindDto::FishingTogether,
+            EventKind::NakedHorseRidingTogether => EventKindDto::NakedHorseRidingTogether,
             EventKind::CustomTogether => EventKindDto::CustomTogether,
         }
     }
@@ -2960,6 +2967,12 @@ mod tests {
             (
                 EventKind::CommittingCrimeTogether,
                 "committing_crime_together",
+            ),
+            // Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6.
+            (EventKind::FishingTogether, "fishing_together"),
+            (
+                EventKind::NakedHorseRidingTogether,
+                "naked_horse_riding_together",
             ),
         ] {
             let dto = EventKindDto::from(kind);

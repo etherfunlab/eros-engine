@@ -211,6 +211,15 @@ pub enum UserAction {
     SingTogether,
     SkinnyDipTogether,
     CommitCrimeTogether,
+    /// The user asks her to go fishing with them (spec 2026-11-27-swim-
+    /// outfit-ladder-and-fish-together-design.md §6.1): behaves as
+    /// `hike_together` does, two to three hours.
+    FishTogether,
+    /// The user asks her to ride a horse naked with them (spec 2026-11-27
+    /// §6.2): romance-gated and answered in the `emotional` tone as
+    /// `skinny_dip_together` is, a refusal drops chemistry, and her period
+    /// does not roll it.
+    RideHorseNakedTogether,
     /// The user asks her to do something with them, in their own words (spec
     /// 2026-11-26 §8): behaves as `jog_together` does, placing
     /// `custom_together`. Neither romance-gated nor emotional, and a refusal
@@ -297,6 +306,7 @@ impl UserAction {
                 | UserAction::SexTogether
                 | UserAction::StreakTogether
                 | UserAction::SkinnyDipTogether
+                | UserAction::RideHorseNakedTogether
                 | UserAction::Propose
                 | UserAction::BreakUp
                 | UserAction::Threaten
@@ -346,6 +356,8 @@ impl UserAction {
             UserAction::SingTogether => Some(EventKind::SingingTogether),
             UserAction::SkinnyDipTogether => Some(EventKind::SkinnyDippingTogether),
             UserAction::CommitCrimeTogether => Some(EventKind::CommittingCrimeTogether),
+            UserAction::FishTogether => Some(EventKind::FishingTogether),
+            UserAction::RideHorseNakedTogether => Some(EventKind::NakedHorseRidingTogether),
             UserAction::CustomTogether { .. } => Some(EventKind::CustomTogether),
             _ => None,
         }
@@ -373,6 +385,7 @@ impl UserAction {
                 | UserAction::SexTogether
                 | UserAction::StreakTogether
                 | UserAction::SkinnyDipTogether
+                | UserAction::RideHorseNakedTogether
         )
     }
 
@@ -1028,6 +1041,37 @@ mod tests {
         );
     }
 
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6.1.
+    #[test]
+    fn fish_together_names_its_event() {
+        let a = UserAction::FishTogether;
+        let v = serde_json::json!({ "type": "fish_together" });
+        assert_eq!(serde_json::to_value(&a).unwrap(), v);
+        assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+        assert_eq!(a.together_kind(), Some(EventKind::FishingTogether));
+        assert_eq!(a.consumed(), None);
+        assert_eq!(a.status_ask(), None);
+        assert_eq!(a.together_text(), None);
+        assert!(!a.speaks_emotionally());
+        assert!(!a.romance_gated());
+    }
+
+    /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §6.2.
+    #[test]
+    fn ride_horse_naked_together_is_gated_and_emotional() {
+        let a = UserAction::RideHorseNakedTogether;
+        let v = serde_json::json!({ "type": "ride_horse_naked_together" });
+        assert_eq!(serde_json::to_value(&a).unwrap(), v);
+        assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+        assert_eq!(a.together_kind(), Some(EventKind::NakedHorseRidingTogether));
+        assert!(a.romance_gated());
+        assert!(a.speaks_emotionally());
+        assert_eq!(a.refusal_line(), Some(AffinityLine::Chemistry));
+        assert_eq!(a.consumed(), None);
+        assert_eq!(a.status_ask(), None);
+        assert_eq!(a.together_text(), None);
+    }
+
     /// One of every action: each unit variant and one of each payload variant.
     fn all_actions() -> Vec<UserAction> {
         use UserAction::*;
@@ -1083,6 +1127,8 @@ mod tests {
             SingTogether,
             SkinnyDipTogether,
             CommitCrimeTogether,
+            FishTogether,
+            RideHorseNakedTogether,
             CustomTogether { text: "x".into() },
             Challenge,
             Bet,
