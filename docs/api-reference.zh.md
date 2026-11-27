@@ -1704,6 +1704,77 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   http://localhost:8080/comp/voice/{session_id}/turn/interrupt
 ```
 
+### `POST /comp/chat/{session_id}/messages/speech`
+
+把她发过的最多八条聊天消息，转成同样的文字加上行内语气标签（`[whispers]`、`[sighs]`……），交给调用方的
+TTS 模型。部署没有 [`[tasks.chat_speech]`](model-config.zh.md#taskschat_speech--聊天消息的语气标注opt-in) 时关闭。
+engine 自己不发声，也不存结果：合成一次，把音频留下。
+
+每条消息按 engine 对它知道的事来判断：角色写好的人设、这条消息写成的语气（`metadata.tone`）、两人此刻的关系
+（语音频道那句关系描述，取这个会话的亲密度、这条消息记下的 scope；约会读母会话的）、以及它前面的四行。
+每条消息调一次模型，同时进行。
+
+请求体：
+
+```json
+{ "message_ids": ["…", "…"], "rewrite": false, "stream": false }
+```
+
+| 字段 | 取值 |
+|---|---|
+| `message_ids` | 这个会话里 1 到 8 条不重复的消息 id，和历史接口返回的一样 |
+| `rewrite` | 可选，默认 `false`：她的话一字不改，只加标签；emoji 和括号里的旁白删掉或改成标签。`true` 时允许模型把这句改得更适合念出来 |
+| `stream` | 可选，默认 `false`。`true` 或请求头 `Accept: text/event-stream` 时以流返回 |
+
+**JSON 响应** —— 请求体格式正确就回 `200`，每个 id 一项，顺序和请求一致：
+
+```json
+{ "items": [
+  { "message_id": "…", "text": "[whispers] 你怎么才来 [sighs] 我等好久了",
+    "truncated": false, "model": "…", "usage": { … }, "generation_id": "…" },
+  { "message_id": "…", "error": { "code": "not_speakable", "message": "…" } }
+] }
+```
+
+| 单项错误 | 何时 |
+|---|---|
+| `not_found` | 这个会话里没有这条消息 |
+| `not_speakable` | 这条不是她的，或者没有文字 |
+| `generation_failed` | 每一个模型都失败了，或者输出是空的 |
+
+`truncated: true` 表示模型提前停了（长度上限或内容过滤，或者有了文字之后连接断了）：文字不完整，念不念由调用方决定。
+
+**流** —— 帧和聊天流相同（`data: <json>`，15 秒一个 `ping`）。各项同时进行，帧会交错；每一帧用 `message_id`
+（原消息的 id）标明属于哪一项：
+
+- `delta` —— 某一项正在生成的文字；
+- `done` —— 某一项结束：`message_id`、`text`（整句，已去掉首尾空白）、`truncated`、`usage`、`generation_id`；
+- `item_error` —— `{ "type": "item_error", "message_id", "code", "message" }`，错误码同上；流继续；
+- `final` —— `{ "type": "final" }`，所有项都结束之后。
+
+没有 `meta` 帧。一项不会先发 `delta` 再报 `item_error`。把 delta 边收边送进 TTS 的调用方，要等标签的右括号到了
+再送。整个请求失败时发终止的 `error` 帧。
+
+| 状态 | 错误码 | 何时 |
+|---|---|---|
+| 200 | — | 请求体格式正确（单项各带自己的错误） |
+| 400 | `byoc_unsupported` | 会话的角色是自带角色 |
+| 401 | — | JWT 缺失或无效 |
+| 403 | `session_forbidden` | 会话不属于 JWT 用户 |
+| 404 | `session_not_found` | `session_id` 不存在 |
+| 409 | `wrong_channel` | 群聊或语音会话 |
+| 422 | `unprocessable` | 列表为空、超过八个、id 重复、id 无法解析 |
+| 429 | `rate_limited` | 用户的并发流上限（3）已满 |
+| 501 | `speech_disabled` | 没有 `[tasks.chat_speech]` |
+
+每次模型调用记进 `engine.llm_generations`（task 为 `chat_speech`）；其余什么都不写。
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"message_ids":["<message-id>"]}' \
+  http://localhost:8080/comp/chat/{session_id}/messages/speech
+```
+
 ## 自带角色（BYOC）
 
 BYOC 实例是一个角色引擎从不存储的角色实例。两个路由负责创建；之后 stream、compose 和图片编辑路由在 `character` 字段里接受封装好的角色卡（见上面 stream 端点的「自带角色」段落）。两个路由都需要 bearer token 和 `X-Byoc-Caller-Secret`，后者必须与部署的 `BYOC_CALLER_SECRET` 相符。它们的拒绝响应使用流前错误的响应体 `{code, message, user_message}`。流程、封装格式和记录的内容见 [byoc.zh.md](byoc.zh.md)；卡片格式见 [eros-character-v1.1.md](eros-character-v1.1.md)。

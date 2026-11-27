@@ -2232,6 +2232,90 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
   http://localhost:8080/comp/voice/{session_id}/turn/interrupt
 ```
 
+### `POST /comp/chat/{session_id}/messages/speech`
+
+Turns up to eight of her stored chat messages into the same text with inline
+audio tags (`[whispers]`, `[sighs]`, …), for the caller's text-to-speech model.
+Off unless the deployment has [`[tasks.chat_speech]`](model-config.md#taskschat_speech--speech-markup-for-chat-messages-opt-in).
+The engine speaks nothing itself, and stores no result: synthesise once and keep
+the audio.
+
+Each message is judged from what the engine knows about it: the persona's
+authored prompt, the tone the message was written in (`metadata.tone`), where
+the pair stands (the voice channel's relationship line, read from the session's
+affinity under the scope the message recorded; a date reads its parent
+session's), and the four rows before it. One model call per message; the calls
+run at once.
+
+Body:
+
+```json
+{ "message_ids": ["…", "…"], "rewrite": false, "stream": false }
+```
+
+| field | value |
+|---|---|
+| `message_ids` | 1 to 8 distinct message ids of this session, as the history route returns them |
+| `rewrite` | optional, default `false`: her words are kept and only tags are added; emoji and bracketed narration are dropped or turned into tags. `true` lets the model rephrase the line for the ear |
+| `stream` | optional, default `false`. `true`, or an `Accept: text/event-stream` header, answers as a stream |
+
+**JSON response** — `200` whenever the body is well formed, one item per id in
+request order:
+
+```json
+{ "items": [
+  { "message_id": "…", "text": "[whispers] 你怎么才来 [sighs] 我等好久了",
+    "truncated": false, "model": "…", "usage": { … }, "generation_id": "…" },
+  { "message_id": "…", "error": { "code": "not_speakable", "message": "…" } }
+] }
+```
+
+| item error | when |
+|---|---|
+| `not_found` | no such message in this session |
+| `not_speakable` | the message is not hers, or has no text |
+| `generation_failed` | every model hop failed, or the output was blank |
+
+`truncated: true` means the model stopped early (its length limit or its
+content filter, or the connection died after text arrived): the text is
+incomplete, and speaking it is the caller's call.
+
+**Stream** — frames as the chat stream's (`data: <json>`, a 15 s `ping`). Items
+run at once and their frames interleave; each names its item by `message_id`,
+the source message's id:
+
+- `delta` — text of one item as it is generated;
+- `done` — the end of one item: `message_id`, `text` (the whole line, trimmed),
+  `truncated`, `usage`, `generation_id`;
+- `item_error` — `{ "type": "item_error", "message_id", "code", "message" }` with
+  the codes above; the stream goes on;
+- `final` — `{ "type": "final" }`, after every item has ended.
+
+No `meta` frame. An item never sends `delta` and then `item_error`. A client
+feeding deltas to its TTS model waits for a tag's closing bracket before sending
+it on. A terminal `error` frame means the whole request died.
+
+| Status | Code | When |
+|---|---|---|
+| 200 | — | the body was well formed (items carry their own errors) |
+| 400 | `byoc_unsupported` | the session's persona is a bring-your-own character |
+| 401 | — | missing or invalid JWT |
+| 403 | `session_forbidden` | session not owned by the JWT user |
+| 404 | `session_not_found` | unknown `session_id` |
+| 409 | `wrong_channel` | a group or a voice session |
+| 422 | `unprocessable` | an empty list, more than eight ids, a repeated id, an id that does not parse |
+| 429 | `rate_limited` | the user's concurrent-stream cap (3) is reached |
+| 501 | `speech_disabled` | no `[tasks.chat_speech]` |
+
+Each model call is recorded in `engine.llm_generations` (task `chat_speech`);
+nothing else is written.
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+  -d '{"message_ids":["<message-id>"]}' \
+  http://localhost:8080/comp/chat/{session_id}/messages/speech
+```
+
 ## Bring your own character (BYOC)
 
 A BYOC instance is a persona instance whose character the engine never stores.

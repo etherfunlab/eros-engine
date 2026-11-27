@@ -154,7 +154,7 @@ That cost is the end user's spend, not the deployment's, so spend queries
 exclude `model LIKE '%@byok'` (see [byok.md](byok.md#what-is-recorded)).
 
 **Full task vocabulary.** Every `[tasks.*]` key that makes a chat-completion
-call now writes here: `chat_companion`, `chat_voice`, `chat_product_qa`,
+call now writes here: `chat_companion`, `chat_voice`, `chat_speech`, `chat_product_qa`,
 `chat_input_filter`, `chat_output_filter`, `chat_vision`,
 `chat_image_prompt_compose`, `chat_image_edit_compose`, `pde_decision`,
 `group_director`, `affinity_evaluation`, `affinity_summary`, `activity_judge`, `insight_extraction`,
@@ -570,6 +570,7 @@ strictly finer than one would have been: it separates `chat_companion` from
 | `group_director` | `companion_decision_events` | — |
 | `affinity_evaluation` | `companion_affinity_events` | — |
 | `activity_judge` | `companion_affinity_events` | the date's `activity` row |
+| `chat_speech` | — | none: a failed hop is logged, and its generation, when it has one, is in `llm_generations` |
 
 The input filter is the one call site that had **no failure record of any
 kind** before v1.4.0. Its failures land on the `role='user'` row, beside the

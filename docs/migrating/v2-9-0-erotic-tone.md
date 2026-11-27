@@ -1,4 +1,4 @@
-# Migrating to v2.8.5: the erotic tone
+# Migrating to v2.9.0: the erotic tone
 
 **Applies to:**
 - deployments that want the `erotic` chat tone;
