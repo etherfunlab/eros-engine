@@ -1476,12 +1476,21 @@ mod tests {
             remain_clothing: Default::default(),
             ignore_orientation: true,
         };
-        assert!(together_ruled_out(&scoped(UserAction::sex_together(), false), false));
-        assert!(!together_ruled_out(&scoped(UserAction::sex_together(), true), false));
+        assert!(together_ruled_out(
+            &scoped(UserAction::sex_together(), false),
+            false
+        ));
+        assert!(!together_ruled_out(
+            &scoped(UserAction::sex_together(), true),
+            false
+        ));
         assert!(!together_ruled_out(&scoped(bypass.clone(), false), false));
         assert!(!together_ruled_out(&scoped(bypass.clone(), true), false));
         for a in [UserAction::ShowerTogether, UserAction::StreakTogether] {
-            assert!(!together_ruled_out(&scoped(a.clone(), false), false), "{a:?}");
+            assert!(
+                !together_ruled_out(&scoped(a.clone(), false), false),
+                "{a:?}"
+            );
         }
         assert!(period_refuses(&action_msg(bypass), true, 0.5));
     }

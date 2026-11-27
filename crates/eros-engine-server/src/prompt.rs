@@ -1712,7 +1712,9 @@ pub(crate) fn intimacy(
     let (leading, led) = match &remain {
         RemainClothing::Flag(false) => (NAKED.to_string(), NAKED.to_string()),
         RemainClothing::Flag(true) => ("穿着衣服".to_string(), "穿着衣服".to_string()),
-        RemainClothing::Sides { active, passive } => (side(active.as_ref()), side(passive.as_ref())),
+        RemainClothing::Sides { active, passive } => {
+            (side(active.as_ref()), side(passive.as_ref()))
+        }
     };
     let (her, theirs) = if lead == Party::Persona {
         (leading, led)
@@ -1723,7 +1725,11 @@ pub(crate) fn intimacy(
         her_clothing: her,
         section: format!(
             "[亲密]\n主动的一方：{}\n对方穿着：{theirs}",
-            if lead == Party::Persona { "角色" } else { "对方" }
+            if lead == Party::Persona {
+                "角色"
+            } else {
+                "对方"
+            }
         ),
     }
 }
@@ -6115,7 +6121,11 @@ mod tests {
         // Her own ask's row: no action, the same defaults.
         assert_eq!(intimacy(None, Some(UM), Wearer::Female), i);
         // `true`: both dressed.
-        let i = intimacy(Some(&act(None, RemainClothing::Flag(true))), Some(UM), Wearer::Female);
+        let i = intimacy(
+            Some(&act(None, RemainClothing::Flag(true))),
+            Some(UM),
+            Wearer::Female,
+        );
         assert_eq!(i.her_clothing, "穿着衣服");
         assert!(i.section.ends_with("对方穿着：穿着衣服"), "{}", i.section);
         // Per side, the persona leading: she wears the active side.
@@ -6123,11 +6133,19 @@ mod tests {
             active: Some(SideClothing::HalfNaked),
             passive: Some(SideClothing::Custom("只穿袜子".into())),
         };
-        let i = intimacy(Some(&act(Some(Party::Persona), sides.clone())), Some(UM), Wearer::Female);
+        let i = intimacy(
+            Some(&act(Some(Party::Persona), sides.clone())),
+            Some(UM),
+            Wearer::Female,
+        );
         assert_eq!(i.her_clothing, "半裸");
         assert_eq!(i.section, "[亲密]\n主动的一方：角色\n对方穿着：只穿袜子");
         // The user leading: she wears the passive side; a missing side is naked.
-        let i = intimacy(Some(&act(Some(Party::User), sides)), Some(UM), Wearer::Female);
+        let i = intimacy(
+            Some(&act(Some(Party::User), sides)),
+            Some(UM),
+            Wearer::Female,
+        );
         assert_eq!(i.her_clothing, "只穿袜子");
         assert_eq!(i.section, "[亲密]\n主动的一方：对方\n对方穿着：半裸");
         let one = RemainClothing::Sides {
@@ -6153,7 +6171,10 @@ mod tests {
         assert_eq!(action_phrase(&UserAction::sex_together()), "想和你上床");
         assert_eq!(action_phrase(&named), "想和你上床：「姿势甲」");
         assert_eq!(doing_label(HavingSexTogether, None), "和对方上床");
-        assert_eq!(doing_label(HavingSexTogether, Some("姿势甲")), "和对方上床：「姿势甲」");
+        assert_eq!(
+            doing_label(HavingSexTogether, Some("姿势甲")),
+            "和对方上床：「姿势甲」"
+        );
     }
 
     /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §4.

@@ -394,17 +394,17 @@ impl UserAction {
             self.together_group(),
             Some(TogetherGroup::Nude | TogetherGroup::Sex)
         ) || matches!(
-                self,
-                UserAction::FrenchKiss
-                    | UserAction::Tease
-                    | UserAction::HugFromBehind
-                    | UserAction::Touch
-                    | UserAction::Strip
-                    | UserAction::Propose
-                    | UserAction::BreakUp
-                    | UserAction::Threaten
-                    | UserAction::Tip { .. }
-            )
+            self,
+            UserAction::FrenchKiss
+                | UserAction::Tease
+                | UserAction::HugFromBehind
+                | UserAction::Touch
+                | UserAction::Strip
+                | UserAction::Propose
+                | UserAction::BreakUp
+                | UserAction::Threaten
+                | UserAction::Tip { .. }
+        )
     }
 
     /// The group of the kind this together action places (spec 2026-11-27

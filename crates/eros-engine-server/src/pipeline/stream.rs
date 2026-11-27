@@ -4488,7 +4488,10 @@ pub(crate) async fn passion_scene(
         action.cloned()
     } else {
         match current.foreground.as_ref().and_then(|e| e.message_id) {
-            Some(id) => match (eros_engine_store::events::EventRepo { pool }).action_of(id).await {
+            Some(id) => match (eros_engine_store::events::EventRepo { pool })
+                .action_of(id)
+                .await
+            {
                 Ok(v) => v.and_then(|v| serde_json::from_value(v).ok()),
                 Err(e) => {
                     tracing::warn!(message_id = %id, "image-compose: passion act read failed: {e}");
@@ -4499,8 +4502,12 @@ pub(crate) async fn passion_scene(
         }
     }
     .filter(|a| matches!(a, UserAction::SexTogether { .. }));
-    let name = act.as_ref().and_then(UserAction::together_text).map(str::to_string);
-    let intimacy = crate::prompt::intimacy(act.as_ref(), user_gender, crate::prompt::wearer(persona));
+    let name = act
+        .as_ref()
+        .and_then(UserAction::together_text)
+        .map(str::to_string);
+    let intimacy =
+        crate::prompt::intimacy(act.as_ref(), user_gender, crate::prompt::wearer(persona));
     Some((intimacy, name))
 }
 
@@ -12574,7 +12581,11 @@ data: [DONE]\n\n";
             .expect("a sex foreground");
         assert_eq!(name.as_deref(), Some("姿势甲"));
         assert_eq!(intimacy.her_clothing, "半裸");
-        assert!(intimacy.section.contains("主动的一方：角色"), "{}", intimacy.section);
+        assert!(
+            intimacy.section.contains("主动的一方：角色"),
+            "{}",
+            intimacy.section
+        );
 
         sqlx::query("UPDATE engine.persona_events SET message_id = NULL")
             .execute(&pool)
@@ -12589,7 +12600,11 @@ data: [DONE]\n\n";
             .expect("a sex foreground");
         assert_eq!(name, None);
         assert_eq!(intimacy.her_clothing, "什么都没穿");
-        assert!(intimacy.section.contains("主动的一方：对方"), "{}", intimacy.section);
+        assert!(
+            intimacy.section.contains("主动的一方：对方"),
+            "{}",
+            intimacy.section
+        );
     }
 
     /// §5: no other kind is covered: an accepted jog's picture reads as the
@@ -12947,7 +12962,9 @@ data: [DONE]\n\n";
         )
         .await;
         assert_eq!(action_response_of(&frames), "refuse");
-        assert!(events_of_kind(&pool, "having_sex_together").await.is_empty());
+        assert!(events_of_kind(&pool, "having_sex_together")
+            .await
+            .is_empty());
         let (context, _) = turn_affinity_row(&pool, umid).await;
         assert_eq!(context["tier_drop"], "chemistry", "{context}");
     }
@@ -24731,8 +24748,9 @@ data: [DONE]\n\n"
                 "（无）",
                 None,
                 None,
+                None,
                 None
-            , None),
+            ),
             base
         );
         let ctx = ImageCompanionContext {
@@ -24782,8 +24800,9 @@ data: [DONE]\n\n"
                 "（无）",
                 None,
                 None,
+                None,
                 None
-            , None),
+            ),
             base
         );
         assert_eq!(
@@ -24802,8 +24821,9 @@ data: [DONE]\n\n"
                 "（无）",
                 Some("  "),
                 None,
+                None,
                 None
-            , None),
+            ),
             base
         );
     }
@@ -24948,8 +24968,7 @@ data: [DONE]\n\n"
         assert_eq!(with["partner_gender"], "女性");
         assert_eq!(with["current_state"], "和对方一起慢跑");
         let without = compose_inputs_json_with(
-            &persona, None, "s", "m", "anime", None, None, None, None, None,
-            None,
+            &persona, None, "s", "m", "anime", None, None, None, None, None, None,
         );
         assert_eq!(without["partner_gender"], "");
         let wrapper = compose_inputs_json(&persona, None, "s", "m", "anime", None, None);
@@ -25218,8 +25237,7 @@ data: [DONE]\n\n"
         );
         assert_eq!(with["current_state"], "洗澡中");
         let without = compose_inputs_json_with(
-            &persona, None, "s", "m", "anime", None, None, None, None, None,
-            None,
+            &persona, None, "s", "m", "anime", None, None, None, None, None, None,
         );
         assert_eq!(without["current_state"], "");
         let wrapper = compose_inputs_json(&persona, None, "s", "m", "anime", None, None);

@@ -4435,10 +4435,9 @@ data: [DONE]\n\n";
     fn sex_together_accepts_plain_or_base64_names() {
         use eros_engine_core::types::UserAction;
         let plain = sex_dto(json!({"type": "sex_together", "name": " 姿势甲 "})).unwrap();
-        let encoded = sex_dto(
-            json!({"type": "sex_together", "name_base64": b64("姿势甲".as_bytes())}),
-        )
-        .unwrap();
+        let encoded =
+            sex_dto(json!({"type": "sex_together", "name_base64": b64("姿势甲".as_bytes())}))
+                .unwrap();
         assert_eq!(plain, encoded);
         assert!(matches!(
             plain,
@@ -4471,7 +4470,10 @@ data: [DONE]\n\n";
                 "both fields",
                 json!({"type": "sex_together", "name": "姿势甲", "name_base64": b64(b"x")}),
             ),
-            ("not base64", json!({"type": "sex_together", "name_base64": "!!!"})),
+            (
+                "not base64",
+                json!({"type": "sex_together", "name_base64": "!!!"}),
+            ),
             (
                 "not UTF-8",
                 json!({"type": "sex_together", "name_base64": b64(&[0xff, 0xfe])}),
@@ -4490,14 +4492,15 @@ data: [DONE]\n\n";
     #[test]
     fn sex_together_reads_every_clothing_shape() {
         use eros_engine_core::types::{RemainClothing, SideClothing, UserAction};
-        let clothing = |rc: Value| match sex_dto(json!({"type": "sex_together", "remain_clothing": rc}))
-            .unwrap()
-        {
-            UserAction::SexTogether {
-                remain_clothing, ..
-            } => remain_clothing,
-            other => panic!("{other:?}"),
-        };
+        let clothing =
+            |rc: Value| match sex_dto(json!({"type": "sex_together", "remain_clothing": rc}))
+                .unwrap()
+            {
+                UserAction::SexTogether {
+                    remain_clothing, ..
+                } => remain_clothing,
+                other => panic!("{other:?}"),
+            };
         assert_eq!(clothing(json!(false)), RemainClothing::Flag(false));
         assert_eq!(clothing(json!(true)), RemainClothing::Flag(true));
         assert_eq!(
@@ -4549,7 +4552,10 @@ data: [DONE]\n\n";
         assert!(!v.to_string().contains("姿势甲"), "{v}");
         let old = UserActionView::from_metadata_action(&json!({"type": "sex_together"}))
             .expect("an old row parses");
-        assert_eq!(serde_json::to_value(&old).unwrap(), json!({"type": "sex_together"}));
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            json!({"type": "sex_together"})
+        );
     }
 
     fn invite(n: u32, place: &str, content: &str) -> Value {
@@ -4585,7 +4591,8 @@ data: [DONE]\n\n";
         .into_iter()
         .enumerate()
         {
-            let body = json!({"content": "", "client_msg_id": msg_id(40 + n as u32), "action": action});
+            let body =
+                json!({"content": "", "client_msg_id": msg_id(40 + n as u32), "action": action});
             let (status, resp) = send_request(&mut app, async_send(session_id, &token, body)).await;
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{action}: {resp}");
             assert_eq!(resp["code"], "unprocessable", "{action}: {resp}");

@@ -377,8 +377,11 @@ impl EventRepo<'_> {
         }
         // A custom_together's text and a sex_together's act ride on the
         // user's message (spec 2026-11-27-passion-group-design.md §5.3).
-        let message_id = matches!(e.kind, EventKind::CustomTogether | EventKind::HavingSexTogether)
-            .then_some(user_message_id);
+        let message_id = matches!(
+            e.kind,
+            EventKind::CustomTogether | EventKind::HavingSexTogether
+        )
+        .then_some(user_message_id);
         Self::insert_preempting_pointing_in_tx(tx, e, message_id).await?;
         Ok(())
     }
