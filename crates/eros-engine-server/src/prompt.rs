@@ -285,6 +285,30 @@ pub(crate) fn erotic_line(chem_tier: u8) -> &'static str {
     }
 }
 
+/// The one `[this_turn]` line of a `mean` turn, set by the pair's bond tier
+/// (spec 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+/// §6.2): tiers 1–2 the first, tier 3 the second, tiers 4–5 the third. The
+/// closer the pair, the less she explains.
+pub(crate) fn mean_line(bond_tier: u8) -> &'static str {
+    match bond_tier {
+        0..=2 => "你还在生对方的气：话里带刺，回得冷淡简短，不主动缓和",
+        3 => "你们在冷战，你不想好好说话：挑对方话里的毛病，冷言冷语，一句带过",
+        _ => "你心里憋着火：说话刻薄，不留情面，也不解释自己为什么生气",
+    }
+}
+
+/// The one `[this_turn]` line of a `drowsy` turn, set by the pair's chemistry
+/// tier (same spec, §7.2): tiers 1–2 the first, tier 3 the second, tiers 4–5
+/// the third. The line also says they just woke side by side: nothing else in
+/// the prompt does.
+pub(crate) fn drowsy_line(chem_tier: u8) -> &'static str {
+    match chem_tier {
+        0..=2 => "你们一起睡了一觉，你刚醒，脑子还没转起来：说得含糊简短，想到什么说什么",
+        3 => "你刚在对方身边睡醒，人还迷糊：话少、慢半拍，带着没睡够的黏糊",
+        _ => "你刚醒，还赖在对方身边不想动：声音懒懒的，回得短，带一点撒娇",
+    }
+}
+
 /// Veto-then-roll (spec 2026-09-13 §3.2 moves the call site, not the odds):
 /// an axis the affinity has already judged cold (same floors and scope gating
 /// as the cold `[mood]` directives) keeps its die out of the cup entirely.
@@ -973,6 +997,8 @@ pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) ->
         GivenItem::Coffee => ("杯", "咖啡"),
         GivenItem::Herb => ("包", "药草"),
         GivenItem::Cuisine => ("道", "菜"),
+        GivenItem::Dessert => ("份", "甜点"),
+        GivenItem::Soup => ("碗", "汤"),
         GivenItem::Watch => ("块", "手表"),
         GivenItem::Gem => ("颗", "宝石"),
         GivenItem::Gold => ("块", "黄金"),
@@ -1009,6 +1035,8 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
     const COFFEE: [&str; 4] = ["提了点神", "精神起来了", "精神很足", "心跳得有点快"];
     const HERB: [&str; 4] = ["药草劲还轻", "药草见效了", "药草劲很足", "药草劲太冲"];
     const CUISINE: [&str; 4] = ["回味还在", "吃得挺满足", "吃得正香", "吃撑了"];
+    const DESSERT: [&str; 4] = ["嘴里还留着甜", "吃得挺开心", "甜得正满足", "甜得发腻"];
+    const SOUP: [&str; 4] = ["胃里还暖着", "喝得挺舒服", "浑身暖和", "喝得肚子发胀"];
     let words = match item {
         GivenItem::Cigarette => &CIGARETTE,
         GivenItem::Alcohol => &ALCOHOL,
@@ -1019,6 +1047,8 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
         GivenItem::Coffee => &COFFEE,
         GivenItem::Herb => &HERB,
         GivenItem::Cuisine => &CUISINE,
+        GivenItem::Dessert => &DESSERT,
+        GivenItem::Soup => &SOUP,
         // A valuable has an empty curve, so no effect ever names one.
         GivenItem::Watch
         | GivenItem::Gem
@@ -1089,6 +1119,9 @@ pub(crate) fn needs_line(
         (habits.drug, "很想抽口大麻"),
         (habits.coffee, "很想喝杯咖啡"),
         (habits.gluttony, "很想吃顿好的"),
+        (habits.sugar, "很想吃点甜的"),
+        (habits.salty, "很想吃点咸的"),
+        (habits.spicy, "很想吃点辣的"),
     ]
     .into_iter()
     .filter_map(|(set, words)| (set == Some(true)).then_some(words))
@@ -1946,9 +1979,12 @@ pub(crate) fn persona_traits(
 }
 
 /// Whether the persona smokes, drinks, uses weed, drinks coffee, loves good
-/// food (spec 2026-10-28-outing-indulgence-needs-and-habits-design.md §3,
-/// 2026-11-08 §4): `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`,
-/// `gluttony`; a key that is not a boolean reads as unset.
+/// food, has a taste for sweet, salt or spice, and whether she is on a diet
+/// (spec 2026-10-28-outing-indulgence-needs-and-habits-design.md §3,
+/// 2026-11-08 §4, 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-
+/// design.md §5): `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`,
+/// `gluttony`, `sugar`, `salty`, `spicy`, `diet`; a key that is not a boolean
+/// reads as unset.
 pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::needs::Habits {
     let key = |k: &str| persona.genome.art_metadata.get(k).and_then(|v| v.as_bool());
     eros_engine_core::needs::Habits {
@@ -1957,6 +1993,10 @@ pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::ne
         drug: key("drug"),
         coffee: key("coffee"),
         gluttony: key("gluttony"),
+        sugar: key("sugar"),
+        salty: key("salty"),
+        spicy: key("spicy"),
+        diet: key("diet"),
     }
 }
 
@@ -2134,16 +2174,17 @@ pub(crate) fn render_recall_sections(
 /// `user_profile = false` leaves the `[user_profile]` block out, header and
 /// placeholder included (the `emotional` tone).
 ///
-/// `focused = true` renders the `focused` tone (spec
+/// `focused = Some(line)` renders the `focused` tone or the `mean` one (spec
 /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
-/// §5.4): no `[feelings]`, `[reply_length]` at the lowest tier whatever the
-/// affinity and the mode, and `[this_turn]` holding `FOCUSED_WORK_LINE` alone.
+/// §5.4, 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+/// §6.2): no `[feelings]`, `[reply_length]` at the lowest tier whatever the
+/// affinity and the mode, and `[this_turn]` holding `line` alone.
 ///
-/// `erotic = Some((affinity, scope))` renders the two things the `erotic`
-/// tone adds to the `emotional` prompt (spec 2026-11-27-erotic-tone-design.md
-/// §7): the `[relationship]` block of that affinity and scope, and
-/// `[this_turn]` holding `erotic_line` of its chemistry tier alone. Nothing
-/// else reads it.
+/// `erotic = Some((affinity, scope, line))` renders the two things the
+/// `erotic` tone and the `drowsy` one add to the `emotional` prompt (spec
+/// 2026-11-27-erotic-tone-design.md §7, 2026-11-28 §7.2): the
+/// `[relationship]` block of that affinity and scope, and `[this_turn]`
+/// holding `line` alone. Nothing else reads it.
 #[allow(clippy::too_many_arguments)] // signature mirrors the gateway's port-of-origin
 fn render_prompt(
     persona: &CompanionPersona,
@@ -2205,8 +2246,8 @@ fn render_prompt(
     // right after the birthday line. Empty ⇒ no line.
     anniversaries: &[String],
     user_profile: bool,
-    focused: bool,
-    erotic: Option<(&Affinity, AffinityScope)>,
+    focused: Option<&'static str>,
+    erotic: Option<(&Affinity, AffinityScope, &'static str)>,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -2294,7 +2335,7 @@ fn render_prompt(
     };
 
     let relationship = match erotic {
-        Some((a, scope)) => relationship_ground(Some(a), scope, persona),
+        Some((a, scope, _)) => relationship_ground(Some(a), scope, persona),
         None => relationship_ground(affinity, affinity_scope, persona),
     };
     let attitude = affinity
@@ -2309,7 +2350,7 @@ fn render_prompt(
     // this section is more cache-stable than the floats it replaces. A focused
     // turn renders no such block.
     let state = affinity
-        .filter(|_| !focused && affinity_scope.active_count() > 0)
+        .filter(|_| focused.is_none() && affinity_scope.active_count() > 0)
         .and_then(|a| a.feeling_clause.as_deref())
         .map(str::trim)
         .filter(|c| !c.is_empty())
@@ -2518,10 +2559,10 @@ fn render_prompt(
     // the behavior, so absence is the default (naming demonstrates, #329).
     let this_turn = {
         let mut won: Vec<&str> = Vec::new();
-        if let Some((a, _)) = erotic {
-            won.push(erotic_line(a.chem_tier()));
-        } else if focused {
-            won.push(FOCUSED_WORK_LINE);
+        if let Some((_, _, line)) = erotic {
+            won.push(line);
+        } else if let Some(line) = focused {
+            won.push(line);
         } else {
             if nudges.affirm {
                 won.push("给对方「小小有成就感」的反应，留余地");
@@ -2573,7 +2614,7 @@ fn render_prompt(
         })
         .collect();
 
-    let lr = if focused {
+    let lr = if focused.is_some() {
         length_rule(None, affinity_scope, None)
     } else {
         length_rule(affinity, affinity_scope, reply_mode)
@@ -2655,7 +2696,7 @@ pub fn build_prompt(
         shared_memories,
         anniversaries,
         true,
-        false,
+        None,
         None,
     )
 }
@@ -2738,7 +2779,47 @@ pub fn build_erotic_prompt(
         needs,
         event,
         shared_memories,
-        Some((affinity, affinity_scope)),
+        Some((affinity, affinity_scope, erotic_line(affinity.chem_tier()))),
+    )
+}
+
+/// The `drowsy` tone's system prompt (spec
+/// 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+/// §7.2): the `erotic` prompt with `drowsy_line` of the chemistry tier in
+/// place of the erotic line.
+#[allow(clippy::too_many_arguments)]
+pub fn build_drowsy_prompt(
+    persona: &CompanionPersona,
+    reply_mode: Option<ReplyMode>,
+    clothing: Option<&str>,
+    prompt_traits: &[PromptTrait],
+    world: Option<&WorldContext>,
+    stories: Option<&StoriesContext>,
+    quote: Option<&QuotedMessage>,
+    character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    now: &NowContext,
+    body_state: Option<&str>,
+    needs: Option<&str>,
+    event: Option<&EventLines>,
+    shared_memories: Option<&str>,
+    affinity: &Affinity,
+    affinity_scope: AffinityScope,
+) -> String {
+    emotional_template(
+        persona,
+        reply_mode,
+        clothing,
+        prompt_traits,
+        world,
+        stories,
+        quote,
+        character_state,
+        now,
+        body_state,
+        needs,
+        event,
+        shared_memories,
+        Some((affinity, affinity_scope, drowsy_line(affinity.chem_tier()))),
     )
 }
 
@@ -2758,7 +2839,7 @@ fn emotional_template(
     needs: Option<&str>,
     event: Option<&EventLines>,
     shared_memories: Option<&str>,
-    erotic: Option<(&Affinity, AffinityScope)>,
+    erotic: Option<(&Affinity, AffinityScope, &'static str)>,
 ) -> String {
     render_prompt(
         persona,
@@ -2783,8 +2864,63 @@ fn emotional_template(
         shared_memories,
         &[],
         false,
-        false,
+        None,
         erotic,
+    )
+}
+
+/// The template the `focused` and the `mean` prompts share: the default
+/// prompt without `[feelings]` and `[emotional_context]`, `[reply_length]` at
+/// the lowest tier, and `[this_turn]` holding `line` alone. Every other
+/// parameter is documented on `render_prompt`.
+#[allow(clippy::too_many_arguments)]
+fn focused_template(
+    persona: &CompanionPersona,
+    profile_groups: &[(String, Vec<String>)],
+    relationship_facts: &[String],
+    affinity: Option<&Affinity>,
+    hints: &[String],
+    reply_mode: Option<ReplyMode>,
+    clothing: Option<&str>,
+    prompt_traits: &[PromptTrait],
+    affinity_scope: AffinityScope,
+    world: Option<&WorldContext>,
+    stories: Option<&StoriesContext>,
+    quote: Option<&QuotedMessage>,
+    character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    now: &NowContext,
+    body_state: Option<&str>,
+    needs: Option<&str>,
+    event: Option<&EventLines>,
+    shared_memories: Option<&str>,
+    anniversaries: &[String],
+    line: &'static str,
+) -> String {
+    render_prompt(
+        persona,
+        profile_groups,
+        relationship_facts,
+        affinity,
+        hints,
+        reply_mode,
+        clothing,
+        prompt_traits,
+        affinity_scope,
+        &[],
+        world,
+        stories,
+        quote,
+        character_state,
+        TurnNudges::default(),
+        now,
+        body_state,
+        needs,
+        event,
+        shared_memories,
+        anniversaries,
+        true,
+        Some(line),
+        None,
     )
 }
 
@@ -2815,7 +2951,7 @@ pub fn build_focused_prompt(
     shared_memories: Option<&str>,
     anniversaries: &[String],
 ) -> String {
-    render_prompt(
+    focused_template(
         persona,
         profile_groups,
         relationship_facts,
@@ -2825,21 +2961,67 @@ pub fn build_focused_prompt(
         clothing,
         prompt_traits,
         affinity_scope,
-        &[],
         world,
         stories,
         quote,
         character_state,
-        TurnNudges::default(),
         now,
         body_state,
         needs,
         event,
         shared_memories,
         anniversaries,
-        true,
-        true,
-        None,
+        FOCUSED_WORK_LINE,
+    )
+}
+
+/// The `mean` tone's system prompt (spec
+/// 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+/// §6.2): the `focused` prompt with `mean_line` of the bond tier in place of
+/// the work line; without an affinity, the lowest tier's line.
+#[allow(clippy::too_many_arguments)]
+pub fn build_mean_prompt(
+    persona: &CompanionPersona,
+    profile_groups: &[(String, Vec<String>)],
+    relationship_facts: &[String],
+    affinity: Option<&Affinity>,
+    hints: &[String],
+    reply_mode: Option<ReplyMode>,
+    clothing: Option<&str>,
+    prompt_traits: &[PromptTrait],
+    affinity_scope: AffinityScope,
+    world: Option<&WorldContext>,
+    stories: Option<&StoriesContext>,
+    quote: Option<&QuotedMessage>,
+    character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    now: &NowContext,
+    body_state: Option<&str>,
+    needs: Option<&str>,
+    event: Option<&EventLines>,
+    shared_memories: Option<&str>,
+    anniversaries: &[String],
+) -> String {
+    focused_template(
+        persona,
+        profile_groups,
+        relationship_facts,
+        affinity,
+        hints,
+        reply_mode,
+        clothing,
+        prompt_traits,
+        affinity_scope,
+        world,
+        stories,
+        quote,
+        character_state,
+        now,
+        body_state,
+        needs,
+        event,
+        shared_memories,
+        anniversaries,
+        mean_line(affinity.map_or(1, |a| a.bond_tier())),
     )
 }
 
@@ -5396,6 +5578,7 @@ mod tests {
             drug: Some(false),
             coffee: Some(false),
             gluttony: Some(false),
+            ..Default::default()
         };
         let drinker = Habits {
             alcoholic: Some(true),
@@ -5438,6 +5621,7 @@ mod tests {
             drug: Some(true),
             coffee: Some(true),
             gluttony: None,
+            ..Default::default()
         };
         let smoke_and_weed = Habits {
             alcoholic: Some(false),
@@ -5487,6 +5671,7 @@ mod tests {
             drug: Some(true),
             coffee: Some(true),
             gluttony: Some(true),
+            ..Default::default()
         };
         for (pick, want) in [
             (0.0, "很想抽根烟"),
@@ -5505,6 +5690,45 @@ mod tests {
         assert_eq!(
             needs_line(&n, glutton, 0.0).as_deref(),
             Some("很想吃顿好的")
+        );
+    }
+
+    /// The three tastes come after `gluttony` in the pick list, in the order
+    /// sugar, salty, spicy; `diet` is never named (spec 2026-11-28-dessert-
+    /// soup-taste-habits-mean-and-drowsy-tones-design.md §5).
+    #[test]
+    fn a_high_indulgence_may_name_a_taste() {
+        use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
+        let n = Needs {
+            social: Mid,
+            emotional: Mid,
+            outing: Mid,
+            indulgence: High,
+        };
+        let h = Habits {
+            sugar: Some(true),
+            salty: Some(true),
+            spicy: Some(true),
+            diet: Some(true),
+            ..Habits::default()
+        };
+        assert_eq!(needs_line(&n, h, 0.0).as_deref(), Some("很想吃点甜的"));
+        assert_eq!(needs_line(&n, h, 0.5).as_deref(), Some("很想吃点咸的"));
+        assert_eq!(needs_line(&n, h, 0.99).as_deref(), Some("很想吃点辣的"));
+        let glut = Habits {
+            gluttony: Some(true),
+            sugar: Some(true),
+            ..Habits::default()
+        };
+        assert_eq!(needs_line(&n, glut, 0.0).as_deref(), Some("很想吃顿好的"));
+        assert_eq!(needs_line(&n, glut, 0.5).as_deref(), Some("很想吃点甜的"));
+        let dieting = Habits {
+            diet: Some(true),
+            ..Habits::default()
+        };
+        assert_eq!(
+            needs_line(&n, dieting, 0.0).as_deref(),
+            Some("很想放纵一下")
         );
     }
 
@@ -6518,9 +6742,17 @@ mod tests {
                 drug: None,
                 coffee: Some(true),
                 gluttony: None,
+                ..Default::default()
             }
         );
         assert_eq!(with(serde_json::json!({"drug": 1})).drug, None);
+        let h =
+            with(serde_json::json!({"sugar": "true", "salty": true, "spicy": false, "diet": 1}));
+        assert_eq!(
+            (h.sugar, h.salty, h.spicy, h.diet),
+            (None, Some(true), Some(false), None)
+        );
+        assert_eq!(with(serde_json::json!({"diet": true})).diet, Some(true));
         assert_eq!(
             with(serde_json::json!({"gluttony": false})).gluttony,
             Some(false)
@@ -8808,6 +9040,29 @@ mod tests {
     }
 
     #[test]
+    fn a_dessert_and_a_soup_have_their_phrases_and_effect_words() {
+        assert_eq!(given_phrase(GivenItem::Dessert, None, 1), "1 份甜点");
+        assert_eq!(
+            given_phrase(GivenItem::Dessert, Some("提拉米苏"), 1),
+            "1 份「提拉米苏」"
+        );
+        assert_eq!(given_phrase(GivenItem::Soup, None, 1), "1 碗汤");
+        assert_eq!(
+            given_phrase(GivenItem::Soup, Some("罗宋汤"), 2),
+            "2 碗「罗宋汤」"
+        );
+        let words = |item| -> Vec<&str> { (1..=4).map(|l| effect_word(item, l)).collect() };
+        assert_eq!(
+            words(GivenItem::Dessert),
+            ["嘴里还留着甜", "吃得挺开心", "甜得正满足", "甜得发腻"]
+        );
+        assert_eq!(
+            words(GivenItem::Soup),
+            ["胃里还暖着", "喝得挺舒服", "浑身暖和", "喝得肚子发胀"]
+        );
+    }
+
+    #[test]
     fn a_dish_has_its_own_effect_words_and_jewelry_none() {
         let words: Vec<&str> = (1..=4)
             .map(|l| effect_word(GivenItem::Cuisine, l))
@@ -9385,6 +9640,149 @@ mod tests {
 
             let e = emotional(mode, None);
             assert!(!e.contains("你手上有工作"), "{mode:?}: {e}");
+        }
+    }
+
+    // ─── The `mean` and `drowsy` tones (spec 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md §6.2, §7.2) ───
+
+    const MEAN_LINES: [&str; 3] = [
+        "你还在生对方的气：话里带刺，回得冷淡简短，不主动缓和",
+        "你们在冷战，你不想好好说话：挑对方话里的毛病，冷言冷语，一句带过",
+        "你心里憋着火：说话刻薄，不留情面，也不解释自己为什么生气",
+    ];
+    const DROWSY_LINES: [&str; 3] = [
+        "你们一起睡了一觉，你刚醒，脑子还没转起来：说得含糊简短，想到什么说什么",
+        "你刚在对方身边睡醒，人还迷糊：话少、慢半拍，带着没睡够的黏糊",
+        "你刚醒，还赖在对方身边不想动：声音懒懒的，回得短，带一点撒娇",
+    ];
+    const FOCUSED_WORK_TEXT: &str = "你手上有工作，心思在工作上：回得简短利落，先顾手上的事";
+
+    #[test]
+    fn the_mean_and_the_drowsy_line_follow_their_tier() {
+        for (tier, band) in [(0, 0), (1, 0), (2, 0), (3, 1), (4, 2), (5, 2)] {
+            assert_eq!(mean_line(tier), MEAN_LINES[band], "bond tier {tier}");
+            assert_eq!(drowsy_line(tier), DROWSY_LINES[band], "chem tier {tier}");
+        }
+    }
+
+    fn mean_prompt_of(a: &Affinity, reply_mode: Option<ReplyMode>) -> String {
+        build_mean_prompt(
+            &fixture_persona(),
+            &focused_profile(),
+            &["FACT-LINE".to_string()],
+            Some(a),
+            &focused_hints(),
+            reply_mode,
+            None,
+            &[],
+            AffinityScope::full(),
+            None,
+            None,
+            None,
+            None,
+            &NowContext::default(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+        )
+    }
+
+    /// Bond tiers 2, 3 and 5: one of each band.
+    #[test]
+    fn a_mean_prompt_is_the_focused_prompt_with_its_own_line() {
+        for (bond, band) in [(0.20, 0), (0.50, 1), (0.95, 2)] {
+            let mut a = lines(bond, 0.50);
+            a.relationship.cold_war_since = Some(chrono::Utc::now());
+            a.feeling_clause = Some(FOCUSED_CLAUSE.into());
+            for mode in FOCUSED_MODES {
+                let m = mean_prompt_of(&a, mode);
+                let f = focused_prompt_of(&a, mode);
+                assert!(f.contains(FOCUSED_WORK_TEXT), "{f}");
+                assert_eq!(
+                    m,
+                    f.replace(FOCUSED_WORK_TEXT, MEAN_LINES[band]),
+                    "bond {bond} {mode:?}"
+                );
+                assert!(m.contains("你们正在冷战"), "{m}");
+                assert_eq!(m.matches("[this_turn]").count(), 1, "{m}");
+            }
+        }
+    }
+
+    /// Without an affinity the line is the lowest band's.
+    #[test]
+    fn a_mean_prompt_without_an_affinity_reads_the_lowest_band() {
+        let m = build_mean_prompt(
+            &fixture_persona(),
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            &[],
+            AffinityScope::full(),
+            None,
+            None,
+            None,
+            None,
+            &NowContext::default(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert!(m.contains(MEAN_LINES[0]), "{m}");
+    }
+
+    fn drowsy(a: &Affinity, scope: AffinityScope, reply_mode: Option<ReplyMode>) -> String {
+        build_drowsy_prompt(
+            &fixture_persona(),
+            reply_mode,
+            Some("白衬衫"),
+            &emotional_traits(),
+            Some(&WorldContext {
+                digest: "WORLD-DIGEST".into(),
+                fragments: vec![],
+            }),
+            Some(&StoriesContext {
+                digest: "STORY-DIGEST".into(),
+                episodes: vec![],
+            }),
+            None,
+            None,
+            &NowContext::default(),
+            Some("微醺"),
+            Some("想找人说说话"),
+            None,
+            None,
+            a,
+            scope,
+        )
+    }
+
+    /// Chemistry tiers 2, 3 and 5: one of each band.
+    #[test]
+    fn a_drowsy_prompt_is_the_erotic_prompt_with_its_own_line() {
+        for (chem, tier, band) in [(0.20, 2, 0), (0.50, 3, 1), (0.95, 5, 2)] {
+            let mut a = lines(0.70, chem);
+            a.relationship.status = RelationshipStatus::Dating;
+            assert_eq!(a.chem_tier(), tier);
+            let scope = AffinityScope::full();
+            let d = drowsy(&a, scope, None);
+            let e = erotic(&a, scope, None);
+            assert!(e.contains(erotic_line(tier)), "{e}");
+            assert_eq!(
+                d,
+                e.replace(erotic_line(tier), DROWSY_LINES[band]),
+                "chem {chem}"
+            );
+            assert!(d.contains("[relationship]"), "{d}");
+            assert!(!d.contains("[user_profile]"), "{d}");
+            assert_eq!(d.matches("[this_turn]").count(), 1, "{d}");
         }
     }
 

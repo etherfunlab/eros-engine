@@ -5534,7 +5534,7 @@
         "properties": {
           "card": {
             "type": "object",
-            "description": "An `eros-character` card (`spec`, `spec_version` `\"1\"` or `\"1.1\"`,\n`data`), at most 64 KiB once serialised."
+            "description": "An `eros-character` card (`spec`, `spec_version` `\"1\"`, `\"1.1\"` or\n`\"1.2\"`, `data`), at most 64 KiB once serialised."
           },
           "id": {
             "type": [
@@ -6390,7 +6390,7 @@
       },
       "GivenItemDto": {
         "type": "string",
-        "description": "What a `give` action hands over. Consumables (`cigarette` through\n`cuisine`) linger on the persona; valuables (`watch` through `horse`) do\nnot.",
+        "description": "What a `give` action hands over. Consumables (`cigarette` through\n`soup`) linger on the persona; valuables (`watch` through `horse`) do\nnot.",
         "enum": [
           "cigarette",
           "alcohol",
@@ -6401,6 +6401,8 @@
           "coffee",
           "herb",
           "cuisine",
+          "dessert",
+          "soup",
           "watch",
           "gem",
           "gold",
@@ -8856,7 +8858,7 @@
         "properties": {
           "card": {
             "type": "object",
-            "description": "An `eros-character` card (`spec`, `spec_version` `\"1\"` or `\"1.1\"`,\n`data`), at most 64 KiB once serialised."
+            "description": "An `eros-character` card (`spec`, `spec_version` `\"1\"`, `\"1.1\"` or\n`\"1.2\"`, `data`), at most 64 KiB once serialised."
           }
         },
         "additionalProperties": false

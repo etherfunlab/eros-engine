@@ -30,14 +30,18 @@ pub struct Needs {
     #[serde(default)]
     pub outing: NeedLevel,
     /// `high` craves what she's hooked on: a smoke, a drink, weed, a coffee,
-    /// a good meal.
+    /// a good meal, something sweet, salty or spicy.
     #[serde(default)]
     pub indulgence: NeedLevel,
 }
 
 /// Whether the persona smokes, drinks, uses weed, drinks coffee, loves good
-/// food: `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`,
-/// each `None` when unset (spec 2026-10-28 §3, 2026-11-08 §4).
+/// food, has a sweet tooth, a taste for salt or for spice:
+/// `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`,
+/// `sugar`, `salty`, `spicy`, each `None` when unset (spec 2026-10-28 §3,
+/// 2026-11-08 §4, 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-
+/// design.md §5.1). `diet` (`art_metadata.diet`) is carried with them for the
+/// give roll alone: it is not a habit (§5.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Habits {
     pub smoking: Option<bool>,
@@ -45,10 +49,15 @@ pub struct Habits {
     pub drug: Option<bool>,
     pub coffee: Option<bool>,
     pub gluttony: Option<bool>,
+    pub sugar: Option<bool>,
+    pub salty: Option<bool>,
+    pub spicy: Option<bool>,
+    /// `true` is on a diet.
+    pub diet: Option<bool>,
 }
 
 impl Habits {
-    /// How many of the five are `true`.
+    /// How many of the eight habits are `true`. `diet` is not one.
     pub fn count_true(self) -> usize {
         [
             self.smoking,
@@ -56,14 +65,18 @@ impl Habits {
             self.drug,
             self.coffee,
             self.gluttony,
+            self.sugar,
+            self.salty,
+            self.spicy,
         ]
         .into_iter()
         .filter(|h| *h == Some(true))
         .count()
     }
 
-    /// The key for what `item` is: tobacco, alcohol, weed, coffee or a dish.
-    /// `None` for any other item, or when the key is unset.
+    /// The key for what `item` is: tobacco, alcohol, weed, coffee, a dish or
+    /// a dessert. `None` for any other item, or when the key is unset.
+    /// `salty` and `spicy` are the key of no item.
     pub fn uses(self, item: GivenItem) -> Option<bool> {
         match item {
             GivenItem::Cigarette => self.smoking,
@@ -71,8 +84,21 @@ impl Habits {
             GivenItem::Herb => self.drug,
             GivenItem::Coffee => self.coffee,
             GivenItem::Cuisine => self.gluttony,
+            GivenItem::Dessert => self.sugar,
             _ => None,
         }
+    }
+
+    /// Whether a give of `item` takes the habit roll: its key is explicitly
+    /// `false`, or she is on a diet and it is food, a dish or a dessert. A
+    /// diet decides alone, whatever she craves; soup and every drink pass.
+    pub fn rolls_on(self, item: GivenItem) -> bool {
+        self.uses(item) == Some(false)
+            || (self.diet == Some(true)
+                && matches!(
+                    item,
+                    GivenItem::Food | GivenItem::Cuisine | GivenItem::Dessert
+                ))
     }
 }
 
@@ -163,12 +189,13 @@ pub fn next_change(rated: Needs, hours: f64, habits: Habits) -> Option<f64> {
 
 /// What an accepted give of `item` does to (social, indulgence), in levels
 /// (spec 2026-10-30 §2.1, 2026-11-08 §3, 2026-11-16 §4.2): tobacco, drink,
-/// weed and a dish loosen her up; medicine and coffee do the opposite. `None`
-/// for an item that moves nothing, plain food included.
+/// weed, a dish and a dessert loosen her up; medicine and coffee do the
+/// opposite. `None` for an item that moves nothing, plain food and soup
+/// included.
 fn give_move(item: GivenItem) -> Option<(i8, i8)> {
     use GivenItem::*;
     Some(match item {
-        Cigarette | Alcohol | Herb | Cuisine => (1, 1),
+        Cigarette | Alcohol | Herb | Cuisine | Dessert => (1, 1),
         Medicine | Coffee => (-1, -1),
         _ => return None,
     })
@@ -229,6 +256,7 @@ mod tests {
             drug: set(2),
             coffee: set(3),
             gluttony: set(4),
+            ..Habits::default()
         }
     }
 
@@ -597,12 +625,94 @@ mod tests {
             drug: None,
             coffee: Some(false),
             gluttony: None,
+            ..Habits::default()
         };
         assert_eq!(h.uses(GivenItem::Cigarette), Some(true));
         assert_eq!(h.uses(GivenItem::Alcohol), Some(false));
         assert_eq!(h.uses(GivenItem::Herb), None);
         assert_eq!(h.uses(GivenItem::Coffee), Some(false));
         assert_eq!(h.uses(GivenItem::Tea), None);
+    }
+
+    #[test]
+    fn a_dessert_moves_needs_as_a_dish_does_and_a_soup_moves_none() {
+        assert_eq!(
+            after_give(Some(all(Mid)), None, GivenItem::Dessert),
+            after_give(Some(all(Mid)), None, GivenItem::Cuisine)
+        );
+        assert!(after_give(Some(all(Mid)), None, GivenItem::Dessert).is_some());
+        assert_eq!(after_give(Some(all(Mid)), None, GivenItem::Soup), None);
+    }
+
+    #[test]
+    fn the_three_tastes_are_habits_and_diet_is_not() {
+        let h = Habits {
+            sugar: Some(true),
+            salty: Some(true),
+            spicy: Some(true),
+            diet: Some(true),
+            ..Habits::default()
+        };
+        assert_eq!(h.count_true(), 3);
+        assert_eq!(h.uses(GivenItem::Dessert), Some(true));
+        assert_eq!(h.uses(GivenItem::Soup), None);
+        assert_eq!(indulgence_drift(h), (High, 4.0));
+        let dieting = Habits {
+            diet: Some(true),
+            ..Habits::default()
+        };
+        assert_eq!(dieting.count_true(), 0);
+    }
+
+    #[test]
+    fn what_takes_the_roll() {
+        use GivenItem::*;
+        let diet = Habits {
+            diet: Some(true),
+            gluttony: Some(true),
+            sugar: Some(true),
+            ..Habits::default()
+        };
+        for i in [Food, Cuisine, Dessert] {
+            assert!(diet.rolls_on(i), "{i:?}");
+        }
+        for i in [Soup, SoftDrink, Tea, Coffee, Alcohol, Flower] {
+            assert!(!diet.rolls_on(i), "{i:?}");
+        }
+        for d in [Some(false), None] {
+            let h = Habits {
+                diet: d,
+                ..Habits::default()
+            };
+            for i in [Food, Cuisine, Dessert] {
+                assert!(!h.rolls_on(i), "{d:?} {i:?}");
+            }
+        }
+        let no_sugar = Habits {
+            sugar: Some(false),
+            ..Habits::default()
+        };
+        assert!(no_sugar.rolls_on(Dessert) && !no_sugar.rolls_on(Food));
+        for (k, h) in [
+            (
+                "salty",
+                Habits {
+                    salty: Some(false),
+                    ..Habits::default()
+                },
+            ),
+            (
+                "spicy",
+                Habits {
+                    spicy: Some(false),
+                    ..Habits::default()
+                },
+            ),
+        ] {
+            for i in [Food, Cuisine, Dessert, Soup] {
+                assert!(!h.rolls_on(i), "{k} {i:?}");
+            }
+        }
     }
 
     #[test]

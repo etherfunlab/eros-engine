@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Genome write routes (`/svc/v1/genomes`): create and update a persona genome
-//! from an `eros-character` card (docs/eros-character-v1.1.md).
+//! from an `eros-character` card (docs/eros-character-v1.2.md).
 //!
 //! Admitted by the shared secret header `x-genome-write-secret`, never by a
 //! user token, and mounted only when the deployment sets
@@ -34,8 +34,8 @@ pub struct CreateGenomeRequest {
     /// request writes nothing and answers `200`, so a retried create leaves
     /// one row. Omitted: the engine mints one.
     pub id: Option<Uuid>,
-    /// An `eros-character` card (`spec`, `spec_version` `"1"` or `"1.1"`,
-    /// `data`), at most 64 KiB once serialised.
+    /// An `eros-character` card (`spec`, `spec_version` `"1"`, `"1.1"` or
+    /// `"1.2"`, `data`), at most 64 KiB once serialised.
     #[schema(value_type = Object)]
     pub card: serde_json::Value,
 }
@@ -43,8 +43,8 @@ pub struct CreateGenomeRequest {
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateGenomeRequest {
-    /// An `eros-character` card (`spec`, `spec_version` `"1"` or `"1.1"`,
-    /// `data`), at most 64 KiB once serialised.
+    /// An `eros-character` card (`spec`, `spec_version` `"1"`, `"1.1"` or
+    /// `"1.2"`, `data`), at most 64 KiB once serialised.
     #[schema(value_type = Object)]
     pub card: serde_json::Value,
 }

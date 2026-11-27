@@ -45,7 +45,7 @@ model_name_display_override = true
 # gating. See docs/prompt-traits.md.
 #allow_traits = ["nsfw_boost","politics_open"]
 # Chat tones (optional). The engine decides the tone of a reply; the judge does
-# not. Three keys, each off when absent or 0, each working without the others.
+# not. Five keys, each off when absent or 0, each working without the others.
 # With `emotional` above 0:
 # - a 1:1 text turn without a user action is `emotional` with this base
 #   probability, times 3 for a persona whose art_metadata.moody is true (a
@@ -77,9 +77,22 @@ model_name_display_override = true
 # 1:1 text turn from chemistry tier 3, whatever the value. A persona whose
 # art_metadata.is_virgin is true is never erotic below chemistry tier 4. An
 # erotic reply is an emotional one that is also told who the user is to her.
-# erotic wins over emotional, and emotional over focused.
+# With `mean` above 0, a 1:1 text turn without a user action is `mean` with
+# that probability while the pair's cold war is on. A mean reply keeps the
+# history and the relationship, is brief (at most one sentence and 40
+# characters), and is told one line by the bond tier: she is cold and has an
+# edge. Her replies are part of what the judge reads, so a cold war may last
+# longer with it on.
+# With `drowsy` above 0, her first text reply after an asleep_together or a
+# having_sex_together event ended is `drowsy` with that probability, on a
+# turn without a user action, within 12 hours of the end and with no
+# incident under way. A drowsy reply is written as an erotic one is (no
+# history, told who the user is to her), with one line by the chemistry tier:
+# she just woke beside them.
+# mean wins over drowsy, drowsy over erotic, erotic over emotional, and
+# emotional over focused.
 # Task-level.
-#tones = { emotional = 0.05, focused = 1.0, erotic = 1.0 }
+#tones = { emotional = 0.05, focused = 1.0, erotic = 1.0, mean = 1.0, drowsy = 1.0 }
 
 # Per-tier overrides are OPTIONAL and downstream-defined: `tier` is whatever
 # your product sends per request. The OSS template enables none — with no tier

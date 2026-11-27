@@ -2,7 +2,9 @@
 //! The tone of a chat turn, drawn by the engine and never by the judge
 //! (spec 2026-11-12-chat-tone-emotional-design.md §3; the `focused` tone is
 //! spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §5;
-//! the `erotic` tone is spec 2026-11-27-erotic-tone-design.md).
+//! the `erotic` tone is spec 2026-11-27-erotic-tone-design.md; the `mean` and
+//! `drowsy` tones are spec
+//! 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md §6–§8).
 
 use crate::events::{Employment, EventKind, TogetherGroup};
 use crate::needs::{NeedLevel, Needs};
@@ -25,6 +27,12 @@ pub enum Tone {
     /// `[relationship]` block and one line set by the chemistry tier (spec
     /// 2026-11-27-erotic-tone-design.md §7).
     Erotic,
+    /// The reply of someone in a cold war: `Focused`'s prompt, with one line
+    /// set by the bond tier in place of the work line.
+    Mean,
+    /// The reply of someone who just woke beside the user: `Erotic`'s prompt,
+    /// with one line set by the chemistry tier in place of the erotic one.
+    Drowsy,
 }
 
 impl Tone {
@@ -35,6 +43,8 @@ impl Tone {
             Tone::Emotional => "emotional",
             Tone::Focused => "focused",
             Tone::Erotic => "erotic",
+            Tone::Mean => "mean",
+            Tone::Drowsy => "drowsy",
         }
     }
 
@@ -42,7 +52,14 @@ impl Tone {
     /// holds for an `emotional` message holds for it (spec
     /// 2026-11-27-erotic-tone-design.md §7.3).
     pub fn on_emotional_template(self) -> bool {
-        matches!(self, Tone::Emotional | Tone::Erotic)
+        matches!(self, Tone::Emotional | Tone::Erotic | Tone::Drowsy)
+    }
+
+    /// Whether the message is built as a `focused` one is: the default prompt
+    /// with one line alone in `[this_turn]`, and whatever holds for a
+    /// `focused` message holds for it.
+    pub fn on_focused_template(self) -> bool {
+        matches!(self, Tone::Focused | Tone::Mean)
     }
 }
 
@@ -204,6 +221,24 @@ pub fn everyday_erotic_probability(
         && gate.chem_tier >= EVERYDAY_MIN_CHEM_TIER
         && everyday_foreground_allows(foreground))
     .then_some(STRONG_DESIRE_P)
+}
+
+/// The chance that a turn is `mean`, or `None` when no roll is made: `key`
+/// (`tones.mean`) while the session's cold war is on. At `0` or below the
+/// tone is off.
+pub fn mean_probability(key: f64, cold_war: bool) -> Option<f64> {
+    (key > 0.0 && cold_war).then_some(key)
+}
+
+/// How long after an `EventKind::WAKES_FROM` event ended she still counts as
+/// just awake.
+pub const WOKE_WITHIN_HOURS: i64 = 12;
+
+/// The chance that a turn is `drowsy`, or `None` when no roll is made: `key`
+/// (`tones.drowsy`) when she just woke beside the user and no incident is
+/// under way. At `0` or below the tone is off.
+pub fn drowsy_probability(key: f64, just_woke: bool, foreground: Option<EventKind>) -> Option<f64> {
+    (key > 0.0 && just_woke && foreground.is_none()).then_some(key)
 }
 
 /// Whether a `roll` in `[0, 1)` wins against the probability `p`.
@@ -494,6 +529,46 @@ mod tests {
         ] {
             assert_eq!(p(&gate(5), Some(true), Some(fg)), None, "{fg:?}");
         }
+    }
+
+    #[test]
+    fn mean_rolls_only_in_a_cold_war() {
+        assert_eq!(mean_probability(0.4, true), Some(0.4));
+        assert_eq!(mean_probability(1.0, true), Some(1.0));
+        assert_eq!(mean_probability(1.0, false), None);
+        for key in [0.0, -0.1] {
+            assert_eq!(mean_probability(key, true), None);
+        }
+    }
+
+    #[test]
+    fn drowsy_rolls_when_she_just_woke_with_nothing_under_way() {
+        assert_eq!(drowsy_probability(0.4, true, None), Some(0.4));
+        assert_eq!(drowsy_probability(1.0, false, None), None);
+        for fg in [Reading, TempWork, OnADate] {
+            assert_eq!(drowsy_probability(1.0, true, Some(fg)), None, "{fg:?}");
+        }
+        for key in [0.0, -0.1] {
+            assert_eq!(drowsy_probability(key, true, None), None);
+        }
+        assert_eq!(WOKE_WITHIN_HOURS, 12);
+        assert_eq!(
+            EventKind::WAKES_FROM,
+            [EventKind::AsleepTogether, EventKind::HavingSexTogether]
+        );
+    }
+
+    #[test]
+    fn the_templates_and_names_of_the_two_tones() {
+        assert!(Tone::Drowsy.on_emotional_template() && !Tone::Mean.on_emotional_template());
+        assert!(Tone::Mean.on_focused_template() && Tone::Focused.on_focused_template());
+        for t in [Tone::Default, Tone::Emotional, Tone::Erotic, Tone::Drowsy] {
+            assert!(!t.on_focused_template(), "{t:?}");
+        }
+        assert_eq!(
+            (Tone::Mean.as_str(), Tone::Drowsy.as_str()),
+            ("mean", "drowsy")
+        );
     }
 
     #[test]

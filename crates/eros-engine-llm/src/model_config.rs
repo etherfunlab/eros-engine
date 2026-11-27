@@ -806,6 +806,19 @@ pub struct Tones {
     /// enforced by `validate_tones`; `0.0` is off.
     #[serde(default)]
     pub erotic: f64,
+    /// Probability that a 1:1 text turn without a user action is written in
+    /// the `mean` tone while the session's cold war is on (spec
+    /// 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+    /// §6). Legal range `[0.0, 1.0]`, enforced by `validate_tones`; `0.0` is
+    /// off.
+    #[serde(default)]
+    pub mean: f64,
+    /// Probability that her first text reply after an `asleep_together` or
+    /// `having_sex_together` event ended is written in the `drowsy` tone
+    /// (same spec, §7). Legal range `[0.0, 1.0]`, enforced by
+    /// `validate_tones`; `0.0` is off.
+    #[serde(default)]
+    pub drowsy: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1863,6 +1876,26 @@ impl ModelConfig {
             .get("chat_companion")
             .and_then(|t| t.tones)
             .map(|t| t.erotic)
+            .unwrap_or(0.0)
+    }
+
+    /// chat_companion task-level `tones.mean` probability during a cold war;
+    /// `0.0` when unset.
+    pub fn tone_mean_probability(&self) -> f64 {
+        self.tasks
+            .get("chat_companion")
+            .and_then(|t| t.tones)
+            .map(|t| t.mean)
+            .unwrap_or(0.0)
+    }
+
+    /// chat_companion task-level `tones.drowsy` probability after she woke
+    /// beside the user; `0.0` when unset.
+    pub fn tone_drowsy_probability(&self) -> f64 {
+        self.tasks
+            .get("chat_companion")
+            .and_then(|t| t.tones)
+            .map(|t| t.drowsy)
             .unwrap_or(0.0)
     }
 
@@ -3022,6 +3055,8 @@ impl ModelConfig {
                 ("emotional", tones.emotional),
                 ("focused", tones.focused),
                 ("erotic", tones.erotic),
+                ("mean", tones.mean),
+                ("drowsy", tones.drowsy),
             ] {
                 if !v.is_finite() || !(0.0..=1.0).contains(&v) {
                     return Err(format!(
@@ -6459,6 +6494,40 @@ temperature = 0.8
             .is_err(),
             "an unknown tone name fails the parse"
         );
+    }
+
+    #[test]
+    fn tones_mean_and_drowsy_parse_default_to_zero_and_are_range_checked() {
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ntones = { mean = 0.3, drowsy = 1 }\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tone_mean_probability(), 0.3);
+        assert_eq!(cfg.tone_drowsy_probability(), 1.0);
+        assert_eq!(cfg.tone_emotional_probability(), 0.0);
+        cfg.validate_tones().unwrap();
+
+        let others = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ntones = { emotional = 0.05 }\n",
+        )
+        .unwrap();
+        assert_eq!(others.tone_mean_probability(), 0.0);
+        assert_eq!(others.tone_drowsy_probability(), 0.0);
+        let absent = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert_eq!(absent.tone_mean_probability(), 0.0);
+        assert_eq!(absent.tone_drowsy_probability(), 0.0);
+
+        for (key, bad) in [("mean", "1.5"), ("drowsy", "-0.1"), ("mean", "nan")] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel = \"m\"\ntones = {{ {key} = {bad} }}\n"
+            ))
+            .unwrap();
+            let err = cfg.validate_tones().unwrap_err();
+            assert!(
+                err.contains("chat_companion") && err.contains(&format!("tones.{key}")),
+                "{key} = {bad}: {err}"
+            );
+        }
     }
 
     #[test]

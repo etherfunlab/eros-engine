@@ -745,7 +745,11 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
             None,
             None,
             Some(&event_lines),
-            erotic,
+            if erotic {
+                eros_engine_core::tone::Tone::Erotic
+            } else {
+                eros_engine_core::tone::Tone::Emotional
+            },
         )
         .await?
     } else {
