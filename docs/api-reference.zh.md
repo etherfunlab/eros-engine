@@ -430,7 +430,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **脱衣服。** `strip` 是用户脱她的衣服，只有性向相容的一对才可能被接受：这一轮的 `affinity_scope` 含暧昧感轴，`memory_scope` 是什么都不影响。其余的 `strip` 在判官运行之前就判为拒绝，不管判官怎么答，也不管有没有 LLM 判官，并像任何被拒的身体动作一样让 chemistry 线降一档。被接受的 `strip` 让她这一轮没穿衣服：穿着写成衣服被对方脱掉了，有指定 `outfit` 时写成「{outfit}」被对方脱掉了，进回复也进图。有出图能力时它像拍照一样回她的图（见下）。
 
-**请她自己脱。** `ask_strip` 是 `strip` 的被动态：用户请她脱衣服，她自己动手。规则全部照 `strip`：性向不相容的一对在判官之前就判为拒绝，其余由判官决定，被拒降 chemistry，被接受且有出图能力时回她的图。被接受时脱到哪一步由这一对的 chemistry 档位决定，写成她这一轮的穿着，进回复也进图：档 1 自己脱了外套（指定了 `outfit` 时是 自己脱了外套，里面还穿着「{outfit}」），档 2 自己脱到只剩内衣，档 3 自己脱到只剩内裤，上身用手遮着（非女性角色是 自己脱到只剩内裤），档 4 自己全脱了，用手遮着，档 5 自己全脱了，不遮不掩。下一轮她照常穿着。判官会被告知在这个档位答应意味着什么（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--可选的-llm-pde-judge)）。
+**请她自己脱。** `ask_strip` 是 `strip` 的被动态：用户请她脱衣服，她自己动手。规则全部照 `strip`：性向不相容的一对在判官之前就判为拒绝，其余由判官决定，被拒降 chemistry，被接受且有出图能力时回她的图。被接受时脱到哪一步由这一对的 chemistry 档位决定，写成她这一轮的穿着，进回复也进图：档 1 自己脱了外套（指定了 `outfit` 时是 自己脱了外套，里面还穿着「{outfit}」），档 2 自己脱到只剩内衣，档 3 自己脱到只剩内裤，上身用手遮着（非女性角色是 自己脱到只剩内裤），档 4 自己全脱了，用手遮着，档 5 自己全脱了，不遮不掩。下一轮她照常穿着。判官会被告知在这个档位答应意味着什么（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。
 
 **舞风。** `ask_dancing`、`dance_together`、`dance_naked_together` 可以用 `style` 说明跳哪种舞（`custom` 时再带 `name`）。舞风只进文案：它会告诉判官和她（想和你一起跳探戈、想看你跳「机械舞」），写在舞蹈事件持续期间的那一行和图的状态里，不改任何规则。历史接口按发来的样子返回 `style` 和 `name`。各舞风的措辞见 [life-events-needs.zh.md](life-events-needs.zh.md#舞风)。
 
