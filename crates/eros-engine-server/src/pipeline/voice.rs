@@ -531,7 +531,7 @@ async fn reload_bootstrap_winner(
 /// The resolved `AffinityScope` flattens to the two halves this line can
 /// inject: any bond axis ⇒ the bond half, any chemistry axis ⇒ the
 /// chemistry half.
-fn relationship_line(affinity: &Affinity, scope: AffinityScope) -> Option<String> {
+pub(crate) fn relationship_line(affinity: &Affinity, scope: AffinityScope) -> Option<String> {
     let base = || {
         match affinity.bond_label() {
         BondLabel::Acquaintance => {

@@ -16,6 +16,7 @@ pub mod proactive;
 pub mod profile_rebuild;
 pub mod reasoning_call;
 pub mod snapshot;
+pub mod speech;
 pub mod story;
 pub mod stream;
 pub mod voice;
