@@ -6113,6 +6113,9 @@
           "naked_yoga_together",
           "naked_hiking_together",
           "naked_hot_spring_together",
+          "naked_dancing_together",
+          "massaging_together",
+          "naked_massaging_together",
           "custom_together"
         ]
       },
@@ -9004,7 +9007,7 @@
           "pat",
           "wink",
           "blink",
-          "ask_for_dance",
+          "ask_massage",
           "ask_dancing",
           "photo",
           "bluff",
@@ -9045,6 +9048,9 @@
           "yoga_naked_together",
           "hike_naked_together",
           "hot_spring_naked_together",
+          "dance_naked_together",
+          "massage_together",
+          "massage_naked_together",
           "custom_together",
           "challenge",
           "bet",
