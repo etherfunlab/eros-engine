@@ -4102,6 +4102,222 @@ mod tests {
         );
     }
 
+    // ── The erotic `sudden_desire` message (spec 2026-11-27-erotic-tone-design.md §4) ──
+
+    const EROTIC_TIER_4_LINE: &str = "- 你现在很想要对方：语气放软、放慢，带着勾人的意味";
+
+    fn with_tones_of(mut state: AppState, tones: &str) -> AppState {
+        state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel = \"companion\"\ntones = {tones}\n"
+            ))
+            .unwrap(),
+        );
+        state
+    }
+
+    /// The pair's chemistry at 0.8: tier 4, and intimacy rung 3, which
+    /// `sudden_desire` needs.
+    async fn make_lovers(pool: &PgPool, user_id: Uuid, instance_id: Uuid, session_id: Uuid) {
+        AffinityRepo { pool }
+            .load_or_create(session_id, user_id, instance_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE engine.companion_affinity \
+                SET intimacy = 0.8, tension = 0.8, updated_at = now() WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A `sudden_desire` draw under the full affinity scope.
+    fn desire_req(key: &str) -> DrawEventRequest {
+        DrawEventRequest {
+            affinity_scope: Some(serde_json::from_value(serde_json::json!("full")).unwrap()),
+            ..req(key, Some(vec![EventKindDto::SuddenDesire]))
+        }
+    }
+
+    async fn draw_desire(state: &AppState, session_id: Uuid, user_id: Uuid, r: DrawEventRequest) {
+        let out = draw_event_at(state, session_id, user_id, r, Utc::now(), rolls(0.5))
+            .await
+            .unwrap();
+        assert!(
+            out.event.is_some() && out.message.is_some(),
+            "sudden_desire told"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn sudden_desire_speaks_erotically(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        seed_history(&pool, session_id).await;
+        make_lovers(&pool, user_id, instance_id, session_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "想你了").await;
+        let state = with_tones_of(
+            with_companion(test_state(pool.clone()), &mock.uri()),
+            "{ emotional = 0.05, erotic = 1.0 }",
+        );
+        draw_desire(&state, session_id, user_id, desire_req("k")).await;
+
+        let msgs = companion_messages(&mock).await;
+        assert_eq!(msgs.len(), 2, "system + the cue: {msgs:?}");
+        let system = msgs[0]["content"].as_str().unwrap();
+        for kept in ["[relationship]\n", EROTIC_TIER_4_LINE] {
+            assert!(system.contains(kept), "{kept}: {system}");
+        }
+        for gone in ["EARLIER-", "[user_profile]", "[mood]", "[feelings]"] {
+            assert!(!system.contains(gone), "{gone} must not render: {system}");
+        }
+        assert_eq!(
+            event_tone(&pool, session_id).await.as_deref(),
+            Some("erotic")
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_streamed_sudden_desire_speaks_erotically(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        seed_history(&pool, session_id).await;
+        make_lovers(&pool, user_id, instance_id, session_id).await;
+        let mock = MockServer::start().await;
+        mount_streamed(&mock, &["想", "你了"]).await;
+        let state = with_tones_of(
+            with_companion(test_state(pool.clone()), &mock.uri()),
+            "{ emotional = 0.05, erotic = 1.0 }",
+        );
+        let frames = stream_frames(&state, session_id, user_id, desire_req("k"), 0.5).await;
+        assert_eq!(frames[0]["event"]["kind"], "sudden_desire", "{frames:?}");
+
+        let msgs = companion_messages(&mock).await;
+        assert_eq!(msgs.len(), 2, "system + the cue: {msgs:?}");
+        assert!(
+            msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains(EROTIC_TIER_4_LINE),
+            "{msgs:?}"
+        );
+        assert_eq!(
+            event_tone(&pool, session_id).await.as_deref(),
+            Some("erotic")
+        );
+    }
+
+    /// The common conditions hold at a fixed moment too: in a cold war, or
+    /// under a scope that is not romantically compatible, the message is the
+    /// `emotional` one it is today.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn sudden_desire_outside_the_common_conditions_stays_emotional(pool: PgPool) {
+        for cold_war in [true, false] {
+            let user_id = Uuid::new_v4();
+            let (instance_id, session_id) = setup(&pool, user_id).await;
+            make_lovers(&pool, user_id, instance_id, session_id).await;
+            if cold_war {
+                sqlx::query(
+                    "UPDATE engine.companion_affinity SET cold_war_since = now() \
+                      WHERE session_id = $1",
+                )
+                .bind(session_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let mock = MockServer::start().await;
+            mount_companion(&mock, "想你了").await;
+            let state = with_tones_of(
+                with_companion(test_state(pool.clone()), &mock.uri()),
+                "{ emotional = 0.05, erotic = 1.0 }",
+            );
+            // In the cold war the scope is compatible; outside it, the
+            // request names no scope and reads the default.
+            let r = if cold_war {
+                desire_req("k")
+            } else {
+                req("k", Some(vec![EventKindDto::SuddenDesire]))
+            };
+            draw_desire(&state, session_id, user_id, r).await;
+            let msgs = companion_messages(&mock).await;
+            let system = msgs[0]["content"].as_str().unwrap();
+            for gone in ["[relationship]", "[this_turn]", EROTIC_TIER_4_LINE] {
+                assert!(
+                    !system.contains(gone),
+                    "cold_war={cold_war} {gone}: {system}"
+                );
+            }
+            assert_eq!(
+                event_tone(&pool, session_id).await.as_deref(),
+                Some("emotional"),
+                "cold_war={cold_war}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn another_listed_kind_is_untouched_by_erotic(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        make_lovers(&pool, user_id, instance_id, session_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "气死我了").await;
+        let state = with_tones_of(
+            with_companion(test_state(pool.clone()), &mock.uri()),
+            "{ emotional = 0.05, erotic = 1.0 }",
+        );
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            DrawEventRequest {
+                affinity_scope: Some(serde_json::from_value(serde_json::json!("full")).unwrap()),
+                ..req("k", Some(vec![EventKindDto::Quarrel]))
+            },
+            Utc::now(),
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        assert!(out.message.is_some());
+        let msgs = companion_messages(&mock).await;
+        let system = msgs[0]["content"].as_str().unwrap();
+        for gone in ["[relationship]", "[this_turn]", EROTIC_TIER_4_LINE] {
+            assert!(!system.contains(gone), "{gone}: {system}");
+        }
+        assert_eq!(
+            event_tone(&pool, session_id).await.as_deref(),
+            Some("emotional")
+        );
+    }
+
+    /// With `erotic` alone and a roll that cannot win, the message is the
+    /// default one, history and all, and records `default`: a roll was made.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_lost_erotic_roll_on_sudden_desire_records_default(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        seed_history(&pool, session_id).await;
+        make_lovers(&pool, user_id, instance_id, session_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "想你了").await;
+        let state = with_tones_of(
+            with_companion(test_state(pool.clone()), &mock.uri()),
+            "{ erotic = 1e-12 }",
+        );
+        draw_desire(&state, session_id, user_id, desire_req("k")).await;
+        let msgs = companion_messages(&mock).await;
+        assert!(msgs.len() > 2, "history is sent: {msgs:?}");
+        assert_eq!(
+            event_tone(&pool, session_id).await.as_deref(),
+            Some("default")
+        );
+    }
+
     // ── custom_together (spec 2026-11-26-more-together-actions-bath-outfit-
     // chemistry-drop-and-custom-together-design.md §8.3–§8.4) ──
 
