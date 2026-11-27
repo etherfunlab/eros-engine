@@ -2921,7 +2921,7 @@ fn is_picture_action(action: &eros_engine_core::types::UserAction) -> bool {
     use eros_engine_core::types::UserAction;
     matches!(
         action,
-        UserAction::Photo | UserAction::Strip | UserAction::AskDancing
+        UserAction::Photo | UserAction::Strip | UserAction::AskDancing { .. }
     ) || action.together_kind().is_some()
 }
 
@@ -4589,7 +4589,7 @@ pub(crate) async fn passion_scene(
     let name = act
         .as_ref()
         .and_then(UserAction::together_text)
-        .map(str::to_string);
+        .map(|name| name.into_owned());
     let intimacy =
         crate::prompt::intimacy(act.as_ref(), user_gender, crate::prompt::wearer(persona));
     Some((intimacy, name))
@@ -6529,13 +6529,13 @@ pub(crate) fn run_stream_with(
                 // (spec 2026-11-26-more-together-actions-bath-outfit-
                 // chemistry-drop-and-custom-together-design.md §8.3).
                 let placed = accepted_together(user_msg.action.as_ref(), plan.action_response);
-                let doing = placed.map(|kind| {
-                    let text = user_msg
-                        .action
-                        .as_ref()
-                        .and_then(eros_engine_core::types::UserAction::together_text);
-                    (kind, text)
-                });
+                // A dance that names its style carries the style's words the
+                // same way (spec 2026-11-28-dance-styles-design.md §6).
+                let doing_words = user_msg
+                    .action
+                    .as_ref()
+                    .and_then(eros_engine_core::types::UserAction::together_text);
+                let doing = placed.map(|kind| (kind, doing_words.as_deref()));
                 let draws = matches!(
                     plan.action_type,
                     ActionType::ReplyImage | ActionType::ReplyTextImage
@@ -11909,7 +11909,7 @@ data: [DONE]\n\n";
     async fn an_accepted_ask_dancing_shows_her_dancing(pool: PgPool) {
         let (frames, composer_body) = run_picture_turn(
             &pool,
-            eros_engine_core::types::UserAction::AskDancing,
+            eros_engine_core::types::UserAction::ask_dancing(),
             Default::default(),
             Default::default(),
             None,
@@ -11928,7 +11928,7 @@ data: [DONE]\n\n";
     async fn a_forced_image_still_wins_on_ask_dancing(pool: PgPool) {
         let (frames, _) = run_picture_turn(
             &pool,
-            eros_engine_core::types::UserAction::AskDancing,
+            eros_engine_core::types::UserAction::ask_dancing(),
             Default::default(),
             Default::default(),
             None,
@@ -22346,7 +22346,7 @@ data: [DONE]\n\n";
         use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
         use eros_engine_core::types::DateDuration;
         use eros_engine_core::types::UserAction::{
-            AskDancing, BathTogether, Kiss, Photo, SaunaTogether, ShowerTogether, Strip,
+            self, BathTogether, Kiss, Photo, SaunaTogether, ShowerTogether, Strip,
         };
         let mut cases = vec![
             (Kiss, Accept, ReplyText, true, None),
@@ -22361,10 +22361,22 @@ data: [DONE]\n\n";
             (Strip, Accept, ReplyText, false, None),
             (Strip, Refuse, ReplyTextImage, true, Some(ReplyText)),
             (Strip, Refuse, ReplyText, true, None),
-            (AskDancing, Accept, ReplyText, true, Some(ReplyTextImage)),
-            (AskDancing, Accept, ReplyText, false, None),
-            (AskDancing, Refuse, ReplyTextImage, true, Some(ReplyText)),
-            (AskDancing, Refuse, ReplyText, true, None),
+            (
+                UserAction::ask_dancing(),
+                Accept,
+                ReplyText,
+                true,
+                Some(ReplyTextImage),
+            ),
+            (UserAction::ask_dancing(), Accept, ReplyText, false, None),
+            (
+                UserAction::ask_dancing(),
+                Refuse,
+                ReplyTextImage,
+                true,
+                Some(ReplyText),
+            ),
+            (UserAction::ask_dancing(), Refuse, ReplyText, true, None),
             (
                 date_of(DateDuration::Short),
                 Accept,
@@ -32062,7 +32074,7 @@ data: [DONE]\n\n"
         use eros_engine_core::types::UserAction;
         for (a, kind, label, naked) in [
             (
-                UserAction::DanceNakedTogether,
+                UserAction::dance_naked_together(),
                 "naked_dancing_together",
                 "和对方一起裸舞",
                 true,

@@ -494,9 +494,21 @@ pub struct UserActionDto {
     /// `give`: optional, a short name for what is handed over, 1–32 chars.
     /// `gift`: required, what is given, 1–64 chars. `sex_together`:
     /// optional, the act in plain text, 1–100 chars (or `name_base64`).
+    /// `ask_dancing`, `dance_together`, `dance_naked_together`: required
+    /// with `style: "custom"` and refused otherwise, the dance in the user's
+    /// own words, 1–32 chars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(max_length = 100)]
     pub name: Option<String>,
+    /// `ask_dancing`, `dance_together` and `dance_naked_together` only,
+    /// optional: which dance. One of `ballroom`, `courtly`, `sexy`, `tiktok`,
+    /// `house`, `hiphop`, `flamenco`, `oriental`, `indian`, `arabic`,
+    /// `ballet`, `jazz`, `latin`, `tango`, `cossack`, `austronesian`,
+    /// `indigenous`, `african`, `kpop`, `pole`, `folk`, `contemporary`,
+    /// `geisha`, or `custom` with `name`. Wording only: it names the dance to
+    /// her and in the picture, and changes no rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
     /// `sex_together` only: the act as base64 (STANDARD) of UTF-8 text,
     /// 1–100 chars once decoded; not together with `name`. A read of the
     /// action always returns the act here, never in `name`.
@@ -567,6 +579,42 @@ impl UserActionDto {
             }
             Ok(Some(t.to_string()))
         }
+        /// The style of a dance action and, for `custom`, its name (spec
+        /// 2026-11-28-dance-styles-design.md §5).
+        fn dance(
+            dto: &UserActionDto,
+        ) -> Result<(Option<eros_engine_core::types::DanceStyle>, Option<String>), String> {
+            use eros_engine_core::types::DanceStyle;
+            let style = match dto.style.as_deref() {
+                None => None,
+                Some(s) => Some(
+                    DanceStyle::parse(s)
+                        .ok_or_else(|| format!("action.style is not a dance style: {s:?}"))?,
+                ),
+            };
+            let name = free_text(dto.name.as_deref(), "name", MAX_ACTION_NAME_CHARS)?;
+            match (style, name) {
+                (Some(DanceStyle::Custom), None) => {
+                    Err("action.name is required with style \"custom\"".into())
+                }
+                (Some(DanceStyle::Custom), name) => Ok((style, name)),
+                (_, Some(_)) => Err("action.name goes with style \"custom\" only".into()),
+                (style, None) => Ok((style, None)),
+            }
+        }
+        if self.style.is_some()
+            && !matches!(
+                self.kind,
+                UserActionKind::AskDancing
+                    | UserActionKind::DanceTogether
+                    | UserActionKind::DanceNakedTogether
+            )
+        {
+            return Err(
+                "action.style is only for ask_dancing, dance_together and dance_naked_together"
+                    .into(),
+            );
+        }
         Ok(match self.kind {
             UserActionKind::Give => {
                 let item: GivenItem = self.item.ok_or("action.item is required for give")?.into();
@@ -591,7 +639,10 @@ impl UserActionDto {
             UserActionKind::Wink => UserAction::Wink,
             UserActionKind::Blink => UserAction::Blink,
             UserActionKind::AskMassage => UserAction::AskMassage,
-            UserActionKind::AskDancing => UserAction::AskDancing,
+            UserActionKind::AskDancing => {
+                let (style, name) = dance(self)?;
+                UserAction::AskDancing { style, name }
+            }
             UserActionKind::Photo => UserAction::Photo,
             UserActionKind::Bluff => UserAction::Bluff,
             UserActionKind::Threaten => UserAction::Threaten,
@@ -673,7 +724,10 @@ impl UserActionDto {
             UserActionKind::SwimTogether => UserAction::SwimTogether,
             UserActionKind::CycleTogether => UserAction::CycleTogether,
             UserActionKind::HikeTogether => UserAction::HikeTogether,
-            UserActionKind::DanceTogether => UserAction::DanceTogether,
+            UserActionKind::DanceTogether => {
+                let (style, name) = dance(self)?;
+                UserAction::DanceTogether { style, name }
+            }
             UserActionKind::AdventureTogether => UserAction::AdventureTogether,
             UserActionKind::PlayWithFireTogether => UserAction::PlayWithFireTogether,
             UserActionKind::SingTogether => UserAction::SingTogether,
@@ -684,7 +738,10 @@ impl UserActionDto {
             UserActionKind::YogaNakedTogether => UserAction::YogaNakedTogether,
             UserActionKind::HikeNakedTogether => UserAction::HikeNakedTogether,
             UserActionKind::HotSpringNakedTogether => UserAction::HotSpringNakedTogether,
-            UserActionKind::DanceNakedTogether => UserAction::DanceNakedTogether,
+            UserActionKind::DanceNakedTogether => {
+                let (style, name) = dance(self)?;
+                UserAction::DanceNakedTogether { style, name }
+            }
             UserActionKind::MassageTogether => UserAction::MassageTogether,
             UserActionKind::MassageNakedTogether => UserAction::MassageNakedTogether,
             UserActionKind::CustomTogether => UserAction::CustomTogether {
@@ -5301,6 +5358,7 @@ mod validate_payload_tests {
             item_kind: None,
             name: name.map(String::from),
             name_base64: None,
+            style: None,
             active: None,
             remain_clothing: None,
             ignore_orientation: None,
@@ -5320,6 +5378,7 @@ mod validate_payload_tests {
             item_kind: None,
             name: None,
             name_base64: None,
+            style: None,
             active: None,
             remain_clothing: None,
             ignore_orientation: None,
@@ -5523,7 +5582,7 @@ mod validate_payload_tests {
         for (wire, want) in [
             ("wink", UserAction::Wink),
             ("blink", UserAction::Blink),
-            ("ask_dancing", UserAction::AskDancing),
+            ("ask_dancing", UserAction::ask_dancing()),
         ] {
             let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
                 .unwrap_or_else(|e| panic!("{wire}: {e}"));
@@ -5580,7 +5639,7 @@ mod validate_payload_tests {
             (
                 "dance_together",
                 UserActionKind::DanceTogether,
-                UserAction::DanceTogether,
+                UserAction::dance_together(),
             ),
             (
                 "adventure_together",
@@ -5839,6 +5898,7 @@ mod validate_payload_tests {
             item_kind: None,
             name: None,
             name_base64: None,
+            style: None,
             active: None,
             remain_clothing: None,
             ignore_orientation: None,
@@ -5875,6 +5935,7 @@ mod validate_payload_tests {
             item_kind: kind,
             name: name.map(String::from),
             name_base64: None,
+            style: None,
             active: None,
             remain_clothing: None,
             ignore_orientation: None,
@@ -6150,7 +6211,7 @@ mod validate_payload_tests {
             (
                 "dance_naked_together",
                 UserActionKind::DanceNakedTogether,
-                UserAction::DanceNakedTogether,
+                UserAction::dance_naked_together(),
             ),
         ] {
             let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
@@ -6162,5 +6223,134 @@ mod validate_payload_tests {
             .unwrap_or_else(|| panic!("history parses a stored {wire}"));
             assert_eq!(view.action.kind, kind);
         }
+    }
+
+    // ── Dance styles (spec 2026-11-28-dance-styles-design.md §5) ──
+
+    fn dance_dto(kind: &str, style: Option<&str>, name: Option<&str>) -> UserActionDto {
+        let mut v = serde_json::json!({ "type": kind });
+        if let Some(s) = style {
+            v["style"] = serde_json::json!(s);
+        }
+        if let Some(n) = name {
+            v["name"] = serde_json::json!(n);
+        }
+        serde_json::from_value(v).expect("the request shape parses")
+    }
+
+    #[test]
+    fn a_dance_action_takes_a_style() {
+        use eros_engine_core::types::{DanceStyle, UserAction};
+        assert_eq!(
+            dance_dto("dance_together", Some("tango"), None)
+                .to_core()
+                .unwrap(),
+            UserAction::DanceTogether {
+                style: Some(DanceStyle::Tango),
+                name: None
+            }
+        );
+        assert_eq!(
+            dance_dto("ask_dancing", Some("custom"), Some("  机械舞 "))
+                .to_core()
+                .unwrap(),
+            UserAction::AskDancing {
+                style: Some(DanceStyle::Custom),
+                name: Some("机械舞".into())
+            },
+            "the name is trimmed"
+        );
+        assert_eq!(
+            dance_dto("dance_naked_together", None, None)
+                .to_core()
+                .unwrap(),
+            UserAction::dance_naked_together()
+        );
+        for style in DanceStyle::ALL {
+            if style == DanceStyle::Custom {
+                continue;
+            }
+            for kind in ["ask_dancing", "dance_together", "dance_naked_together"] {
+                assert!(
+                    dance_dto(kind, Some(style.as_str()), None)
+                        .to_core()
+                        .is_ok(),
+                    "{kind} {style:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dance_style_is_checked() {
+        let long = "舞".repeat(33);
+        for (why, dto) in [
+            (
+                "unknown style",
+                dance_dto("dance_together", Some("waltz"), None),
+            ),
+            (
+                "custom without a name",
+                dance_dto("dance_together", Some("custom"), None),
+            ),
+            (
+                "a name with another style",
+                dance_dto("ask_dancing", Some("tango"), Some("x")),
+            ),
+            (
+                "a name without a style",
+                dance_dto("ask_dancing", None, Some("x")),
+            ),
+            (
+                "a style on a gesture",
+                dance_dto("kiss", Some("tango"), None),
+            ),
+            (
+                "a style on another together action",
+                dance_dto("jog_together", Some("tango"), None),
+            ),
+            (
+                "a name too long",
+                dance_dto("dance_together", Some("custom"), Some(&long)),
+            ),
+            (
+                "a name with a line break",
+                dance_dto("dance_together", Some("custom"), Some("机\n械")),
+            ),
+            (
+                "a blank name",
+                dance_dto("dance_together", Some("custom"), Some("   ")),
+            ),
+        ] {
+            assert!(dto.to_core().is_err(), "{why}");
+        }
+        assert!(
+            dance_dto("dance_together", Some("custom"), Some(&"舞".repeat(32)))
+                .to_core()
+                .is_ok(),
+            "32 characters fit"
+        );
+    }
+
+    /// The history routes return the style and the name as they were sent.
+    #[test]
+    fn a_stored_dance_reads_back_with_its_style() {
+        let view = UserActionView::from_metadata_action(&serde_json::json!(
+            {"type": "dance_together", "style": "custom", "name": "机械舞", "response": "accept"}
+        ))
+        .expect("parses");
+        assert_eq!(view.action.kind, UserActionKind::DanceTogether);
+        assert_eq!(view.action.style.as_deref(), Some("custom"));
+        assert_eq!(view.action.name.as_deref(), Some("机械舞"));
+        let plain = UserActionView::from_metadata_action(&serde_json::json!(
+            {"type": "dance_together", "response": "accept"}
+        ))
+        .expect("parses");
+        assert_eq!(plain.action.style, None);
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"type": "dance_together", "response": "accept"}),
+            "no style, no key"
+        );
     }
 }
