@@ -468,8 +468,10 @@ pub struct EventView {
     pub started_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
     pub message_id: Option<Uuid>,
-    /// The user's words of a `custom_together`, read from the message that
-    /// asked; `null` once that message is gone, and for every other kind.
+    /// The user's words of a `custom_together`, or the words of the style a
+    /// dance names (`dancing_together`, `naked_dancing_together`), read from
+    /// the message that asked; `null` once that message is gone, for a dance
+    /// without a style, and for every other kind.
     pub text: Option<String>,
 }
 
@@ -686,8 +688,8 @@ async fn respond(
 }
 
 /// [`respond`]'s parts: the event, the row that told it, her picture. A
-/// `custom_together`'s or a user-placed `having_sex_together`'s `message_id`
-/// is the user's message that asked, never hers
+/// `custom_together`'s, a dance's or a user-placed `having_sex_together`'s
+/// `message_id` is the user's message that asked, never hers
 /// ([`eros_engine_store::events::points_at_the_user`]): it returns no message.
 async fn stored(
     state: &AppState,
