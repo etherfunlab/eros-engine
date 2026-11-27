@@ -6971,7 +6971,11 @@ pub(crate) fn run_stream_with(
                         user_msg.user_message_id, &now_ctx,
                         body_state.as_deref(), needs_text.as_deref(),
                         Some(&event_lines),
-                        erotic,
+                        if erotic {
+                            eros_engine_core::tone::Tone::Erotic
+                        } else {
+                            eros_engine_core::tone::Tone::Emotional
+                        },
                     ).await
                 } else if focused {
                     crate::pipeline::handlers::build_focused_reply_request(
@@ -6980,6 +6984,7 @@ pub(crate) fn run_stream_with(
                         user_msg.user_message_id, &now_ctx,
                         body_state.as_deref(), needs_text.as_deref(),
                         Some(&event_lines),
+                        eros_engine_core::tone::Tone::Focused,
                     ).await
                 } else {
                     crate::pipeline::handlers::build_reply_request(

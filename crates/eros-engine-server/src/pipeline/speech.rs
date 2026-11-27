@@ -33,16 +33,21 @@ const TONE_EMOTIONAL: &str =
     "She said this in the grip of a feeling, unguarded: let it show in the delivery.";
 const TONE_EROTIC_ADDS: &str = "She wants the other person: soft, slow, close, alluring.";
 const TONE_FOCUSED: &str = "She said this with her mind on her work: brisk, even, brief.";
+const TONE_MEAN: &str =
+    "She said this while angry at the other person: cold, clipped, with an edge.";
+const TONE_DROWSY: &str = "She said this just after waking up: sleepy, slow, soft.";
 
 /// The one sentence that tells the model which tone the line was written in
 /// (spec §5.1), from the row's `metadata.tone`. `erotic` is a superset of
-/// `emotional` here as in the chat prompt. `default`, an unknown value and no
-/// key say nothing.
+/// `emotional` here as in the chat prompt; `drowsy` stands alone. `default`,
+/// an unknown value and no key say nothing.
 pub(crate) fn tone_sentence(tone: Option<&str>) -> Option<String> {
     match tone? {
         "emotional" => Some(TONE_EMOTIONAL.to_string()),
         "erotic" => Some(format!("{TONE_EMOTIONAL} {TONE_EROTIC_ADDS}")),
         "focused" => Some(TONE_FOCUSED.to_string()),
+        "mean" => Some(TONE_MEAN.to_string()),
+        "drowsy" => Some(TONE_DROWSY.to_string()),
         _ => None,
     }
 }
@@ -428,6 +433,15 @@ mod tests {
             Some(format!("{EMOTIONAL} {WANTS}"))
         );
         assert_eq!(tone_sentence(Some("focused")).as_deref(), Some(FOCUSED));
+        assert_eq!(
+            tone_sentence(Some("mean")).as_deref(),
+            Some("She said this while angry at the other person: cold, clipped, with an edge.")
+        );
+        assert_eq!(
+            tone_sentence(Some("drowsy")).as_deref(),
+            Some("She said this just after waking up: sleepy, slow, soft."),
+            "alone, without the emotional sentence"
+        );
         for none in [None, Some("default"), Some("cheerful"), Some("")] {
             assert_eq!(tone_sentence(none), None, "{none:?}");
         }

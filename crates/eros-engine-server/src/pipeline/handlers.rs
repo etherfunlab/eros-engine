@@ -1014,15 +1014,18 @@ pub(crate) async fn build_reply_request(
         needs,
         event,
         None,
-        false,
+        eros_engine_core::tone::Tone::Default,
     )
     .await
 }
 
 /// The reply request of a `focused` turn (spec
 /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
-/// §5.4): the default request with the focused system prompt. History, the
-/// profile, memories and `[reactions]` are the default's.
+/// §5.4), or of a `mean` one (spec
+/// 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+/// §6.2): the default request with that tone's system prompt. History, the
+/// profile, memories and `[reactions]` are the default's. `tone` is
+/// `Tone::Focused` or `Tone::Mean`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_focused_reply_request(
     state: &AppState,
@@ -1036,6 +1039,7 @@ pub(crate) async fn build_focused_reply_request(
     body_state: Option<&str>,
     needs: Option<&str>,
     event: Option<&crate::prompt::EventLines>,
+    tone: eros_engine_core::tone::Tone,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     build_reply_request_with(
         state,
@@ -1051,17 +1055,20 @@ pub(crate) async fn build_focused_reply_request(
         needs,
         event,
         None,
-        true,
+        tone,
     )
     .await
 }
 
 /// [`build_reply_request`] for one group speaker: `group` swaps the 1:1
 /// history for the group transcript seen from that speaker and appends its
-/// `[群聊]` block to the system prompt. `None` is the 1:1 request. `focused`
-/// writes the system prompt of the `focused` tone (spec
+/// `[群聊]` block to the system prompt. `None` is the 1:1 request. A `tone`
+/// on the `focused` template (`Tone::Focused`, `Tone::Mean`) writes that
+/// tone's system prompt (spec
 /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
-/// §5.4) and reads no `[emotional_context]`.
+/// §5.4, 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+/// §6.2) and reads no `[emotional_context]`; any other value is the default
+/// request.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_reply_request_with(
     state: &AppState,
@@ -1088,8 +1095,9 @@ pub(crate) async fn build_reply_request_with(
     // 2026-10-15-life-events-v2-design.md §8.2).
     event: Option<&crate::prompt::EventLines>,
     group: Option<&crate::pipeline::group::GroupSpeakerView>,
-    focused: bool,
+    tone: eros_engine_core::tone::Tone,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
+    let focused = tone.on_focused_template();
     let chat_repo = ChatRepo { pool: &state.pool };
     // A quote points at one line; it never narrows the window. Every turn gets
     // the same driving-row-anchored history, so quoting something from last
@@ -1335,7 +1343,12 @@ pub(crate) async fn build_reply_request_with(
     };
 
     let mut system_prompt = if focused {
-        crate::prompt::build_focused_prompt(
+        let build = if tone == eros_engine_core::tone::Tone::Mean {
+            crate::prompt::build_mean_prompt
+        } else {
+            crate::prompt::build_focused_prompt
+        };
+        build(
             &input.persona,
             &profile_groups,
             &relationship_facts,
@@ -1508,10 +1521,12 @@ pub(crate) async fn build_reply_request_with(
 /// the one user message: the driving line of a chat turn, or an event's cue
 /// (spec 2026-11-12-emotional-event-messages-design.md §4).
 ///
-/// `erotic = true` builds the `erotic` tone's system prompt instead (spec
-/// 2026-11-27-erotic-tone-design.md §7): the same, plus the `[relationship]`
-/// block and the chemistry tier's line, read from `input.affinity` and the
-/// event's affinity scope.
+/// `Tone::Erotic` and `Tone::Drowsy` build that tone's system prompt instead
+/// (spec 2026-11-27-erotic-tone-design.md §7,
+/// 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+/// §7.2): the same, plus the `[relationship]` block and the chemistry tier's
+/// line, read from `input.affinity` and the event's affinity scope. Any other
+/// `tone` is the `emotional` prompt.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_emotional_system_request(
     state: &AppState,
@@ -1523,7 +1538,7 @@ pub(crate) async fn build_emotional_system_request(
     body_state: Option<&str>,
     needs: Option<&str>,
     event: Option<&crate::prompt::EventLines>,
-    erotic: bool,
+    tone: eros_engine_core::tone::Tone,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let (quote, tier, requested_traits, memory_scope, affinity_scope) = match &input.event {
         Event::UserMessage {
@@ -1594,8 +1609,16 @@ pub(crate) async fn build_emotional_system_request(
             })
     };
 
-    let system_prompt = if erotic {
-        crate::prompt::build_erotic_prompt(
+    let system_prompt = if matches!(
+        tone,
+        eros_engine_core::tone::Tone::Erotic | eros_engine_core::tone::Tone::Drowsy
+    ) {
+        let build = if tone == eros_engine_core::tone::Tone::Drowsy {
+            crate::prompt::build_drowsy_prompt
+        } else {
+            crate::prompt::build_erotic_prompt
+        };
+        build(
             &input.persona,
             plan.reply_mode,
             plan.clothing.as_deref(),
@@ -1645,7 +1668,7 @@ pub(crate) async fn build_emotional_system_request(
 /// The reply request of an `emotional` turn (spec
 /// 2026-11-12-chat-tone-emotional-design.md §4): the system-only request of
 /// [`build_emotional_system_request`] and the driving user message, with no
-/// earlier row of the session. `erotic` is passed on to it.
+/// earlier row of the session. `tone` is passed on to it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_emotional_reply_request(
     state: &AppState,
@@ -1659,7 +1682,7 @@ pub(crate) async fn build_emotional_reply_request(
     body_state: Option<&str>,
     needs: Option<&str>,
     event: Option<&crate::prompt::EventLines>,
-    erotic: bool,
+    tone: eros_engine_core::tone::Tone,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let (mut req, injected_tags) = build_emotional_system_request(
         state,
@@ -1671,7 +1694,7 @@ pub(crate) async fn build_emotional_reply_request(
         body_state,
         needs,
         event,
-        erotic,
+        tone,
     )
     .await?;
     let (content, action) = match &input.event {
@@ -4358,7 +4381,7 @@ mod tests {
             None,
             None,
             Some(&view),
-            false,
+            eros_engine_core::tone::Tone::Default,
         )
         .await
         .expect("build_reply_request_with succeeds");
@@ -5167,7 +5190,7 @@ mod tests {
             None,
             None,
             view.as_ref(),
-            false,
+            eros_engine_core::tone::Tone::Default,
         )
         .await
         .expect("build_reply_request_with succeeds");
@@ -5495,7 +5518,7 @@ mod tests {
             None,
             None,
             None,
-            false,
+            eros_engine_core::tone::Tone::Emotional,
         )
         .await
         .expect("build_emotional_reply_request succeeds");
@@ -5810,7 +5833,7 @@ mod tests {
             None,
             None,
             None,
-            false,
+            eros_engine_core::tone::Tone::Emotional,
         )
         .await
         .expect("build_emotional_system_request succeeds");
@@ -5885,7 +5908,7 @@ mod tests {
             None,
             None,
             None,
-            false,
+            eros_engine_core::tone::Tone::Emotional,
         )
         .await
         .expect("build_emotional_reply_request succeeds");
@@ -6076,7 +6099,11 @@ mod tests {
             None,
             None,
             None,
-            erotic,
+            if erotic {
+                eros_engine_core::tone::Tone::Erotic
+            } else {
+                eros_engine_core::tone::Tone::Emotional
+            },
         )
         .await
         .expect("build_emotional_reply_request succeeds");
@@ -6237,7 +6264,7 @@ mod tests {
             None,
             None,
             None,
-            true,
+            eros_engine_core::tone::Tone::Erotic,
         )
         .await
         .expect("build_emotional_system_request succeeds");
