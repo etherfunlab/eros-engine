@@ -375,7 +375,10 @@ impl EventRepo<'_> {
         {
             return Ok(());
         }
-        let message_id = (e.kind == EventKind::CustomTogether).then_some(user_message_id);
+        // A custom_together's text and a sex_together's act ride on the
+        // user's message (spec 2026-11-27-passion-group-design.md §5.3).
+        let message_id = matches!(e.kind, EventKind::CustomTogether | EventKind::HavingSexTogether)
+            .then_some(user_message_id);
         Self::insert_preempting_pointing_in_tx(tx, e, message_id).await?;
         Ok(())
     }
@@ -467,6 +470,22 @@ impl EventRepo<'_> {
             self.read_text(e).await?;
         }
         Ok(e)
+    }
+
+    /// The `metadata.action` of the message `message_id`, if it has one: the
+    /// action a passion row reads its act and clothing from (spec
+    /// 2026-11-27-passion-group-design.md §5.3).
+    pub async fn action_of(
+        &self,
+        message_id: Uuid,
+    ) -> Result<Option<serde_json::Value>, sqlx::Error> {
+        Ok(sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT metadata->'action' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(message_id)
+        .fetch_optional(self.pool)
+        .await?
+        .flatten())
     }
 
     /// Fill `e.text` for a `custom_together` whose message is there: the
@@ -1362,6 +1381,60 @@ mod tests {
         assert_eq!((e.message_id, e.text), (None, None));
         let by_key = repo.by_key(s, &key).await.unwrap().expect("written");
         assert_eq!(by_key.text, None);
+    }
+
+    /// Spec 2026-11-27-passion-group-design.md §5.3: the row a user's
+    /// `sex_together` places points at the message that asked, and the
+    /// action is read back from it; no act text goes on the event.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_users_sex_row_points_at_the_message(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let action = json!({"type": "sex_together", "name": "姿势甲", "response": "accept"});
+        let asked: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, '2026-10-01T10:00:00Z') RETURNING id",
+        )
+        .bind(s)
+        .bind(json!({ "action": action }))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let key = format!("action:{asked}:sex_together");
+        let mut tx = pool.begin().await.unwrap();
+        EventRepo::place_together_in_tx(
+            &mut tx,
+            &ev(
+                i,
+                s,
+                &key,
+                HavingSexTogether,
+                "2026-10-01T10:00:00Z",
+                "2026-10-01T11:00:00Z",
+            ),
+            asked,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let e = repo
+            .current(i, None, t("2026-10-01T10:30:00Z"), None)
+            .await
+            .unwrap()
+            .foreground
+            .expect("under way");
+        assert_eq!((e.kind, e.message_id), (HavingSexTogether, Some(asked)));
+        assert_eq!(e.text, None);
+        assert_eq!(repo.action_of(asked).await.unwrap(), Some(action));
+        let plain: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', 'hi', '{}'::jsonb, '2026-10-01T09:00:00Z') RETURNING id",
+        )
+        .bind(s)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(repo.action_of(plain).await.unwrap(), None);
     }
 
     #[sqlx::test(migrations = "./migrations")]

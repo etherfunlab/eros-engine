@@ -164,7 +164,22 @@ pub enum UserAction {
     ToiletTogether,
     SmokeTogether,
     FallAsleepTogether,
-    SexTogether,
+    /// The passion group's one action (spec 2026-11-27-passion-group-
+    /// design.md §5): the client may name the act, say who leads and what
+    /// each side wears. All default, it is the plain `sex_together` of
+    /// before and serialises as `{"type":"sex_together"}`. Gated for an
+    /// incompatible pair unless `ignore_orientation`; a named act's refusal
+    /// drops bond and chemistry.
+    SexTogether {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active: Option<Party>,
+        #[serde(default, skip_serializing_if = "RemainClothing::is_default")]
+        remain_clothing: RemainClothing,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        ignore_orientation: bool,
+    },
     WalkTogether,
     SmokeWeedTogether,
     JogTogether,
@@ -269,6 +284,51 @@ pub enum UserAction {
     },
 }
 
+/// Who leads in a passion act (spec 2026-11-27-passion-group-design.md
+/// §5.5); the other side is passive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Party {
+    User,
+    Persona,
+}
+
+/// What one side of a passion act wears (spec 2026-11-27 §5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideClothing {
+    FullNaked,
+    HalfNaked,
+    Custom(String),
+}
+
+/// What both sides of a passion act wear (spec 2026-11-27 §5.2): `false`
+/// both fully naked, `true` both as they are, or one value per side, a
+/// missing side fully naked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RemainClothing {
+    Flag(bool),
+    Sides {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active: Option<SideClothing>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        passive: Option<SideClothing>,
+    },
+}
+
+impl Default for RemainClothing {
+    fn default() -> Self {
+        RemainClothing::Flag(false)
+    }
+}
+
+impl RemainClothing {
+    pub fn is_default(&self) -> bool {
+        *self == RemainClothing::Flag(false)
+    }
+}
+
 /// How long a date the user proposes lasts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -313,14 +373,27 @@ const OUTDOOR_ACTIONS: [UserAction; 5] = [
 ];
 
 impl UserAction {
+    /// The plain `sex_together`: no act, no leader, both fully naked, gated
+    /// (spec 2026-11-27-passion-group-design.md §5).
+    pub const fn sex_together() -> Self {
+        UserAction::SexTogether {
+            name: None,
+            active: None,
+            remain_clothing: RemainClothing::Flag(false),
+            ignore_orientation: false,
+        }
+    }
+
     /// Whether her reply to this action is written in the `emotional` tone,
     /// accepted or refused, when the deployment has the tone on (spec
     /// 2026-11-12-emotional-action-replies-design.md §2): every nude together
     /// action (spec 2026-11-27-together-action-groups-design.md §5.1) and
     /// the gestures and status asks below.
     pub fn speaks_emotionally(&self) -> bool {
-        self.together_group() == Some(TogetherGroup::Nude)
-            || matches!(
+        matches!(
+            self.together_group(),
+            Some(TogetherGroup::Nude | TogetherGroup::Sex)
+        ) || matches!(
                 self,
                 UserAction::FrenchKiss
                     | UserAction::Tease
@@ -363,7 +436,7 @@ impl UserAction {
             UserAction::ToiletTogether => Some(EventKind::UsingToiletTogether),
             UserAction::SmokeTogether => Some(EventKind::SmokingTogether),
             UserAction::FallAsleepTogether => Some(EventKind::AsleepTogether),
-            UserAction::SexTogether => Some(EventKind::HavingSexTogether),
+            UserAction::SexTogether { .. } => Some(EventKind::HavingSexTogether),
             UserAction::WalkTogether => Some(EventKind::WalkingTogether),
             UserAction::SmokeWeedTogether => Some(EventKind::SmokingWeedTogether),
             UserAction::JogTogether => Some(EventKind::JoggingTogether),
@@ -397,6 +470,7 @@ impl UserAction {
     pub fn together_text(&self) -> Option<&str> {
         match self {
             UserAction::CustomTogether { text } => Some(text),
+            UserAction::SexTogether { name, .. } => name.as_deref(),
             _ => None,
         }
     }
@@ -439,6 +513,8 @@ impl UserAction {
             | UserAction::Bet
             | UserAction::Date { .. } => &[],
             UserAction::Give { .. } | UserAction::Gift { .. } => &[Bond],
+            // A named passion act (spec 2026-11-27-passion-group-design.md §6).
+            UserAction::SexTogether { name: Some(_), .. } => &[Bond, Chemistry],
             a if OUTDOOR_ACTIONS.contains(a) => &[Bond],
             a => match a.together_kind() {
                 Some(k) if k.together_group() == Some(TogetherGroup::Thrill) => &[Bond],
@@ -800,7 +876,7 @@ mod tests {
                 EventKind::AsleepTogether,
             ),
             (
-                UserAction::SexTogether,
+                UserAction::sex_together(),
                 "sex_together",
                 EventKind::HavingSexTogether,
             ),
@@ -879,7 +955,7 @@ mod tests {
     #[test]
     fn sex_streaking_and_a_proposal_speak_emotionally() {
         for a in [
-            UserAction::SexTogether,
+            UserAction::sex_together(),
             UserAction::StreakTogether,
             UserAction::Propose,
         ] {
@@ -916,7 +992,7 @@ mod tests {
         assert_eq!(give.consumed(), Some((Coffee, 3)));
         for a in [
             UserAction::WalkTogether,
-            UserAction::SexTogether,
+            UserAction::sex_together(),
             UserAction::Kiss,
             UserAction::Propose,
         ] {
@@ -1148,7 +1224,7 @@ mod tests {
             UserAction::HotSpringNakedTogether,
             UserAction::ShowerTogether,
             UserAction::BathTogether,
-            UserAction::SexTogether,
+            UserAction::sex_together(),
         ] {
             assert_eq!(a.refusal_lines(), [Chemistry], "{a:?}");
         }
@@ -1186,6 +1262,75 @@ mod tests {
         assert_eq!(a.consumed(), None);
         assert_eq!(a.status_ask(), None);
         assert_eq!(a.together_text(), None);
+    }
+
+    /// Spec 2026-11-27-passion-group-design.md §5.1: the all-default form is
+    /// today's `{"type":"sex_together"}`, so stored rows keep parsing.
+    #[test]
+    fn sex_together_round_trips_with_and_without_fields() {
+        let plain = UserAction::sex_together();
+        let v = serde_json::json!({ "type": "sex_together" });
+        assert_eq!(serde_json::to_value(&plain).unwrap(), v);
+        assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), plain);
+        assert_eq!(
+            plain,
+            UserAction::SexTogether {
+                name: None,
+                active: None,
+                remain_clothing: RemainClothing::Flag(false),
+                ignore_orientation: false,
+            }
+        );
+        let full = UserAction::SexTogether {
+            name: Some("姿势甲".into()),
+            active: Some(Party::Persona),
+            remain_clothing: RemainClothing::Sides {
+                active: Some(SideClothing::HalfNaked),
+                passive: Some(SideClothing::Custom("只穿袜子".into())),
+            },
+            ignore_orientation: true,
+        };
+        let v = serde_json::json!({
+            "type": "sex_together",
+            "name": "姿势甲",
+            "active": "persona",
+            "remain_clothing": {"active": "half_naked", "passive": {"custom": "只穿袜子"}},
+            "ignore_orientation": true
+        });
+        assert_eq!(serde_json::to_value(&full).unwrap(), v);
+        assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), full);
+        let dressed = serde_json::json!({ "type": "sex_together", "remain_clothing": true });
+        let a = serde_json::from_value::<UserAction>(dressed.clone()).unwrap();
+        assert!(matches!(
+            a,
+            UserAction::SexTogether {
+                remain_clothing: RemainClothing::Flag(true),
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&a).unwrap(), dressed);
+    }
+
+    /// Spec 2026-11-27-passion-group-design.md §4, §6.
+    #[test]
+    fn sex_together_is_the_passion_group() {
+        let plain = UserAction::sex_together();
+        assert_eq!(plain.together_group(), Some(TogetherGroup::Sex));
+        assert_eq!(plain.together_kind(), Some(EventKind::HavingSexTogether));
+        assert!(plain.speaks_emotionally());
+        assert_eq!(plain.refusal_lines(), [AffinityLine::Chemistry]);
+        assert_eq!(plain.together_text(), None);
+        let named = UserAction::SexTogether {
+            name: Some("姿势甲".into()),
+            active: None,
+            remain_clothing: RemainClothing::default(),
+            ignore_orientation: false,
+        };
+        assert_eq!(
+            named.refusal_lines(),
+            [AffinityLine::Bond, AffinityLine::Chemistry]
+        );
+        assert_eq!(named.together_text(), Some("姿势甲"));
     }
 
     /// Spec 2026-11-27-together-action-groups-design.md §6.
@@ -1251,7 +1396,7 @@ mod tests {
             ToiletTogether,
             SmokeTogether,
             FallAsleepTogether,
-            SexTogether,
+            UserAction::sex_together(),
             WalkTogether,
             SmokeWeedTogether,
             JogTogether,
@@ -1306,7 +1451,12 @@ mod tests {
         };
         let nude: Vec<EventKind> = all_actions()
             .iter()
-            .filter(|a| a.together_group() == Some(TogetherGroup::Nude))
+            .filter(|a| {
+                matches!(
+                    a.together_group(),
+                    Some(TogetherGroup::Nude | TogetherGroup::Sex)
+                )
+            })
             .filter_map(|a| a.together_kind())
             .collect();
         assert_eq!(
@@ -1315,10 +1465,9 @@ mod tests {
         );
     }
 
-    const NUDE_ACTIONS: [UserAction; 9] = [
+    const NUDE_ACTIONS: [UserAction; 8] = [
         UserAction::ShowerTogether,
         UserAction::BathTogether,
-        UserAction::SexTogether,
         UserAction::StreakTogether,
         UserAction::SkinnyDipTogether,
         UserAction::RideHorseNakedTogether,
@@ -1340,6 +1489,9 @@ mod tests {
         for a in all_actions() {
             let want = if NUDE_ACTIONS.contains(&a) {
                 Some(TogetherGroup::Nude)
+            } else if matches!(a, UserAction::SexTogether { .. }) {
+                // Spec 2026-11-27-passion-group-design.md §4.
+                Some(TogetherGroup::Sex)
             } else if THRILL_ACTIONS.contains(&a) {
                 Some(TogetherGroup::Thrill)
             } else if a.together_kind().is_some() {
@@ -1368,7 +1520,10 @@ mod tests {
         {
             assert_eq!(
                 a.speaks_emotionally(),
-                a.together_group() == Some(TogetherGroup::Nude),
+                matches!(
+                    a.together_group(),
+                    Some(TogetherGroup::Nude | TogetherGroup::Sex)
+                ),
                 "{a:?}"
             );
         }
@@ -1433,7 +1588,7 @@ mod tests {
         assert_eq!(UserAction::BreakUp.status_ask(), Some(StatusAsk::BreakUp));
         for a in [
             UserAction::Kiss,
-            UserAction::SexTogether,
+            UserAction::sex_together(),
             UserAction::FallAsleepTogether,
             UserAction::Challenge,
             UserAction::Custom { text: "x".into() },

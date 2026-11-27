@@ -12727,12 +12727,38 @@ data: [DONE]\n\n";
         assert!(context.get("tier_drop").is_none(), "{context}");
     }
 
-    /// §5.1: so is an incompatible pair's sex.
+    /// Spec 2026-11-27-passion-group-design.md §4: an incompatible pair's
+    /// sex is refused before the judge again: with no judge the rule engine
+    /// would accept it. It places nothing and drops chemistry.
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
-    async fn an_incompatible_pairs_sex_reaches_the_judge(pool: PgPool) {
+    async fn an_incompatible_pairs_sex_is_refused_before_the_judge(pool: PgPool) {
+        let (frames, _, umid) = run_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::sex_together(),
+            None,
+            false,
+            &[],
+            true,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        assert!(events_of_kind(&pool, "having_sex_together").await.is_empty());
+        let (context, _) = turn_affinity_row(&pool, umid).await;
+        assert_eq!(context["tier_drop"], "chemistry", "{context}");
+    }
+
+    /// §5.4: `ignore_orientation` takes the same ask past the gate to the
+    /// judge (here the rule engine, which accepts).
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn ignore_orientation_takes_sex_past_the_gate(pool: PgPool) {
         let (frames, _, _) = run_together_turn(
             &pool,
-            eros_engine_core::types::UserAction::SexTogether,
+            eros_engine_core::types::UserAction::SexTogether {
+                name: None,
+                active: None,
+                remain_clothing: Default::default(),
+                ignore_orientation: true,
+            },
             None,
             false,
             &[],
@@ -12800,7 +12826,7 @@ data: [DONE]\n\n";
     ) -> bool {
         let (frames, mock, umid) = run_together_turn_mock(
             pool,
-            eros_engine_core::types::UserAction::SexTogether,
+            eros_engine_core::types::UserAction::sex_together(),
             judge,
             if picture {
                 "reply_text_image"
@@ -22009,15 +22035,15 @@ data: [DONE]\n\n";
         use eros_engine_core::types::ActionType::{ReplyImage, ReplyText, ReplyTextImage};
         use eros_engine_core::types::UserAction::{
             DrinkTogether, FallAsleepTogether, JogTogether, Kiss, Propose, RideHorseTogether,
-            SexTogether, SmokeTogether, SmokeWeedTogether, StargazeTogether, StreakTogether,
-            ToiletTogether, WalkTogether, YogaTogether,
+            SmokeTogether, SmokeWeedTogether, StargazeTogether, StreakTogether, ToiletTogether,
+            WalkTogether, YogaTogether,
         };
         let mut cases = Vec::new();
         for a in [
             ToiletTogether,
             SmokeTogether,
             FallAsleepTogether,
-            SexTogether,
+            eros_engine_core::types::UserAction::sex_together(),
             WalkTogether,
             SmokeWeedTogether,
             JogTogether,
@@ -22233,7 +22259,7 @@ data: [DONE]\n\n";
         let t = JudgeTranscript::default();
         let mut input = fixture_decision_input();
         for (a, marker) in [
-            (UserAction::SexTogether, "想和你上床"),
+            (UserAction::sex_together(), "想和你上床"),
             (UserAction::StreakTogether, "想和你一起裸奔"),
             (UserAction::ToiletTogether, "想和你一起去上厕所"),
             (UserAction::SmokeTogether, "想和你一起去抽根烟"),
@@ -25785,7 +25811,7 @@ data: [DONE]\n\n"
         }
         for a in [
             UserAction::WalkTogether,
-            UserAction::SexTogether,
+            UserAction::sex_together(),
             UserAction::Kiss,
             UserAction::Propose,
         ] {

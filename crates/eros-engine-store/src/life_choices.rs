@@ -576,7 +576,7 @@ mod tests {
         let wire = |a: UserAction| serde_json::to_value(a).unwrap()["type"].clone();
         assert_eq!(
             LifeChoiceKind::SleepTogether.user_ask(),
-            wire(UserAction::SexTogether).as_str()
+            wire(UserAction::sex_together()).as_str()
         );
         assert_eq!(
             LifeChoiceKind::Propose.user_ask(),

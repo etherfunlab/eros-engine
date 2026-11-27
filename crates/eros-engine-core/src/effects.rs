@@ -176,7 +176,7 @@ mod tests {
         }
         for a in [
             UserAction::WalkTogether,
-            UserAction::SexTogether,
+            UserAction::sex_together(),
             UserAction::FallAsleepTogether,
             UserAction::Propose,
         ] {

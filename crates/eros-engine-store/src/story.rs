@@ -426,7 +426,12 @@ impl<'a> StoryRepo<'a> {
         // telling (§8.2, §8.3).
         let kept_out: Vec<&str> = EventKind::SPECIAL
             .into_iter()
-            .filter(|k| k.together_group() == Some(TogetherGroup::Nude))
+            .filter(|k| {
+                matches!(
+                    k.together_group(),
+                    Some(TogetherGroup::Nude | TogetherGroup::Sex)
+                )
+            })
             .chain([
                 EventKind::UsingToiletTogether,
                 EventKind::AsleepTogether,

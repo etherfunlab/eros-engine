@@ -832,7 +832,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::ToiletTogether => "想和你一起去上厕所".into(),
         UserAction::SmokeTogether => "想和你一起去抽根烟".into(),
         UserAction::FallAsleepTogether => "想和你一起睡觉".into(),
-        UserAction::SexTogether => "想和你上床".into(),
+        UserAction::SexTogether { .. } => "想和你上床".into(),
         UserAction::WalkTogether => "想和你一起散步".into(),
         UserAction::SmokeWeedTogether => "想和你一起抽大麻".into(),
         UserAction::JogTogether => "想和你一起慢跑".into(),
@@ -1728,6 +1728,9 @@ pub(crate) fn water_clothing(
     };
     match foreground? {
         k if k.together_group() == Some(TogetherGroup::Nude) => Some("什么都没穿"),
+        // Sex left the naturism group (spec 2026-11-27-passion-group-design.md
+        // §7): nothing on unless a 1:1 picture's action says otherwise.
+        eros_engine_core::events::EventKind::HavingSexTogether => Some("什么都没穿"),
         SwimmingTogether => swimsuit(wear),
         HotSpringTogether => swimsuit(wear).or_else(towel),
         SaunaTogether => towel(),
@@ -7404,7 +7407,7 @@ mod tests {
             UserAction::ToiletTogether,
             UserAction::SmokeTogether,
             UserAction::FallAsleepTogether,
-            UserAction::SexTogether,
+            UserAction::sex_together(),
             UserAction::WalkTogether,
             UserAction::SmokeWeedTogether,
             UserAction::JogTogether,
@@ -7695,7 +7698,7 @@ mod tests {
             (UserAction::ToiletTogether, "和对方一起上厕所"),
             (UserAction::SmokeTogether, "和对方一起抽烟"),
             (UserAction::FallAsleepTogether, "和对方睡在一起"),
-            (UserAction::SexTogether, "和对方上床"),
+            (UserAction::sex_together(), "和对方上床"),
             (UserAction::WalkTogether, "和对方一起散步"),
             (UserAction::SmokeWeedTogether, "和对方一起抽大麻"),
             (UserAction::JogTogether, "和对方一起慢跑"),

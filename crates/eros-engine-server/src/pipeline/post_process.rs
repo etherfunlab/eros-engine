@@ -2961,7 +2961,7 @@ mod tests {
             memory_scope: Default::default(),
             affinity_scope: Default::default(),
             quote: None,
-            action: Some(UserAction::SexTogether),
+            action: Some(UserAction::sex_together()),
             outfit: None,
         };
         let refused = |refusal_free: bool| ActionPlan {

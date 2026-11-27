@@ -66,6 +66,8 @@ pub enum TogetherGroup {
     General,
     Nude,
     Thrill,
+    /// Passion in the docs (spec 2026-11-27-passion-group-design.md §4).
+    Sex,
 }
 
 /// What happens to the persona.
@@ -710,9 +712,9 @@ impl EventKind {
     pub fn together_group(self) -> Option<TogetherGroup> {
         use EventKind::*;
         match self {
+            HavingSexTogether => Some(TogetherGroup::Sex),
             ShoweringTogether
             | BathingTogether
-            | HavingSexTogether
             | StreakingTogether
             | SkinnyDippingTogether
             | NakedHorseRidingTogether
@@ -4004,7 +4006,12 @@ mod tests {
         assert_eq!(
             set(EventKind::ENDS_ON_CHEMISTRY_DROP.to_vec()),
             set(every()
-                .filter(|k| k.together_group() == Some(TogetherGroup::Nude))
+                .filter(|k| {
+                    matches!(
+                        k.together_group(),
+                        Some(TogetherGroup::Nude | TogetherGroup::Sex)
+                    )
+                })
                 .collect())
         );
         assert_eq!(
@@ -4044,6 +4051,11 @@ mod tests {
             let want = pairs.iter().find(|(n, _)| *n == k).map(|(_, c)| *c);
             assert_eq!(k.clothed_counterpart(), want, "{k:?}");
         }
+        assert_eq!(
+            HavingSexTogether.together_group(),
+            Some(TogetherGroup::Sex),
+            "spec 2026-11-27-passion-group-design.md §4"
+        );
         for (nude, clothed) in pairs {
             assert_eq!(nude.together_group(), Some(TogetherGroup::Nude));
             assert_eq!(clothed.together_group(), Some(TogetherGroup::General));

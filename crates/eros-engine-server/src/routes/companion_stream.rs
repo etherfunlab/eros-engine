@@ -518,7 +518,7 @@ impl UserActionDto {
             UserActionKind::ToiletTogether => UserAction::ToiletTogether,
             UserActionKind::SmokeTogether => UserAction::SmokeTogether,
             UserActionKind::FallAsleepTogether => UserAction::FallAsleepTogether,
-            UserActionKind::SexTogether => UserAction::SexTogether,
+            UserActionKind::SexTogether => UserAction::sex_together(),
             UserActionKind::WalkTogether => UserAction::WalkTogether,
             UserActionKind::SmokeWeedTogether => UserAction::SmokeWeedTogether,
             UserActionKind::JogTogether => UserAction::JogTogether,
@@ -5368,7 +5368,7 @@ mod validate_payload_tests {
             (
                 "sex_together",
                 UserActionKind::SexTogether,
-                UserAction::SexTogether,
+                UserAction::sex_together(),
             ),
             (
                 "walk_together",
