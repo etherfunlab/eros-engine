@@ -973,6 +973,8 @@ pub(crate) fn given_phrase(item: GivenItem, name: Option<&str>, quantity: u8) ->
         GivenItem::Coffee => ("杯", "咖啡"),
         GivenItem::Herb => ("包", "药草"),
         GivenItem::Cuisine => ("道", "菜"),
+        GivenItem::Dessert => ("份", "甜点"),
+        GivenItem::Soup => ("碗", "汤"),
         GivenItem::Watch => ("块", "手表"),
         GivenItem::Gem => ("颗", "宝石"),
         GivenItem::Gold => ("块", "黄金"),
@@ -1009,6 +1011,8 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
     const COFFEE: [&str; 4] = ["提了点神", "精神起来了", "精神很足", "心跳得有点快"];
     const HERB: [&str; 4] = ["药草劲还轻", "药草见效了", "药草劲很足", "药草劲太冲"];
     const CUISINE: [&str; 4] = ["回味还在", "吃得挺满足", "吃得正香", "吃撑了"];
+    const DESSERT: [&str; 4] = ["嘴里还留着甜", "吃得挺开心", "甜得正满足", "甜得发腻"];
+    const SOUP: [&str; 4] = ["胃里还暖着", "喝得挺舒服", "浑身暖和", "喝得肚子发胀"];
     let words = match item {
         GivenItem::Cigarette => &CIGARETTE,
         GivenItem::Alcohol => &ALCOHOL,
@@ -1019,6 +1023,8 @@ fn effect_word(item: GivenItem, level: u8) -> &'static str {
         GivenItem::Coffee => &COFFEE,
         GivenItem::Herb => &HERB,
         GivenItem::Cuisine => &CUISINE,
+        GivenItem::Dessert => &DESSERT,
+        GivenItem::Soup => &SOUP,
         // A valuable has an empty curve, so no effect ever names one.
         GivenItem::Watch
         | GivenItem::Gem
@@ -1089,6 +1095,9 @@ pub(crate) fn needs_line(
         (habits.drug, "很想抽口大麻"),
         (habits.coffee, "很想喝杯咖啡"),
         (habits.gluttony, "很想吃顿好的"),
+        (habits.sugar, "很想吃点甜的"),
+        (habits.salty, "很想吃点咸的"),
+        (habits.spicy, "很想吃点辣的"),
     ]
     .into_iter()
     .filter_map(|(set, words)| (set == Some(true)).then_some(words))
@@ -1946,9 +1955,12 @@ pub(crate) fn persona_traits(
 }
 
 /// Whether the persona smokes, drinks, uses weed, drinks coffee, loves good
-/// food (spec 2026-10-28-outing-indulgence-needs-and-habits-design.md §3,
-/// 2026-11-08 §4): `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`,
-/// `gluttony`; a key that is not a boolean reads as unset.
+/// food, has a taste for sweet, salt or spice, and whether she is on a diet
+/// (spec 2026-10-28-outing-indulgence-needs-and-habits-design.md §3,
+/// 2026-11-08 §4, 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-
+/// design.md §5): `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`,
+/// `gluttony`, `sugar`, `salty`, `spicy`, `diet`; a key that is not a boolean
+/// reads as unset.
 pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::needs::Habits {
     let key = |k: &str| persona.genome.art_metadata.get(k).and_then(|v| v.as_bool());
     eros_engine_core::needs::Habits {
@@ -1957,6 +1969,10 @@ pub(crate) fn persona_habits(persona: &CompanionPersona) -> eros_engine_core::ne
         drug: key("drug"),
         coffee: key("coffee"),
         gluttony: key("gluttony"),
+        sugar: key("sugar"),
+        salty: key("salty"),
+        spicy: key("spicy"),
+        diet: key("diet"),
     }
 }
 
@@ -5396,6 +5412,7 @@ mod tests {
             drug: Some(false),
             coffee: Some(false),
             gluttony: Some(false),
+            ..Default::default()
         };
         let drinker = Habits {
             alcoholic: Some(true),
@@ -5438,6 +5455,7 @@ mod tests {
             drug: Some(true),
             coffee: Some(true),
             gluttony: None,
+            ..Default::default()
         };
         let smoke_and_weed = Habits {
             alcoholic: Some(false),
@@ -5487,6 +5505,7 @@ mod tests {
             drug: Some(true),
             coffee: Some(true),
             gluttony: Some(true),
+            ..Default::default()
         };
         for (pick, want) in [
             (0.0, "很想抽根烟"),
@@ -5505,6 +5524,45 @@ mod tests {
         assert_eq!(
             needs_line(&n, glutton, 0.0).as_deref(),
             Some("很想吃顿好的")
+        );
+    }
+
+    /// The three tastes come after `gluttony` in the pick list, in the order
+    /// sugar, salty, spicy; `diet` is never named (spec 2026-11-28-dessert-
+    /// soup-taste-habits-mean-and-drowsy-tones-design.md §5).
+    #[test]
+    fn a_high_indulgence_may_name_a_taste() {
+        use eros_engine_core::needs::{Habits, NeedLevel::*, Needs};
+        let n = Needs {
+            social: Mid,
+            emotional: Mid,
+            outing: Mid,
+            indulgence: High,
+        };
+        let h = Habits {
+            sugar: Some(true),
+            salty: Some(true),
+            spicy: Some(true),
+            diet: Some(true),
+            ..Habits::default()
+        };
+        assert_eq!(needs_line(&n, h, 0.0).as_deref(), Some("很想吃点甜的"));
+        assert_eq!(needs_line(&n, h, 0.5).as_deref(), Some("很想吃点咸的"));
+        assert_eq!(needs_line(&n, h, 0.99).as_deref(), Some("很想吃点辣的"));
+        let glut = Habits {
+            gluttony: Some(true),
+            sugar: Some(true),
+            ..Habits::default()
+        };
+        assert_eq!(needs_line(&n, glut, 0.0).as_deref(), Some("很想吃顿好的"));
+        assert_eq!(needs_line(&n, glut, 0.5).as_deref(), Some("很想吃点甜的"));
+        let dieting = Habits {
+            diet: Some(true),
+            ..Habits::default()
+        };
+        assert_eq!(
+            needs_line(&n, dieting, 0.0).as_deref(),
+            Some("很想放纵一下")
         );
     }
 
@@ -6518,9 +6576,17 @@ mod tests {
                 drug: None,
                 coffee: Some(true),
                 gluttony: None,
+                ..Default::default()
             }
         );
         assert_eq!(with(serde_json::json!({"drug": 1})).drug, None);
+        let h =
+            with(serde_json::json!({"sugar": "true", "salty": true, "spicy": false, "diet": 1}));
+        assert_eq!(
+            (h.sugar, h.salty, h.spicy, h.diet),
+            (None, Some(true), Some(false), None)
+        );
+        assert_eq!(with(serde_json::json!({"diet": true})).diet, Some(true));
         assert_eq!(
             with(serde_json::json!({"gluttony": false})).gluttony,
             Some(false)
@@ -8805,6 +8871,29 @@ mod tests {
         );
         assert_eq!(given_phrase(GivenItem::Cigarette, None, 1), "1 支烟");
         assert_eq!(given_phrase(GivenItem::Medicine, None, 2), "2 片药");
+    }
+
+    #[test]
+    fn a_dessert_and_a_soup_have_their_phrases_and_effect_words() {
+        assert_eq!(given_phrase(GivenItem::Dessert, None, 1), "1 份甜点");
+        assert_eq!(
+            given_phrase(GivenItem::Dessert, Some("提拉米苏"), 1),
+            "1 份「提拉米苏」"
+        );
+        assert_eq!(given_phrase(GivenItem::Soup, None, 1), "1 碗汤");
+        assert_eq!(
+            given_phrase(GivenItem::Soup, Some("罗宋汤"), 2),
+            "2 碗「罗宋汤」"
+        );
+        let words = |item| -> Vec<&str> { (1..=4).map(|l| effect_word(item, l)).collect() };
+        assert_eq!(
+            words(GivenItem::Dessert),
+            ["嘴里还留着甜", "吃得挺开心", "甜得正满足", "甜得发腻"]
+        );
+        assert_eq!(
+            words(GivenItem::Soup),
+            ["胃里还暖着", "喝得挺舒服", "浑身暖和", "喝得肚子发胀"]
+        );
     }
 
     #[test]

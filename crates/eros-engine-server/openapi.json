@@ -6390,7 +6390,7 @@
       },
       "GivenItemDto": {
         "type": "string",
-        "description": "What a `give` action hands over. Consumables (`cigarette` through\n`cuisine`) linger on the persona; valuables (`watch` through `horse`) do\nnot.",
+        "description": "What a `give` action hands over. Consumables (`cigarette` through\n`soup`) linger on the persona; valuables (`watch` through `horse`) do\nnot.",
         "enum": [
           "cigarette",
           "alcohol",
@@ -6401,6 +6401,8 @@
           "coffee",
           "herb",
           "cuisine",
+          "dessert",
+          "soup",
           "watch",
           "gem",
           "gold",

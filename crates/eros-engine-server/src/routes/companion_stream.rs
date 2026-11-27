@@ -215,7 +215,7 @@ pub enum UserActionKind {
 }
 
 /// What a `give` action hands over. Consumables (`cigarette` through
-/// `cuisine`) linger on the persona; valuables (`watch` through `horse`) do
+/// `soup`) linger on the persona; valuables (`watch` through `horse`) do
 /// not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -229,6 +229,8 @@ pub enum GivenItemDto {
     Coffee,
     Herb,
     Cuisine,
+    Dessert,
+    Soup,
     Watch,
     Gem,
     Gold,
@@ -259,6 +261,8 @@ impl From<GivenItemDto> for eros_engine_core::types::GivenItem {
             GivenItemDto::Coffee => GivenItem::Coffee,
             GivenItemDto::Herb => GivenItem::Herb,
             GivenItemDto::Cuisine => GivenItem::Cuisine,
+            GivenItemDto::Dessert => GivenItem::Dessert,
+            GivenItemDto::Soup => GivenItem::Soup,
             GivenItemDto::Watch => GivenItem::Watch,
             GivenItemDto::Gem => GivenItem::Gem,
             GivenItemDto::Gold => GivenItem::Gold,
@@ -291,6 +295,8 @@ impl From<eros_engine_core::types::GivenItem> for GivenItemDto {
             GivenItem::Coffee => GivenItemDto::Coffee,
             GivenItem::Herb => GivenItemDto::Herb,
             GivenItem::Cuisine => GivenItemDto::Cuisine,
+            GivenItem::Dessert => GivenItemDto::Dessert,
+            GivenItem::Soup => GivenItemDto::Soup,
             GivenItem::Watch => GivenItemDto::Watch,
             GivenItem::Gem => GivenItemDto::Gem,
             GivenItem::Gold => GivenItemDto::Gold,
@@ -5403,6 +5409,8 @@ mod validate_payload_tests {
             ("credit_card", GivenItem::CreditCard),
             ("flower", GivenItem::Flower),
             ("cuisine", GivenItem::Cuisine),
+            ("dessert", GivenItem::Dessert),
+            ("soup", GivenItem::Soup),
             ("jewelry", GivenItem::Jewelry),
             ("car", GivenItem::Car),
             ("motorcycle", GivenItem::Motorcycle),
