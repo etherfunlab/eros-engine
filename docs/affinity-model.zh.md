@@ -197,12 +197,12 @@ PDE 判定的 ghost 回合从不进入 `persist_with_event`：只有 `ghost_stre
 聊天回合可以带用户动作（见 [api-reference.zh.md](api-reference.zh.md) 的 `action` 字段）。PDE 判官在生成回复之前决定角色接不接受；没有明确拒绝时，engine 按接受处理。例外是递来角色不用的烟、酒、大麻、咖啡或一道菜，或者在她不碰这些时请她一起抽烟、抽大麻、喝酒：掷一次可能就拒收，不管判官怎么说（见[角色设置](life-events-needs.zh.md#角色设置)）。
 
 - **接受：** 没有额外机制。affinity 判官从用户文本里看到这个动作，照常给这一轮打分。
-- **拒绝：** 动作对应的那条线（`give`、`gift` 与 `commit_crime_together` 动 Bond，身体动作动 Chemistry）降一档，落在下一档内的相同相对位置；第 1 档的线直接归 `0`。这条线的两个轴按同一比例缩放，比例保持不变。落点在行锁内按本轮之前的快照计算，取代判官本轮对这条线的打分；另一条线和 warmth / patience 档照判官走。这条线的 `pending_deltas` 清零，事件行的 `context.tier_drop` 记下是哪条线。affinity 判官被跳过或调用失败时照样降档。
+- **拒绝：** 动作对应的每条线降一档，落在下一档内的相同相对位置；第 1 档的线直接归 `0`。`give`、`gift`、刺激组的一起做的动作（`adventure_together`、`commit_crime_together`、`play_with_fire_together`、`fight_together`），以及户外的 `jog_together`、`hike_together`、`fish_together`、`cycle_together` 和 `ride_horse_together` 动 Bond；它们在天然组的对应动作 `streak_together`、`hike_naked_together` 和 `ride_horse_naked_together`，以及写明了做什么的 `sex_together`，两条线都动；其余身体动作动 Chemistry（见[被拒的代价](life-events-needs.zh.md#被拒的代价)）。一条线的两个轴按同一比例缩放，比例保持不变。落点在行锁内按本轮之前的快照计算，取代判官本轮对这条线的打分；动作没碰到的线和 warmth / patience 档照判官走。被降的每条线的 `pending_deltas` 清零，事件行的 `context.tier_drop` 记下是哪条线，两条线都降时记 `both`。affinity 判官被跳过或调用失败时照样降档。
 - **被拒的打赏：** `tip` 不降档。回复照判官的结论写，这一轮按常规打分。
 - **社交动作：** 被拒的 `bluff`、`threaten`、`trick` 表示她识破了，被拒的 `challenge`、`bet` 表示她没接，同样不降档；这一轮按常规打分。
-- **脱衣服：** `affinity_scope` 性向不相容的一对发来的 `strip`，不管判官怎么说都判为拒绝，并像任何被拒的身体动作一样让 Chemistry 降一档。这样的一对发来的 `shower_together`、`bath_together`、`sex_together`、`streak_together` 或 `skinny_dip_together` 同样如此，机器角色收到的 `toilet_together` 也一样。`setting` 不是 `fantasy` 的角色收到的 `fight_together`，以及 `setting` 是 `fantasy` 的角色收到的 `cycle_together`，同样判为拒绝，但哪条线都不降。其余一起做的动作没有这条规则。掷骰拒掉的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 同样降 Chemistry，不降 Bond。
-- **经期：** 她的经期里，上面的规则没有拒掉的 `sex_together`、`bath_together`、`hot_spring_together`、`sauna_together`、`swim_together` 或 `skinny_dip_together`，三次里有两次在判官之前由掷骰判为拒绝（见[她的周期](life-events-needs.zh.md#她的周期)），哪条线都不降；其余那一次照常由判官决定。
-- **进行中的亲密事件：** 用户在事件开始之后做的某件事让 Chemistry 档位下降，被拒动作的降档也算，就会立刻结束正在进行的 `showering_together`、`bathing_together`、`having_sex_together`、`streaking_together` 或 `skinny_dipping_together`（见[亲密事件提前结束](life-events-needs.zh.md#亲密事件提前结束)）。
+- **脱衣服：** `affinity_scope` 性向不相容的一对发来的 `strip`，不管判官怎么说都判为拒绝，并像任何被拒的身体动作一样让 Chemistry 降一档。这样的一对发来的 `sex_together` 同样如此（除非带 `ignore_orientation`），降的是被拒的 `sex_together` 该降的线；机器角色收到的 `toilet_together` 也一样。`setting` 不是 `fantasy` 的角色收到的 `fight_together`，以及 `setting` 是 `fantasy` 的角色收到的 `cycle_together`，同样判为拒绝，但哪条线都不降。其余一起做的动作，包括天然组的，没有这条规则。掷骰拒掉的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 同样降 Chemistry，不降 Bond。
+- **经期：** 她的经期里，上面的规则没有拒掉的 `sex_together`，以及在水里做的一起做的动作（`swim_together`、`hot_spring_together`、`sauna_together`、`shower_together`、`bath_together`、`skinny_dip_together`、`hot_spring_naked_together`），三次里有两次在判官之前由掷骰判为拒绝（见[她的周期](life-events-needs.zh.md#她的周期)），哪条线都不降；其余那一次照常由判官决定。
+- **进行中的亲密事件：** 用户在事件开始之后做的某件事让 Chemistry 档位下降，被拒动作的降档也算，就会立刻结束正在进行的天然组或激情组事件（`showering_together`、`bathing_together`、`streaking_together`、`skinny_dipping_together`、`naked_horse_riding_together`、`naked_yoga_together`、`naked_hiking_together`、`naked_hot_spring_together`、`having_sex_together`；见[亲密事件提前结束](life-events-needs.zh.md#亲密事件提前结束)）。
 - **求婚与分手：** 被拒的 `propose` 或 `break_up` 不降档，这一轮按常规打分。关系状态不是 `dating`、`fwb` 或 `situationship` 时的 `propose`，以及关系状态不可分手时的 `break_up`，在判官之前就同样判为拒绝；被回答的则会挪动[关系状态](#关系状态)。
 - **礼物：** 被接受时还会进入角色的持有物品或衣柜；被拒时什么也不进，并像被拒的 `give` 一样让 Bond 掉一档。
 - **约会：** 被拒的 `date` 邀约不降档，这一轮按常规打分。被接受的根本不打分：它开启约会，约会在结算时整场评一次（见[下文](#约会)）。
@@ -538,7 +538,7 @@ session 的行上，记为跳过的评估（见[上文](#不移动的回合)）�
   `grades`、门的 `pending_after`，以及端点审计（本轮实际读到时的
   `warmth_grade`/`patience_grade`、`boost_warmth`/`boost_patience`、
   `decay_factor`、`units`）；被收税的回合另有 `cross_penalty_assessed`；动作被拒绝而降档的回合另有
-  `tier_drop`（`bond` | `chemistry`），标明被降的那条线；冷战减半了为正的增长时，另有 `growth_scale`（`0.5`）。
+  `tier_drop`（`bond` | `chemistry` | `both`），标明被降的那条线，两条线都降时为 `both`；冷战减半了为正的增长时，另有 `growth_scale`（`0.5`）。
   生活选择自己的 `life_choice` 行，`context` 是 `life_choice` 与 `choice_id`（见[上文](#生活选择的降档与冷战减半)）。
   约会的 `activity` 行另有 `activity_id`、`turns`、`weight`、判官的 `reason`，上限限住某条线时还有 `capped`（见[上文](#约会)）。
   `relationship` 行的 `context` 是 `from` 与 `to`（状态键），冷战标记切换了时另有 `cold_war`（`entered` | `ended`），
