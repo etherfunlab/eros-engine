@@ -136,7 +136,7 @@ CREATE TABLE engine.llm_generations (
 completed` tracing——落库是额外加的，不是取代那行日志。
 
 **完整的任务词表。** 每一个会发起 chat-completion 调用的 `[tasks.*]` key
-现在都会写这张表：`chat_companion`、`chat_voice`、`chat_product_qa`、
+现在都会写这张表：`chat_companion`、`chat_voice`、`chat_speech`、`chat_product_qa`、
 `chat_input_filter`、`chat_output_filter`、`chat_vision`、
 `chat_image_prompt_compose`、`chat_image_edit_compose`、`pde_decision`、
 `group_director`、`affinity_evaluation`、`affinity_summary`、`activity_judge`、`insight_extraction`、
@@ -488,6 +488,7 @@ Venice 用 `429 MODEL_OVERLOADED` 和 `503 MODEL_AT_CAPACITY`，下一家又会�
 | `group_director` | `companion_decision_events` | — |
 | `affinity_evaluation` | `companion_affinity_events` | — |
 | `activity_judge` | `companion_affinity_events` | 约会的 `activity` 行 |
+| `chat_speech` | — | 无：失败的一跳只打日志，有 generation 的照样进 `llm_generations` |
 
 输入过滤器是 v1.4.0 之前**完全没有任何失败记录**的那个调用点。它的失败落在
 `role='user'` 行上，与该行早就在记录的成功审计

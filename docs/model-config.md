@@ -781,6 +781,7 @@ the judge's decision row and not in any frame.
 | `memory_extraction` | nothing — retired. A present block is ignored with a boot warning naming `dreaming_scan` | retired |
 | `chat_input_filter` | `pipeline::stream` (user-input rewrite filter; activated by `input_filter` on `[tasks.chat_companion]` and this task block; off by default) | live (opt-in) |
 | `chat_voice` | `pipeline::voice::run_voice_turn`, reached from `routes::voice` (`POST /comp/voice/{session_id}/turn/stream`) via `resolve_voice()` (voice-channel companion reply; a blank `filter_prompt` does NOT disable it — falls back to the built-in directive; off when the task block is absent) | live (opt-in) |
+| `chat_speech` | `pipeline::speech::run_speech`, reached from `routes::speech` (`POST /comp/chat/{session_id}/messages/speech`) via `resolve_speech()` (speech markup of her stored chat messages for a TTS model; a blank `filter_prompt` falls back to the built-in base directive; off when the task block is absent) | live (opt-in) |
 | `world_director` | `pipeline::world::sweeper` via `resolve_world_director()` (background per-owner world-state director round; off when the task block is absent/blank, `WORLD_DISABLED` is set, or `WORLD_TICK_SECS=0`) | live (opt-in) |
 | `world_stories_director` | `pipeline::story::run_stories_scan`, invoked from `pipeline::world::sweeper` via `resolve_world_stories_director()` (per-owner story round, gated on `world_director` also being configured; off when the task block is absent/blank or `WORLD_STORIES_DISABLED` is set) | live (opt-in) |
 | `world_comment` | `pipeline::world_town::sweeper` via `resolve_world_comment()` (hourly world-town comment round, gated on `world_director` also being configured — posts only exist downstream of it; off when the task block is absent/blank, `WORLD_DISABLED` or `WORLD_TOWN_DISABLED` is set, or `WORLD_TICK_SECS=0`) | live (opt-in) |
@@ -795,6 +796,7 @@ A `[tasks.<name>]` entry is only meaningful if the engine actually calls `model_
 - `crates/eros-engine-server/src/pipeline/post_process.rs` → `insight_extraction`, `affinity_evaluation`, `affinity_summary`, `character_insight_extraction`, `character_insight_structuring`, `user_insight_extraction`, `user_insight_structuring`
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision` via `run_pde_decision` inside `run_stream` (only when `filter_prompt` is set); `chat_image_prompt_compose` via `resolve_image_prompt_compose()` (image-prompt composer, required for image turns, resolved lazily only on image turns); `chat_vision` via `resolve_vision()` (vision pre-stage, opt-in); `chat_product_qa` via `resolve_product_qa()` (product-QA executor, opt-in); `chat_input_filter` via `resolve_input_filter()` (input rewrite, opt-in); `chat_output_filter` via `resolve_output_filter()`
 - `crates/eros-engine-server/src/routes/voice.rs` → `chat_voice` via `resolve_voice()`
+- `crates/eros-engine-server/src/routes/speech.rs` → `chat_speech` via `resolve_speech()`
 - `crates/eros-engine-server/src/pipeline/world.rs`, `story.rs`, `world_town.rs` → `world_director`, `world_stories_director`, `world_comment`, `world_reply` (the world sweepers, opt-in)
 - `crates/eros-engine-server/src/pipeline/activity.rs` → `activity_judge` via `resolve_activity_judge()` (a date's settlement, from the end route, a send or `/open`)
 - `crates/eros-engine-server/src/pipeline/dreaming/scan.rs` → `dreaming_scan` via `resolve_dreaming_scan()` and `arc_rewrite` via `resolve_arc_rewrite()` (the relationship scan and the arc rewrite it starts; reached from post-process at 20 pending turns, from the dreaming sweeper, and from the `backfill-dreaming` subcommand)
@@ -833,6 +835,31 @@ Powers `POST /comp/voice/{session_id}/turn/stream`
   [memory-layers.md](memory-layers.md#voice-turns).
 
 Call site: `crates/eros-engine-server/src/pipeline/voice.rs::run_voice_turn`.
+
+### `[tasks.chat_speech]` — speech markup for chat messages (opt-in)
+
+Powers `POST /comp/chat/{session_id}/messages/speech`
+([api-reference.md](api-reference.md#post-compchatsession_idmessagesspeech);
+`pipeline::speech::run_speech`, reached from `routes::speech` via
+`resolve_speech()`). Off unless this task block exists. One call per message.
+
+- `model` — **must** be a single fixed, non-empty id, as on `chat_voice`;
+  the round-robin array, the weighted table and `tiers` refuse to boot.
+  `fallback` is the sequential outage-retry chain.
+- `filter_prompt` — optional override of the built-in base directive (prepare
+  a line she already said for a text-to-speech voice; the context is not to be
+  answered; reply with the line alone). A blank or absent value falls back to
+  it. Whatever the base, the engine appends the mode sentence (words kept, or
+  rephrased when the request says `rewrite`) and the audio-tag guidance, which
+  lists the same tags as `chat_voice`'s `tts_audio_tags` and is used whether or
+  not that key or that block is set.
+- `max_tokens` — has to leave room for the source line plus its tags; too low
+  a value comes back as `truncated` items. The shipped example uses 400.
+
+The model's output is trimmed and returned as it is: no tag validation, no
+output filter, no word-for-word check against the source.
+
+Call site: `crates/eros-engine-server/src/pipeline/speech.rs::run_speech`.
 
 ### `[tasks.pde_decision]` — opt-in LLM PDE judge
 

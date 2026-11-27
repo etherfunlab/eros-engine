@@ -652,6 +652,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 | `memory_extraction` | 无——已退役。仍存在的块会被忽略，启动时打一条警告，指向 `dreaming_scan` | 已退役 |
 | `chat_input_filter` | `pipeline::stream`（用户输入改写 filter；由 `[tasks.chat_companion]` 上的 `input_filter` 和此任务块共同激活；默认关闭） | live（opt-in） |
 | `chat_voice` | `pipeline::voice::run_voice_turn`，由 `routes::voice`（`POST /comp/voice/{session_id}/turn/stream`）经 `resolve_voice()` 到达（语音通道的伴侣回复；`filter_prompt` 为空白**不会**关闭该任务——会回退到内置 directive；任务块缺失时关闭） | live（opt-in） |
+| `chat_speech` | `pipeline::speech::run_speech`，由 `routes::speech`（`POST /comp/chat/{session_id}/messages/speech`）经 `resolve_speech()` 到达（把她发过的聊天消息标注成给 TTS 的文本；`filter_prompt` 为空白会回退到内置基础指令；任务块缺失时关闭） | live（opt-in） |
 | `world_director` | `pipeline::world::sweeper`，经由 `resolve_world_director()`（后台按 owner 逐一执行的世界状态 director 轮次；任务块缺失/空白、设置了 `WORLD_DISABLED`，或 `WORLD_TICK_SECS=0` 时关闭） | live（opt-in） |
 | `world_stories_director` | `pipeline::story::run_stories_scan`，由 `pipeline::world::sweeper` 调用，经由 `resolve_world_stories_director()`（按 owner 逐一执行的故事轮次，还要求 `world_director` 已配置；任务块缺失/空白，或设置了 `WORLD_STORIES_DISABLED` 时关闭） | live（opt-in） |
 | `world_comment` | `pipeline::world_town::sweeper`，经由 `resolve_world_comment()`（每小时一次的 world-town 评论轮次，还要求 `world_director` 已配置——贴文只能在它下游产生；任务块缺失/空白、设置了 `WORLD_DISABLED` 或 `WORLD_TOWN_DISABLED`、或 `WORLD_TICK_SECS=0` 时关闭） | live（opt-in） |
@@ -666,6 +667,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 - `crates/eros-engine-server/src/pipeline/profile_rebuild.rs` → `profile_rebuild`，通过 `resolve_profile_rebuild()`（按计划的画像重建）
 - `crates/eros-engine-server/src/pipeline/stream.rs` → `pde_decision`，通过 `run_stream` 内的 `run_pde_decision`（仅当设置了 `filter_prompt`）；`chat_image_prompt_compose`，通过 `resolve_image_prompt_compose()`（出图 prompt 合成器，图片轮次必需，仅在图片轮次按需解析）；`chat_vision`，通过 `resolve_vision()`（视觉预处理阶段，opt-in）；`chat_product_qa`，通过 `resolve_product_qa()`（产品问答执行器，opt-in）；`chat_input_filter`，通过 `resolve_input_filter()`（输入改写，opt-in）；`chat_output_filter`，通过 `resolve_output_filter()`
 - `crates/eros-engine-server/src/routes/voice.rs` → `chat_voice`，通过 `resolve_voice()`
+- `crates/eros-engine-server/src/routes/speech.rs` → `chat_speech`，通过 `resolve_speech()`
 - `crates/eros-engine-server/src/pipeline/world.rs`、`story.rs`、`world_town.rs` → `world_director`、`world_stories_director`、`world_comment`、`world_reply`（world 各 sweeper，opt-in）
 - `crates/eros-engine-server/src/pipeline/activity.rs` → `activity_judge`，通过 `resolve_activity_judge()`（约会的结算，来自结束路由、一次发送或 `/open`）
 - `crates/eros-engine-server/src/pipeline/dreaming/scan.rs` → `dreaming_scan`，通过 `resolve_dreaming_scan()`；`arc_rewrite`，通过 `resolve_arc_rewrite()`（关系扫描和它发起的弧线改写；入口有三个：待扫轮数到 20 时的 post-process、dreaming 清扫器、`backfill-dreaming` 子命令）
@@ -699,6 +701,25 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
   [memory-layers.zh.md](memory-layers.zh.md#语音轮次)。
 
 调用点：`crates/eros-engine-server/src/pipeline/voice.rs::run_voice_turn`。
+
+### `[tasks.chat_speech]` — 聊天消息的语气标注（opt-in）
+
+支撑 `POST /comp/chat/{session_id}/messages/speech`
+（[api-reference.zh.md](api-reference.zh.md#post-compchatsession_idmessagesspeech)；
+`pipeline::speech::run_speech`，由 `routes::speech` 经 `resolve_speech()` 调用）。
+任务块缺失时功能关闭。每条消息调用一次。
+
+- `model` —— **必须**是单个固定、非空的 id，和 `chat_voice` 一样；round-robin 数组、加权表、`tiers`
+  都会拒绝启动。`fallback` 是顺序重试的故障切换链。
+- `filter_prompt` —— 可选，覆盖内置的基础指令（把她说过的一句话准备成给 TTS 念的文本；上下文不用回应；
+  只回这一句）。留空或缺省回退到内置指令。不论基础指令是哪一份，engine 都会追加模式句（一字不改，或请求带
+  `rewrite` 时允许改写）和音频标签说明；标签说明和 `chat_voice` 的 `tts_audio_tags` 列的是同一组标签，
+  不管那个键或那个任务块有没有设置都会用上。
+- `max_tokens` —— 要给原句加上标签留够空间；太小会让单项带 `truncated` 返回。示例配置用 400。
+
+模型的输出去掉首尾空白后原样返回：不校验标签、不走输出 filter、不逐字比对原句。
+
+调用点：`crates/eros-engine-server/src/pipeline/speech.rs::run_speech`。
 
 ### `[tasks.pde_decision]` — opt-in LLM PDE 判断器
 
