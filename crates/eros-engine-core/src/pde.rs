@@ -65,16 +65,20 @@ pub fn refuses_give(event: &Event, habits: Habits, roll: f64) -> bool {
     }
 }
 
-/// Whether this turn's `strip` is ruled out before the judge (spec
-/// 2026-11-08-strip-and-world-setting-design.md §2.1): the turn's scopes are
-/// not romance-compatible. Not a roll: such a pair always refuses.
-pub fn strip_ruled_out(event: &Event) -> bool {
+/// Whether this turn's gesture is ruled out before the judge for romance:
+/// a `strip` (spec 2026-11-08-strip-and-world-setting-design.md §2.1) or a
+/// gesture with the passion attribute (spec 2026-11-28-dance-massage-and-
+/// passion-actions-design.md §6.1) from a pair whose scopes are not
+/// romance-compatible. Not a roll, and no bypass: such a pair always refuses.
+pub fn romance_ruled_out(event: &Event) -> bool {
     match event {
         Event::UserMessage {
-            action: Some(UserAction::Strip),
+            action: Some(a),
             affinity_scope,
             ..
-        } => !crate::scope::romance_compatible(*affinity_scope),
+        } if matches!(a, UserAction::Strip) || a.is_passion() => {
+            !crate::scope::romance_compatible(*affinity_scope)
+        }
         _ => false,
     }
 }
@@ -1079,7 +1083,7 @@ mod tests {
         use crate::scope::{AffinityScope, MemoryScope};
         let strip = action_msg(UserAction::Strip);
         assert!(
-            strip_ruled_out(&strip),
+            romance_ruled_out(&strip),
             "engine defaults are not compatible"
         );
         let mut romantic = strip.clone();
@@ -1092,7 +1096,7 @@ mod tests {
             *memory_scope = MemoryScope::Full;
             *affinity_scope = AffinityScope::full();
         }
-        assert!(!strip_ruled_out(&romantic));
+        assert!(!romance_ruled_out(&romantic));
         let mut neutral_fallback = strip.clone();
         if let Event::UserMessage {
             memory_scope,
@@ -1103,9 +1107,9 @@ mod tests {
             *memory_scope = MemoryScope::NeutralOnly;
             *affinity_scope = AffinityScope::full();
         }
-        assert!(!strip_ruled_out(&neutral_fallback));
-        assert!(!strip_ruled_out(&action_msg(UserAction::Kiss)));
-        assert!(!strip_ruled_out(&user_msg("hi")));
+        assert!(!romance_ruled_out(&neutral_fallback));
+        assert!(!romance_ruled_out(&action_msg(UserAction::Kiss)));
+        assert!(!romance_ruled_out(&user_msg("hi")));
     }
 
     /// No naturism action is ruled out before the judge for romance
@@ -1658,5 +1662,45 @@ mod tests {
         assert!(!refuses_give(&named_gift, no_smoke, 0.99));
         assert!(!refuses_give(&action_msg(UserAction::Hug), no_smoke, 0.99));
         assert!(!refuses_give(&user_msg("hi"), no_smoke, 0.99));
+    }
+
+    /// Spec 2026-11-28-dance-massage-and-passion-actions-design.md §6.1.
+    #[test]
+    fn the_passion_gestures_need_a_compatible_pair() {
+        use crate::scope::{AffinityScope, MemoryScope};
+        let compatible = |action: UserAction| {
+            let mut e = action_msg(action);
+            if let Event::UserMessage {
+                memory_scope,
+                affinity_scope,
+                ..
+            } = &mut e
+            {
+                *memory_scope = MemoryScope::Full;
+                *affinity_scope = AffinityScope::full();
+            }
+            e
+        };
+        for a in [
+            UserAction::FrenchKiss,
+            UserAction::Tease,
+            UserAction::Lick,
+            UserAction::Touch,
+            UserAction::AskMassage,
+            UserAction::Strip,
+        ] {
+            assert!(romance_ruled_out(&action_msg(a.clone())), "{a:?}");
+            assert!(!romance_ruled_out(&compatible(a.clone())), "{a:?}");
+        }
+        for a in [
+            UserAction::Kiss,
+            UserAction::HugFromBehind,
+            UserAction::MassageTogether,
+            UserAction::MassageNakedTogether,
+            UserAction::DanceNakedTogether,
+            UserAction::DanceTogether,
+        ] {
+            assert!(!romance_ruled_out(&action_msg(a.clone())), "{a:?}");
+        }
     }
 }
