@@ -14,9 +14,8 @@ use crate::life_choices::pending_for_instance_on;
 /// One event. `session_id` is where it was drawn and told, `message_id` the
 /// message that told it; either is `None` once its row is gone, and
 /// `message_id` is `None` for an event that is never told. On a
-/// `custom_together` `message_id` is the user's message that asked (spec
-/// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-custom-
-/// together-design.md §8.3).
+/// `custom_together`, or a `having_sex_together` a user's action placed,
+/// `message_id` is the user's message that asked ([`points_at_the_user`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventRecord {
     pub id: Uuid,
@@ -151,6 +150,19 @@ pub(crate) async fn lock_instance(
 
 pub struct EventRepo<'a> {
     pub pool: &'a PgPool,
+}
+
+/// Whether a row of `kind` that a user's action places points at the user's
+/// message that asked, not at hers: a `custom_together`'s text and a
+/// `sex_together`'s act ride on it (spec 2026-11-26-more-together-actions-
+/// bath-outfit-chemistry-drop-and-custom-together-design.md §8.3; spec
+/// 2026-11-27-passion-group-design.md §5.3). Every other placed row points at
+/// no message.
+pub fn points_at_the_user(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::CustomTogether | EventKind::HavingSexTogether
+    )
 }
 
 impl EventRepo<'_> {
@@ -351,11 +363,9 @@ impl EventRepo<'_> {
     /// or a date being opened, is waited for and then seen. Nothing here
     /// commits.
     ///
-    /// `user_message_id` is the user's message that asked. A `custom_together`
-    /// row points at it (`message_id`), as the user's words live there (spec
-    /// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
-    /// custom-together-design.md §8.3); a row of any other kind points at no
-    /// message. One message places at most one row, so
+    /// `user_message_id` is the user's message that asked. A row of a kind
+    /// [`points_at_the_user`] names points at it (`message_id`); a row of any
+    /// other kind points at no message. One message places at most one row, so
     /// `persona_events_message_uidx` holds.
     pub async fn place_together_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -375,7 +385,7 @@ impl EventRepo<'_> {
         {
             return Ok(());
         }
-        let message_id = (e.kind == EventKind::CustomTogether).then_some(user_message_id);
+        let message_id = points_at_the_user(e.kind).then_some(user_message_id);
         Self::insert_preempting_pointing_in_tx(tx, e, message_id).await?;
         Ok(())
     }
@@ -467,6 +477,22 @@ impl EventRepo<'_> {
             self.read_text(e).await?;
         }
         Ok(e)
+    }
+
+    /// The `metadata.action` of the message `message_id`, if it has one: the
+    /// action a passion row reads its act and clothing from (spec
+    /// 2026-11-27-passion-group-design.md §5.3).
+    pub async fn action_of(
+        &self,
+        message_id: Uuid,
+    ) -> Result<Option<serde_json::Value>, sqlx::Error> {
+        Ok(sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT metadata->'action' FROM engine.chat_messages WHERE id = $1",
+        )
+        .bind(message_id)
+        .fetch_optional(self.pool)
+        .await?
+        .flatten())
     }
 
     /// Fill `e.text` for a `custom_together` whose message is there: the
@@ -1362,6 +1388,60 @@ mod tests {
         assert_eq!((e.message_id, e.text), (None, None));
         let by_key = repo.by_key(s, &key).await.unwrap().expect("written");
         assert_eq!(by_key.text, None);
+    }
+
+    /// Spec 2026-11-27-passion-group-design.md §5.3: the row a user's
+    /// `sex_together` places points at the message that asked, and the
+    /// action is read back from it; no act text goes on the event.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_users_sex_row_points_at_the_message(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let repo = EventRepo { pool: &pool };
+        let action = json!({"type": "sex_together", "name": "姿势甲", "response": "accept"});
+        let asked: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', '', $2, '2026-10-01T10:00:00Z') RETURNING id",
+        )
+        .bind(s)
+        .bind(json!({ "action": action }))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let key = format!("action:{asked}:sex_together");
+        let mut tx = pool.begin().await.unwrap();
+        EventRepo::place_together_in_tx(
+            &mut tx,
+            &ev(
+                i,
+                s,
+                &key,
+                HavingSexTogether,
+                "2026-10-01T10:00:00Z",
+                "2026-10-01T11:00:00Z",
+            ),
+            asked,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let e = repo
+            .current(i, None, t("2026-10-01T10:30:00Z"), None)
+            .await
+            .unwrap()
+            .foreground
+            .expect("under way");
+        assert_eq!((e.kind, e.message_id), (HavingSexTogether, Some(asked)));
+        assert_eq!(e.text, None);
+        assert_eq!(repo.action_of(asked).await.unwrap(), Some(action));
+        let plain: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+             VALUES ($1, 'user', 'hi', '{}'::jsonb, '2026-10-01T09:00:00Z') RETURNING id",
+        )
+        .bind(s)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(repo.action_of(plain).await.unwrap(), None);
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -81,8 +81,10 @@ pub fn strip_ruled_out(event: &Event) -> bool {
 
 /// Whether this turn's together action is ruled out before the judge: a
 /// `toilet_together` when the persona is a `machine` (spec 2026-11-23-twelve-
-/// together-actions-and-propose-design.md §4.1). No together action is ruled
-/// out for romance compatibility (spec 2026-11-27-together-action-groups-
+/// together-actions-and-propose-design.md §4.1), and a `sex_together` from a
+/// pair that is not romance-compatible unless it says `ignore_orientation`
+/// (spec 2026-11-27-passion-group-design.md §4, §5.4). No naturism action is
+/// ruled out for compatibility (spec 2026-11-27-together-action-groups-
 /// design.md §5.1).
 pub fn together_ruled_out(event: &Event, machine: bool) -> bool {
     match event {
@@ -90,6 +92,17 @@ pub fn together_ruled_out(event: &Event, machine: bool) -> bool {
             action: Some(UserAction::ToiletTogether),
             ..
         } => machine,
+        // The passion group's gate, and its bypass (spec 2026-11-27-passion-
+        // group-design.md §4, §5.4).
+        Event::UserMessage {
+            action:
+                Some(UserAction::SexTogether {
+                    ignore_orientation: false,
+                    ..
+                }),
+            affinity_scope,
+            ..
+        } => !crate::scope::romance_compatible(*affinity_scope),
         _ => false,
     }
 }
@@ -127,7 +140,7 @@ pub fn period_refuses(event: &Event, on_period: bool, roll: f64) -> bool {
             Event::UserMessage {
                 action: Some(a), ..
             } => {
-                matches!(a, UserAction::SexTogether)
+                matches!(a, UserAction::SexTogether { .. })
                     || a.together_kind()
                         .is_some_and(crate::events::EventKind::is_wet)
             }
@@ -1095,9 +1108,9 @@ mod tests {
         assert!(!strip_ruled_out(&user_msg("hi")));
     }
 
-    /// No together action is ruled out before the judge for romance
-    /// compatibility any more: a shower, a bath and a sauna reach the judge on
-    /// any scopes (spec 2026-11-27-together-action-groups-design.md §5.1).
+    /// No naturism action is ruled out before the judge for romance
+    /// compatibility: a shower, a bath and a sauna reach the judge on any
+    /// scopes (spec 2026-11-27-together-action-groups-design.md §5.1).
     #[test]
     fn a_shower_or_a_bath_together_reaches_the_judge_on_any_scopes() {
         use crate::scope::{AffinityScope, MemoryScope};
@@ -1138,9 +1151,10 @@ mod tests {
         assert!(!together_ruled_out(&user_msg("hi"), false));
     }
 
-    /// A machine never goes to the toilet, and nothing else is ruled out
-    /// here: no nude action is refused before the judge for romance
-    /// compatibility (spec 2026-11-27-together-action-groups-design.md §5.1).
+    /// A machine never goes to the toilet, and no naturism action is refused
+    /// before the judge for romance compatibility (spec 2026-11-27-together-
+    /// action-groups-design.md §5.1); `sex_together`'s gate is tested on its
+    /// own.
     #[test]
     fn only_a_machines_toilet_is_ruled_out() {
         use crate::scope::{AffinityScope, MemoryScope};
@@ -1165,7 +1179,6 @@ mod tests {
         for a in [
             UserAction::ShowerTogether,
             UserAction::BathTogether,
-            UserAction::SexTogether,
             UserAction::StreakTogether,
             UserAction::SkinnyDipTogether,
             UserAction::RideHorseNakedTogether,
@@ -1300,7 +1313,7 @@ mod tests {
         // Not a habit action: never rolled, whatever she does not use.
         for a in [
             UserAction::WalkTogether,
-            UserAction::SexTogether,
+            UserAction::sex_together(),
             UserAction::Propose,
         ] {
             assert!(
@@ -1358,7 +1371,7 @@ mod tests {
     /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
     /// custom-together-design.md §4: `skinny_dip_together` is rolled as
     /// `swim_together` is; its five siblings are neither rolled nor
-    /// world-bound. No together action is gated (spec 2026-11-27-together-
+    /// world-bound. No naturism action is gated (spec 2026-11-27-together-
     /// action-groups-design.md §5.1).
     #[test]
     fn skinny_dip_is_rolled_on_her_period() {
@@ -1433,6 +1446,55 @@ mod tests {
         }
     }
 
+    /// Spec 2026-11-27-passion-group-design.md §4, §5.4: `sex_together` is
+    /// gated for an incompatible pair unless it ignores orientation; the
+    /// naturism actions stay ungated, and her period still rolls sex.
+    #[test]
+    fn sex_together_is_gated_unless_it_ignores_orientation() {
+        use crate::scope::{AffinityScope, MemoryScope};
+        let scoped = |a: UserAction, compatible: bool| {
+            let mut e = action_msg(a);
+            if let Event::UserMessage {
+                memory_scope,
+                affinity_scope,
+                ..
+            } = &mut e
+            {
+                if compatible {
+                    *memory_scope = MemoryScope::Full;
+                    *affinity_scope = AffinityScope::full();
+                } else {
+                    *memory_scope = MemoryScope::default();
+                    *affinity_scope = AffinityScope::default();
+                }
+            }
+            e
+        };
+        let bypass = UserAction::SexTogether {
+            name: None,
+            active: None,
+            remain_clothing: Default::default(),
+            ignore_orientation: true,
+        };
+        assert!(together_ruled_out(
+            &scoped(UserAction::sex_together(), false),
+            false
+        ));
+        assert!(!together_ruled_out(
+            &scoped(UserAction::sex_together(), true),
+            false
+        ));
+        assert!(!together_ruled_out(&scoped(bypass.clone(), false), false));
+        assert!(!together_ruled_out(&scoped(bypass.clone(), true), false));
+        for a in [UserAction::ShowerTogether, UserAction::StreakTogether] {
+            assert!(
+                !together_ruled_out(&scoped(a.clone(), false), false),
+                "{a:?}"
+            );
+        }
+        assert!(period_refuses(&action_msg(bypass), true, 0.5));
+    }
+
     /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
     /// custom-together-design.md §8.1: nothing rules a `custom_together` out
     /// before the judge, and her period does not roll it.
@@ -1461,7 +1523,7 @@ mod tests {
     fn her_period_refuses_sex_and_water_two_times_in_three() {
         use UserAction::*;
         for a in [
-            SexTogether,
+            UserAction::sex_together(),
             BathTogether,
             ShowerTogether,
             HotSpringTogether,
@@ -1524,7 +1586,7 @@ mod tests {
         }
         for a in [
             UserAction::Kiss,
-            UserAction::SexTogether,
+            UserAction::sex_together(),
             UserAction::Challenge,
             UserAction::FightTogether,
         ] {

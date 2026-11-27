@@ -394,8 +394,9 @@ impl<'a> StoryRepo<'a> {
     /// `cap` newest, and a row under way survives it. Left out: a
     /// `taking_space` / `fell_out` whose session is gone or archived (it
     /// belongs to that relationship), a false alarm still under way (she
-    /// does not know yet), and every nude together kind (spec 2026-11-27-
-    /// together-action-groups-design.md §5.1), `using_toilet_together`,
+    /// does not know yet), and every naturism and passion kind (spec
+    /// 2026-11-27-together-action-groups-design.md §5.1; spec 2026-11-27-
+    /// passion-group-design.md §4), `using_toilet_together`,
     /// `asleep_together`, `custom_together` and `on_a_date`: a romantic
     /// choice's or action's outcome lives in the conversation only (spec
     /// 2026-10-30 §4.7, 2026-11-23 §4.3), and a date in its own sub-session.
@@ -426,7 +427,12 @@ impl<'a> StoryRepo<'a> {
         // telling (§8.2, §8.3).
         let kept_out: Vec<&str> = EventKind::SPECIAL
             .into_iter()
-            .filter(|k| k.together_group() == Some(TogetherGroup::Nude))
+            .filter(|k| {
+                matches!(
+                    k.together_group(),
+                    Some(TogetherGroup::Nude | TogetherGroup::Sex)
+                )
+            })
             .chain([
                 EventKind::UsingToiletTogether,
                 EventKind::AsleepTogether,

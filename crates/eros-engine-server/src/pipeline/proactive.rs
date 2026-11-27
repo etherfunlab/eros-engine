@@ -814,6 +814,7 @@ async fn store(
             None,
             "event",
             shown.clothing_override,
+            None,
         )
         .await;
         metadata.insert(

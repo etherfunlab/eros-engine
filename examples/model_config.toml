@@ -375,6 +375,10 @@ model_name_display_override = true
 # When the chat request carries user_gender and an event she shares with the
 # user is live, one more labeled section ([对方]) gives the partner's gender
 # (男性 / 女性). A custom prompt should say the partner is drawn as that gender.
+# While she is in a passion act with the user on a 1:1 picture, a [亲密]
+# section says who leads (角色 / 对方) and what the user wears; the engine
+# writes [此刻穿着] from the act. A custom prompt should let both win over
+# [此刻状态] and follow who leads.
 # Omit the block entirely and image turns stay unavailable. Fail-open: on failure / timeout / empty
 # reply it falls back to an empty subject (a plain persona-appearance
 # portrait), so it never blocks the image turn (and never advances any
