@@ -334,6 +334,47 @@ impl From<eros_engine_core::types::ItemKind> for ItemKindDto {
     }
 }
 
+/// Who leads in a `sex_together` (spec 2026-11-27-passion-group-design.md
+/// §5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PartyDto {
+    User,
+    Persona,
+}
+
+impl From<PartyDto> for eros_engine_core::types::Party {
+    fn from(p: PartyDto) -> Self {
+        match p {
+            PartyDto::User => Self::User,
+            PartyDto::Persona => Self::Persona,
+        }
+    }
+}
+
+/// What one side of a `sex_together` wears (spec 2026-11-27 §5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SideClothingDto {
+    FullNaked,
+    HalfNaked,
+    Custom(String),
+    CustomBase64(String),
+}
+
+/// What both sides of a `sex_together` wear (spec 2026-11-27 §5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum RemainClothingDto {
+    Flag(bool),
+    Sides {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active: Option<SideClothingDto>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        passive: Option<SideClothingDto>,
+    },
+}
+
 /// How long a `date` lasts: `short` is one hour, `mid` four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -357,8 +398,9 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// `adventure_together`, `commit_crime_together`, `play_with_fire_together`
 /// and `fight_together`, and `jog_together`, `hike_together`,
 /// `fish_together`, `cycle_together` and `ride_horse_together` → bond;
-/// `streak_together`, `hike_naked_together` and `ride_horse_naked_together`
-/// → bond and chemistry; every other physical or custom action →
+/// `streak_together`, `hike_naked_together`, `ride_horse_naked_together` and
+/// a `sex_together` with a `name` → bond and chemistry; every other physical
+/// or custom action →
 /// chemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `break_up`,
 /// `challenge` or `bet` costs nothing.
 /// An accepted `gift` joins the persona's items or wardrobe. A `date` asks her
@@ -397,8 +439,13 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// start an event the same way, as do `yoga_naked_together` →
 /// `naked_yoga_together` and `hot_spring_naked_together` →
 /// `naked_hot_spring_together` (one hour each) and `hike_naked_together` →
-/// `naked_hiking_together` (two to three hours). No together action is
-/// refused for the pair's scopes: the judge decides. During her period a
+/// `naked_hiking_together` (two to three hours). Only a `sex_together` is
+/// refused before the judge for the pair's scopes, when they are not
+/// romance-compatible and the action does not say `ignore_orientation`; the
+/// judge decides every other together action. A `sex_together` may name the
+/// act (`name` or `name_base64`), say who leads (`active`) and what each side
+/// wears (`remain_clothing`); these shape her picture, and a read returns the
+/// act and custom clothing as base64. During her period a
 /// `sex_together`, or a together action that happens in water
 /// (`swim_together`, `hot_spring_together`, `sauna_together`,
 /// `shower_together`, `bath_together`, `skinny_dip_together`,
@@ -428,10 +475,31 @@ pub struct UserActionDto {
     #[serde(rename = "kind", default, skip_serializing_if = "Option::is_none")]
     pub item_kind: Option<ItemKindDto>,
     /// `give`: optional, a short name for what is handed over, 1–32 chars.
-    /// `gift`: required, what is given, 1–64 chars.
+    /// `gift`: required, what is given, 1–64 chars. `sex_together`:
+    /// optional, the act in plain text, 1–100 chars (or `name_base64`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(max_length = 64)]
+    #[schema(max_length = 100)]
     pub name: Option<String>,
+    /// `sex_together` only: the act as base64 (STANDARD) of UTF-8 text,
+    /// 1–100 chars once decoded; not together with `name`. A read of the
+    /// action always returns the act here, never in `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_base64: Option<String>,
+    /// `sex_together` only: who leads, `user` or `persona`; the other side is
+    /// passive. Absent: a male user with a female persona leads, a female
+    /// user with a male persona is led, the user leads otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<PartyDto>,
+    /// `sex_together` only: what each side wears. `false` (the default) both
+    /// fully naked, `true` both as they are, or `{"active": …, "passive": …}`
+    /// with `full_naked`, `half_naked`, `{"custom": "…"}` or
+    /// `{"custom_base64": "…"}` per side (a missing side is `full_naked`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remain_clothing: Option<RemainClothingDto>,
+    /// `sex_together` only: `true` takes the ask past the romance gate; the
+    /// judge still decides. For debugging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_orientation: Option<bool>,
     /// `give` only: 1–99, default 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(minimum = 1, maximum = 99)]
@@ -518,7 +586,60 @@ impl UserActionDto {
             UserActionKind::ToiletTogether => UserAction::ToiletTogether,
             UserActionKind::SmokeTogether => UserAction::SmokeTogether,
             UserActionKind::FallAsleepTogether => UserAction::FallAsleepTogether,
-            UserActionKind::SexTogether => UserAction::sex_together(),
+            UserActionKind::SexTogether => {
+                use eros_engine_core::types::{RemainClothing, SideClothing};
+                // Plain or base64, decoded and bounded the same way (spec
+                // 2026-11-27-passion-group-design.md §5.1).
+                fn decoded(b64: &str, field: &str) -> Result<String, String> {
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(b64.trim())
+                        .map_err(|_| format!("action.{field} must be base64"))?;
+                    String::from_utf8(bytes)
+                        .map_err(|_| format!("action.{field} must decode to UTF-8 text"))
+                }
+                let name = match (self.name.as_deref(), self.name_base64.as_deref()) {
+                    (Some(_), Some(_)) => {
+                        return Err("action.name and action.name_base64 are exclusive".into())
+                    }
+                    (Some(n), None) => free_text(Some(n), "name", MAX_ACTION_TEXT_CHARS)?,
+                    (None, Some(b)) => free_text(
+                        Some(&decoded(b, "name_base64")?),
+                        "name_base64",
+                        MAX_ACTION_TEXT_CHARS,
+                    )?,
+                    (None, None) => None,
+                };
+                let side = |s: &SideClothingDto| -> Result<SideClothing, String> {
+                    let custom = |t: &str, field: &str| {
+                        free_text(Some(t), field, MAX_ACTION_TEXT_CHARS)
+                            .map(|t| SideClothing::Custom(t.unwrap_or_default()))
+                    };
+                    match s {
+                        SideClothingDto::FullNaked => Ok(SideClothing::FullNaked),
+                        SideClothingDto::HalfNaked => Ok(SideClothing::HalfNaked),
+                        SideClothingDto::Custom(t) => custom(t, "remain_clothing.custom"),
+                        SideClothingDto::CustomBase64(b) => custom(
+                            &decoded(b, "remain_clothing.custom_base64")?,
+                            "remain_clothing.custom_base64",
+                        ),
+                    }
+                };
+                let remain_clothing = match &self.remain_clothing {
+                    None => RemainClothing::default(),
+                    Some(RemainClothingDto::Flag(b)) => RemainClothing::Flag(*b),
+                    Some(RemainClothingDto::Sides { active, passive }) => RemainClothing::Sides {
+                        active: active.as_ref().map(side).transpose()?,
+                        passive: passive.as_ref().map(side).transpose()?,
+                    },
+                };
+                UserAction::SexTogether {
+                    name,
+                    active: self.active.map(Into::into),
+                    remain_clothing,
+                    ignore_orientation: self.ignore_orientation.unwrap_or(false),
+                }
+            }
             UserActionKind::WalkTogether => UserAction::WalkTogether,
             UserActionKind::SmokeWeedTogether => UserAction::SmokeWeedTogether,
             UserActionKind::JogTogether => UserAction::JogTogether,
@@ -613,9 +734,27 @@ pub struct UserActionView {
 
 impl UserActionView {
     /// Parse a stored `metadata.action`; what does not parse is dropped rather
-    /// than failing the history page.
+    /// than failing the history page. A `sex_together`'s act and custom
+    /// clothing are stored in plain text and read back as base64 only (spec
+    /// 2026-11-27-passion-group-design.md §5.3).
     pub(crate) fn from_metadata_action(raw: &serde_json::Value) -> Option<Self> {
-        serde_json::from_value(raw.clone()).ok()
+        use base64::Engine as _;
+        let b64 = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+        let mut raw = raw.clone();
+        if raw.get("type").and_then(|t| t.as_str()) == Some("sex_together") {
+            if let Some(name) = raw.as_object_mut().and_then(|o| o.remove("name")) {
+                raw["name_base64"] = serde_json::json!(b64(name.as_str().unwrap_or("")));
+            }
+            for side in ["active", "passive"] {
+                let slot = raw.pointer_mut(&format!("/remain_clothing/{side}"));
+                if let Some(slot) = slot {
+                    if let Some(t) = slot.get("custom").and_then(|t| t.as_str()) {
+                        *slot = serde_json::json!({ "custom_base64": b64(t) });
+                    }
+                }
+            }
+        }
+        serde_json::from_value(raw).ok()
     }
 }
 
@@ -4279,6 +4418,140 @@ data: [DONE]\n\n";
         json!({"content": "hi", "client_msg_id": msg_id(n)})
     }
 
+    fn b64(s: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(s)
+    }
+
+    fn sex_dto(action: Value) -> Result<eros_engine_core::types::UserAction, String> {
+        serde_json::from_value::<UserActionDto>(action)
+            .map_err(|e| e.to_string())?
+            .to_core()
+    }
+
+    /// Spec 2026-11-27-passion-group-design.md §5.1: plain or base64, the
+    /// same act.
+    #[test]
+    fn sex_together_accepts_plain_or_base64_names() {
+        use eros_engine_core::types::UserAction;
+        let plain = sex_dto(json!({"type": "sex_together", "name": " 姿势甲 "})).unwrap();
+        let encoded = sex_dto(
+            json!({"type": "sex_together", "name_base64": b64("姿势甲".as_bytes())}),
+        )
+        .unwrap();
+        assert_eq!(plain, encoded);
+        assert!(matches!(
+            plain,
+            UserAction::SexTogether { name: Some(ref n), .. } if n == "姿势甲"
+        ));
+        assert_eq!(
+            sex_dto(json!({"type": "sex_together"})).unwrap(),
+            UserAction::sex_together()
+        );
+        let full = sex_dto(json!({
+            "type": "sex_together", "active": "persona", "ignore_orientation": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            full,
+            UserAction::SexTogether {
+                active: Some(eros_engine_core::types::Party::Persona),
+                ignore_orientation: true,
+                ..
+            }
+        ));
+    }
+
+    /// §5.1: each malformed name is refused.
+    #[test]
+    fn sex_together_rejects_bad_names() {
+        let long = "姿".repeat(MAX_ACTION_TEXT_CHARS + 1);
+        for (why, action) in [
+            (
+                "both fields",
+                json!({"type": "sex_together", "name": "姿势甲", "name_base64": b64(b"x")}),
+            ),
+            ("not base64", json!({"type": "sex_together", "name_base64": "!!!"})),
+            (
+                "not UTF-8",
+                json!({"type": "sex_together", "name_base64": b64(&[0xff, 0xfe])}),
+            ),
+            (
+                "too long after decoding",
+                json!({"type": "sex_together", "name_base64": b64(long.as_bytes())}),
+            ),
+            ("blank", json!({"type": "sex_together", "name": "   "})),
+        ] {
+            assert!(sex_dto(action).is_err(), "{why}");
+        }
+    }
+
+    /// §5.2: every clothing shape.
+    #[test]
+    fn sex_together_reads_every_clothing_shape() {
+        use eros_engine_core::types::{RemainClothing, SideClothing, UserAction};
+        let clothing = |rc: Value| match sex_dto(json!({"type": "sex_together", "remain_clothing": rc}))
+            .unwrap()
+        {
+            UserAction::SexTogether {
+                remain_clothing, ..
+            } => remain_clothing,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(clothing(json!(false)), RemainClothing::Flag(false));
+        assert_eq!(clothing(json!(true)), RemainClothing::Flag(true));
+        assert_eq!(
+            clothing(json!({"active": "full_naked", "passive": "half_naked"})),
+            RemainClothing::Sides {
+                active: Some(SideClothing::FullNaked),
+                passive: Some(SideClothing::HalfNaked),
+            }
+        );
+        assert_eq!(
+            clothing(json!({"active": {"custom": "只穿袜子"},
+                            "passive": {"custom_base64": b64("只穿袜子".as_bytes())}})),
+            RemainClothing::Sides {
+                active: Some(SideClothing::Custom("只穿袜子".into())),
+                passive: Some(SideClothing::Custom("只穿袜子".into())),
+            }
+        );
+        assert_eq!(
+            clothing(json!({"passive": "half_naked"})),
+            RemainClothing::Sides {
+                active: None,
+                passive: Some(SideClothing::HalfNaked),
+            }
+        );
+        assert!(sex_dto(json!({"type": "sex_together",
+                               "remain_clothing": {"active": {"custom_base64": "!!!"}}}))
+        .is_err());
+    }
+
+    /// §5.3: a read returns the act and custom clothing as base64 only,
+    /// whatever was sent; an old plain row still reads.
+    #[test]
+    fn the_history_view_returns_the_act_as_base64() {
+        let stored = json!({
+            "type": "sex_together", "name": "姿势甲",
+            "remain_clothing": {"active": {"custom": "只穿袜子"}, "passive": "half_naked"},
+            "response": "accept"
+        });
+        let view = UserActionView::from_metadata_action(&stored).expect("parses");
+        let v = serde_json::to_value(&view).unwrap();
+        assert_eq!(v["name_base64"], json!(b64("姿势甲".as_bytes())), "{v}");
+        assert!(v.get("name").is_none(), "{v}");
+        assert_eq!(
+            v["remain_clothing"]["active"],
+            json!({"custom_base64": b64("只穿袜子".as_bytes())}),
+            "{v}"
+        );
+        assert_eq!(v["remain_clothing"]["passive"], json!("half_naked"), "{v}");
+        assert!(!v.to_string().contains("姿势甲"), "{v}");
+        let old = UserActionView::from_metadata_action(&json!({"type": "sex_together"}))
+            .expect("an old row parses");
+        assert_eq!(serde_json::to_value(&old).unwrap(), json!({"type": "sex_together"}));
+    }
+
     fn invite(n: u32, place: &str, content: &str) -> Value {
         json!({
             "content": "",
@@ -4294,6 +4567,29 @@ data: [DONE]\n\n";
         let session_id =
             crate::routes::companion::testutil::seed_session(pool, user_id, instance_id).await;
         (user_id, instance_id, session_id)
+    }
+
+    /// Spec 2026-11-27-passion-group-design.md §5.1: a malformed
+    /// `sex_together` is a 422 on the send route.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn sex_action_is_validated(pool: PgPool) {
+        use crate::routes::companion::testutil::send_request;
+        let (user_id, _, session_id) = home(&pool).await;
+        let mut app = build_router(crate::routes::companion::test_state(pool.clone()));
+        let token = mint_jwt(user_id);
+        for (n, action) in [
+            json!({"type": "sex_together", "name": "姿势甲", "name_base64": b64(b"x")}),
+            json!({"type": "sex_together", "name_base64": "!!!"}),
+            json!({"type": "sex_together", "name_base64": b64(&[0xff, 0xfe])}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let body = json!({"content": "", "client_msg_id": msg_id(40 + n as u32), "action": action});
+            let (status, resp) = send_request(&mut app, async_send(session_id, &token, body)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{action}: {resp}");
+            assert_eq!(resp["code"], "unprocessable", "{action}: {resp}");
+        }
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -4955,6 +5251,10 @@ mod validate_payload_tests {
             item: Some(GivenItemDto::Alcohol),
             item_kind: None,
             name: name.map(String::from),
+            name_base64: None,
+            active: None,
+            remain_clothing: None,
+            ignore_orientation: None,
             quantity,
             text: None,
             amount_usd: None,
@@ -4970,6 +5270,10 @@ mod validate_payload_tests {
             item: None,
             item_kind: None,
             name: None,
+            name_base64: None,
+            active: None,
+            remain_clothing: None,
+            ignore_orientation: None,
             quantity: None,
             text: None,
             amount_usd: None,
@@ -5484,6 +5788,10 @@ mod validate_payload_tests {
             item: None,
             item_kind: None,
             name: None,
+            name_base64: None,
+            active: None,
+            remain_clothing: None,
+            ignore_orientation: None,
             quantity: None,
             text: None,
             amount_usd: amount,
@@ -5516,6 +5824,10 @@ mod validate_payload_tests {
             item: None,
             item_kind: kind,
             name: name.map(String::from),
+            name_base64: None,
+            active: None,
+            remain_clothing: None,
+            ignore_orientation: None,
             quantity: None,
             text: None,
             amount_usd: None,
