@@ -261,15 +261,20 @@ roll can refuse whatever the judge says
 
 - **Accepted:** nothing special. The affinity judge sees the action in the
   user text and grades the turn as usual.
-- **Refused:** the line the action touches (`give`, `gift` and `commit_crime_together` → Bond,
-  every physical action → Chemistry) drops one tier, landing at the same relative position
-  inside the lower tier; a tier-1 line goes to `0`. Both axes of the line are
-  scaled by the same factor, so their ratio is kept. The drop is computed from
+- **Refused:** each line the action touches drops one tier, landing at the same relative
+  position inside the lower tier; a tier-1 line goes to `0`. `give`, `gift`, a thrill together
+  action (`adventure_together`, `commit_crime_together`, `play_with_fire_together`,
+  `fight_together`) and the outdoor `jog_together`, `hike_together`, `fish_together`,
+  `cycle_together` and `ride_horse_together` touch Bond; their naturism counterparts
+  `streak_together`, `hike_naked_together` and `ride_horse_naked_together`, and a
+  `sex_together` that names its act, touch both lines; every other physical action touches
+  Chemistry ([what a refusal costs](life-events-needs.md#what-a-refusal-costs)). Both axes of a
+  line are scaled by the same factor, so their ratio is kept. The drop is computed from
   the pre-turn snapshot inside the row lock and replaces whatever the judge's
-  grades did to that line; the other line and the base-pair levels follow the
-  judge. That line's `pending_deltas` are cleared, and the event row's
-  `context.tier_drop` names the line. The drop applies even when the affinity
-  eval is skipped or fails.
+  grades did to that line; a line the action does not touch and the base-pair levels follow
+  the judge. Each dropped line's `pending_deltas` are cleared, and the event row's
+  `context.tier_drop` names the line, or reads `both` for a two-line drop. The drop applies
+  even when the affinity eval is skipped or fails.
 - **Refused tip:** a `tip` drops no line. The persona's reply follows the
   verdict; the turn is graded like any other.
 - **Social actions:** a refused `bluff`, `threaten` or `trick` means she saw
@@ -277,19 +282,25 @@ roll can refuse whatever the judge says
   drops a line; the turn is graded like any other.
 - **Strip:** a `strip` from a pair whose `affinity_scope` is not romance-compatible is
   refused whatever the judge says, and drops Chemistry like any refused
-  physical action. So is a `shower_together`, `bath_together`, `sex_together`,
-  `streak_together` or `skinny_dip_together` from such a pair, and a `toilet_together` to a machine persona. A
+  physical action. So is a `sex_together` from such a pair, unless it says
+  `ignore_orientation`, and it drops the lines a refused `sex_together` drops; so is a
+  `toilet_together` to a machine persona. A
   `fight_together` to a persona whose `setting` is not `fantasy`, and a `cycle_together` to one
-  whose `setting` is, are refused the same way and drop no line. The other together actions have no such rule. A `smoke_together`, `smoke_weed_together` or
+  whose `setting` is, are refused the same way and drop no line. The other together actions,
+  the naturism ones included, have no such rule. A `smoke_together`, `smoke_weed_together` or
   `drink_together` the roll refuses drops Chemistry too, not Bond.
-- **Her period:** during her period a `sex_together`, `bath_together`, `hot_spring_together`,
-  `sauna_together`, `swim_together` or `skinny_dip_together` that the rules above did not refuse is refused before the
-  judge two times in three by a roll ([her cycle](life-events-needs.md#her-cycle)), and drops no
-  line; the other third is judged as usual.
+- **Her period:** during her period a `sex_together`, or a together action that happens in water
+  (`swim_together`, `hot_spring_together`, `sauna_together`, `shower_together`,
+  `bath_together`, `skinny_dip_together`, `hot_spring_naked_together`), that the rules above did
+  not refuse is refused before the judge two times in three by a roll
+  ([her cycle](life-events-needs.md#her-cycle)), and drops no line; the other third is judged as
+  usual.
 - **An intimate event under way:** a fall of the Chemistry tier from something the user did after
-  it started, a refused action's drop included, ends a `showering_together`, `bathing_together`,
-  `having_sex_together`, `streaking_together` or `skinny_dipping_together` at once
-  ([life-events-needs.md](life-events-needs.md#when-chemistry-falls-the-intimate-event-ends)).
+  it started, a refused action's drop included, ends a naturism or passion event at once
+  (`showering_together`, `bathing_together`, `streaking_together`, `skinny_dipping_together`,
+  `naked_horse_riding_together`, `naked_yoga_together`, `naked_hiking_together`,
+  `naked_hot_spring_together`, `having_sex_together`;
+  [life-events-needs.md](life-events-needs.md#when-chemistry-falls-the-intimate-event-ends)).
 - **Proposal and break-up:** a refused `propose` or `break_up` drops no line; the turn is
   graded like any other. Before the judge, a `propose` from a status other than `dating`,
   `fwb` or `situationship`, and a `break_up` from a status that is not breakable, are refused
@@ -755,8 +766,8 @@ Each delta turn appends one row to `engine.companion_affinity_events`:
   `grades`, `pending_after`, and the endpoint audit: `warmth_grade`/
   `patience_grade` when read, `boost_warmth`/`boost_patience`,
   `decay_factor`, `units`. `cross_penalty_assessed` joins them whenever a
-  turn was taxed; `tier_drop` (`bond` | `chemistry`) joins them on a turn
-  whose refused action dropped that line; `growth_scale` (`0.5`) joins them
+  turn was taxed; `tier_drop` (`bond` | `chemistry` | `both`) joins them on a turn
+  whose refused action dropped that line, or both lines; `growth_scale` (`0.5`) joins them
   on a turn whose positive growth was halved by the cold war. A life choice's
   own `life_choice` row has a `context` of `life_choice` and `choice_id`
   instead (see [above](#life-choice-drops-and-the-cold-war-halving)). A date's
