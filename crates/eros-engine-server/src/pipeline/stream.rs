@@ -543,6 +543,44 @@ fn drive_chat_burst(
     )
 }
 
+/// What a 1:1 text turn's tone is decided from (spec
+/// 2026-11-27-erotic-tone-design.md §6). Each chance is `None` when its roll
+/// is not made on this turn.
+struct ToneInputs {
+    /// The `erotic` chance: a fixed moment's or the everyday draw's.
+    erotic_p: Option<f64>,
+    /// A listed user action under `tones.emotional`: `emotional` with no
+    /// draw.
+    listed_emotional: bool,
+    /// The `emotional` draw's chance, on a turn that draws.
+    emotional_p: Option<f64>,
+    /// The `focused` roll's chance.
+    focused_p: Option<f64>,
+}
+
+/// The turn's tone: `erotic` over `emotional` over `focused`, the first roll
+/// to win naming the turn and no later one being read. `rolls` are the
+/// erotic, the emotional and the focused roll, each in `[0, 1)`. `None` is a
+/// turn for which no roll was made: it records no tone. A turn whose only
+/// roll was a lost `erotic` one is `Default`.
+fn decide_tone(i: &ToneInputs, rolls: [f64; 3]) -> Option<eros_engine_core::tone::Tone> {
+    use eros_engine_core::tone::{self, Tone};
+    if i.erotic_p.is_some_and(|p| tone::won(p, rolls[0])) {
+        return Some(Tone::Erotic);
+    }
+    let drawn = if i.listed_emotional {
+        Some(Tone::Emotional)
+    } else {
+        i.emotional_p.map(|p| tone::draw(p, rolls[1]))
+    };
+    let decided = match (drawn, i.focused_p) {
+        (Some(Tone::Emotional), _) => drawn,
+        (_, Some(p)) => Some(tone::draw_focused(p, rolls[2])),
+        (drawn, None) => drawn,
+    };
+    decided.or(i.erotic_p.map(|_| Tone::Default))
+}
+
 /// [`drive_chat_burst`] for one group speaker: `speaker_session_id` is
 /// stamped on every assistant row the burst persists and on every `meta`
 /// frame it yields. `None` is the 1:1 burst. `tone` is the turn's drawn tone,
@@ -5825,26 +5863,19 @@ pub(crate) fn run_stream_with(
             .action
             .as_ref()
             .is_some_and(|a| a.speaks_emotionally());
-        let drawn: Option<eros_engine_core::tone::Tone> = if tone_on && listed_action {
-            Some(eros_engine_core::tone::Tone::Emotional)
-        } else {
-            (tone_on && !action_turn).then(|| {
-                let p = eros_engine_core::tone::emotional_probability(
-                    tone_base,
-                    crate::prompt::persona_moody(&input.persona),
-                    turn_needs.as_ref(),
-                    eros_engine_core::scope::romance_compatible(affinity_scope),
-                );
-                eros_engine_core::tone::draw(p, rand::thread_rng().gen())
-            })
-        };
-        // The `focused` draw (spec 2026-11-24-focused-tone-four-together-
-        // actions-and-user-gender-design.md §5.3): the emotional draw comes
-        // first and a turn it makes `emotional` stays so; any other text turn
-        // without an action rolls once when the events under way, `employed`
-        // and `tones.focused` give it a chance. A turn with a user action
-        // rolls no `focused` dice: a listed action is `emotional` above or
-        // draws nothing.
+        let emotional_p = (tone_on && !action_turn).then(|| {
+            eros_engine_core::tone::emotional_probability(
+                tone_base,
+                crate::prompt::persona_moody(&input.persona),
+                turn_needs.as_ref(),
+                eros_engine_core::scope::romance_compatible(affinity_scope),
+            )
+        });
+        // The `focused` roll (spec 2026-11-24-focused-tone-four-together-
+        // actions-and-user-gender-design.md §5.3): a text turn without an
+        // action that did not come up `emotional` rolls once when the events
+        // under way, `employed` and `tones.focused` give it a chance. A turn
+        // with a user action rolls no `focused` dice.
         let focused_p = (plan.action_type.bears_text() && !action_turn)
             .then(|| {
                 eros_engine_core::tone::focused_probability(
@@ -5855,15 +5886,49 @@ pub(crate) fn run_stream_with(
                 )
             })
             .flatten();
-        let tone = match (drawn, focused_p) {
-            (Some(eros_engine_core::tone::Tone::Emotional), _) => drawn,
-            (_, Some(p)) => Some(eros_engine_core::tone::draw_focused(
-                p,
-                rand::thread_rng().gen(),
-            )),
-            (drawn, None) => drawn,
+        // The `erotic` roll (spec 2026-11-27-erotic-tone-design.md §4–§6)
+        // comes first: at a fixed moment, her reply to an accepted
+        // `sex_together`, against `tones.erotic`; on a turn without an
+        // action, the strong-desire persona's everyday chance. Any other
+        // action turn makes no `erotic` roll.
+        let erotic_gate = eros_engine_core::tone::EroticGate {
+            key: state.model_config.tone_erotic_probability(),
+            compatible: eros_engine_core::scope::romance_compatible(affinity_scope),
+            cold_war: input.affinity.relationship.cold_war(),
+            is_virgin: traits.is_virgin,
+            chem_tier: input.affinity.chem_tier(),
         };
-        let emotional = tone == Some(eros_engine_core::tone::Tone::Emotional);
+        let sex_accepted = plan.action_response
+            == Some(eros_engine_core::types::ActionResponse::Accept)
+            && user_msg.action.as_ref().is_some_and(|a| {
+                a.together_group() == Some(eros_engine_core::events::TogetherGroup::Sex)
+            });
+        let erotic_p = if !plan.action_type.bears_text() {
+            None
+        } else if sex_accepted {
+            eros_engine_core::tone::fixed_erotic_probability(&erotic_gate)
+        } else if !action_turn {
+            eros_engine_core::tone::everyday_erotic_probability(
+                &erotic_gate,
+                traits.sex_addict,
+                current.foreground.as_ref().map(|e| e.kind),
+            )
+        } else {
+            None
+        };
+        let tone = decide_tone(
+            &ToneInputs {
+                erotic_p,
+                listed_emotional: tone_on && listed_action,
+                emotional_p,
+                focused_p,
+            },
+            rand::thread_rng().gen(),
+        );
+        // An `erotic` turn is built on the `emotional` template, and whatever
+        // holds for an `emotional` turn holds for it.
+        let emotional = tone.is_some_and(|t| t.on_emotional_template());
+        let erotic = tone == Some(eros_engine_core::tone::Tone::Erotic);
         let focused = tone == Some(eros_engine_core::tone::Tone::Focused);
         // An action turn rolls no dice: the action already fixes what the turn
         // is about (spec 2026-10-05 §5.2). Neither does an emotional turn: its
@@ -6880,7 +6945,7 @@ pub(crate) fn run_stream_with(
                         user_msg.user_message_id, &now_ctx,
                         body_state.as_deref(), needs_text.as_deref(),
                         Some(&event_lines),
-                        false,
+                        erotic,
                     ).await
                 } else if focused {
                     crate::pipeline::handlers::build_focused_reply_request(
@@ -11975,6 +12040,38 @@ data: [DONE]\n\n";
         chemistry: Option<f64>,
         tweak: impl FnOnce(&mut PersistedUserMessage),
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        run_together_turn_toned(
+            pool,
+            action,
+            response,
+            judge_action,
+            compatible,
+            events,
+            image,
+            art,
+            chemistry,
+            "",
+            tweak,
+        )
+        .await
+    }
+
+    /// [`run_together_turn_tweaked`] with `tones` appended to
+    /// `[tasks.chat_companion]`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_together_turn_toned(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        response: Option<&str>,
+        judge_action: &str,
+        compatible: bool,
+        events: &[EventSeed],
+        image: bool,
+        art: Option<serde_json::Value>,
+        chemistry: Option<f64>,
+        tones: &str,
+        tweak: impl FnOnce(&mut PersistedUserMessage),
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
         use futures_util::StreamExt;
         use wiremock::matchers::{body_string_contains, path as wm_path};
@@ -12027,7 +12124,7 @@ data: [DONE]\n\n";
         let mut state = crate::routes::companion::test_state(pool.clone());
         state.model_config = std::sync::Arc::new(
             eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
-                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n{}{}",
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\n{tones}\n{}{}",
                 if response.is_some() {
                     "[tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n"
                 } else {
@@ -28285,6 +28382,13 @@ data: [DONE]\n\n"
         background: Option<eros_engine_core::events::EventKind>,
         employed: Option<&'static str>,
         setting: Option<&'static str>,
+        /// The pair's chemistry, both its axes at this score; `None` leaves
+        /// the session without an affinity row of its own making.
+        chemistry: Option<f64>,
+        /// The turn's affinity scope; `None` is the request default.
+        scope: Option<eros_engine_core::scope::AffinityScope>,
+        sex_addict: Option<bool>,
+        is_virgin: bool,
     }
 
     /// One 1:1 turn after an earlier exchange (`EARLIER-USER` /
@@ -28370,6 +28474,12 @@ data: [DONE]\n\n"
         if let Some(setting) = scene.setting {
             art.insert("setting".into(), setting.into());
         }
+        if let Some(sex_addict) = scene.sex_addict {
+            art.insert("sex_addict".into(), sex_addict.into());
+        }
+        if scene.is_virgin {
+            art.insert("is_virgin".into(), true.into());
+        }
         if !art.is_empty() {
             sqlx::query("UPDATE engine.persona_genomes SET art_metadata = $2 WHERE id = $1")
                 .bind(genome_id)
@@ -28384,6 +28494,20 @@ data: [DONE]\n\n"
             .collect();
         if !events.is_empty() {
             seed_events(pool, user_id, instance_id, session_id, &events).await;
+        }
+        if let Some(c) = scene.chemistry {
+            sqlx::query(
+                "INSERT INTO engine.companion_affinity \
+                   (session_id, user_id, instance_id, intimacy, tension) \
+                 VALUES ($1, $2, $3, $4, $4)",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .bind(instance_id)
+            .bind(c)
+            .execute(pool)
+            .await
+            .unwrap();
         }
         let mut toml = format!("[tasks.chat_companion]\nmodel=\"deepseek/x\"\n{tones}\n");
         if filtered {
@@ -28455,7 +28579,7 @@ data: [DONE]\n\n"
                 audit: None,
                 tier: None,
                 memory_scope: Default::default(),
-                affinity_scope: Default::default(),
+                affinity_scope: scene.scope.unwrap_or_default(),
                 image_url: None,
                 image: None,
                 quote: Default::default(),
@@ -30965,5 +31089,312 @@ data: [DONE]\n\n"
             )]
         );
         assert_eq!(s.sub_affinity_rows().await, 0);
+    }
+
+    // ─── The erotic tone (spec 2026-11-27-erotic-tone-design.md) ───
+
+    const EROTIC_LINES: [&str; 3] = [
+        "你此刻对对方有欲望：话里带着撩拨和暗示，慢一点，贴近一点",
+        "你现在很想要对方：语气放软、放慢，带着勾人的意味",
+        "你的心思和身体都在对方身上：说话带着诱惑，不必遮掩",
+    ];
+
+    /// A romantically compatible pair at chemistry tier 4.
+    fn lovers() -> ToneScene {
+        ToneScene {
+            chemistry: Some(0.7),
+            scope: Some(eros_engine_core::scope::AffinityScope::full()),
+            ..ToneScene::default()
+        }
+    }
+
+    fn action_verdict(response: &str) -> serde_json::Value {
+        serde_json::json!({"action": "reply_text", "inner_state": "", "action_response": response})
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_sex_together_is_erotic_and_records_it(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { emotional = 1.0, erotic = 1.0 }",
+            Some(action_verdict("accept")),
+            Some(eros_engine_core::types::UserAction::sex_together()),
+            false,
+            lovers(),
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert_eq!(messages.len(), 2, "system + the driving line: {messages:?}");
+        assert_eq!(messages[1]["content"], "（想和你上床）");
+        let system = messages[0]["content"].as_str().unwrap();
+        for kept in ["[relationship]\n", EROTIC_LINES[1], "[user_action]\n"] {
+            assert!(system.contains(kept), "{kept}: {system}");
+        }
+        for gone in ["[user_profile]", "[mood]", "[feelings]", "EARLIER-"] {
+            assert!(!system.contains(gone), "{gone} must not render: {system}");
+        }
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "erotic"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_refused_sex_together_stays_emotional(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { emotional = 1.0, erotic = 1.0 }",
+            Some(action_verdict("refuse")),
+            Some(eros_engine_core::types::UserAction::sex_together()),
+            false,
+            lovers(),
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        let system = messages[0]["content"].as_str().unwrap();
+        for gone in ["[relationship]", "[this_turn]", EROTIC_LINES[1]] {
+            assert!(!system.contains(gone), "{gone} must not render: {system}");
+        }
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "emotional"
+        );
+    }
+
+    /// `ignore_orientation` lets an incompatible pair's `sex_together` reach
+    /// the judge; the pair is still not romantically compatible, so the
+    /// accepted reply is `emotional` as before.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incompatible_pair_let_through_stays_emotional(pool: PgPool) {
+        use eros_engine_core::types::{RemainClothing, UserAction};
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { emotional = 1.0, erotic = 1.0 }",
+            Some(action_verdict("accept")),
+            Some(UserAction::SexTogether {
+                name: None,
+                active: None,
+                remain_clothing: RemainClothing::Flag(false),
+                ignore_orientation: true,
+            }),
+            false,
+            ToneScene {
+                chemistry: Some(0.7),
+                ..ToneScene::default()
+            },
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("你接受了"), "she accepted: {system}");
+        for gone in ["[relationship]", EROTIC_LINES[1]] {
+            assert!(!system.contains(gone), "{gone} must not render: {system}");
+        }
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "emotional"
+        );
+    }
+
+    /// With `erotic` alone and a roll that cannot win: the accepted reply is
+    /// the default request and records `default` (a roll was made); a refused
+    /// one made no roll and records nothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_lost_erotic_roll_without_emotional_records_default(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { erotic = 1e-12 }",
+            Some(action_verdict("accept")),
+            Some(eros_engine_core::types::UserAction::sex_together()),
+            false,
+            lovers(),
+        )
+        .await;
+        assert!(tone_chat_messages(&mock).await.len() > 2, "history is sent");
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "default"
+        );
+
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { erotic = 1e-12 }",
+            Some(action_verdict("refuse")),
+            Some(eros_engine_core::types::UserAction::sex_together()),
+            false,
+            lovers(),
+        )
+        .await;
+        assert!(tone_chat_messages(&mock).await.len() > 2);
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "{meta}");
+    }
+
+    /// The everyday roll is made for a strong-desire persona at chemistry
+    /// tier 3 and for nobody else: a rolled turn records a tone, an unrolled
+    /// one records none.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_strong_desire_persona_reaches_the_roll(pool: PgPool) {
+        let scene = |sex_addict, is_virgin| ToneScene {
+            chemistry: Some(0.5),
+            scope: Some(eros_engine_core::scope::AffinityScope::full()),
+            sex_addict,
+            is_virgin,
+            ..ToneScene::default()
+        };
+        let tone_of = |scene: ToneScene| {
+            let pool = pool.clone();
+            async move {
+                let (_mock, session_id) = run_tone_turn_at(
+                    &pool,
+                    "tones = { erotic = 1.0 }",
+                    Some(plain_verdict()),
+                    None,
+                    false,
+                    scene,
+                )
+                .await;
+                tone_reply_metadata(&pool, session_id).await["tone"].clone()
+            }
+        };
+        let rolled = tone_of(scene(Some(true), false)).await;
+        assert!(
+            rolled == "erotic" || rolled == "default",
+            "a roll was made: {rolled}"
+        );
+        for (sex_addict, is_virgin) in [(Some(false), false), (None, false), (Some(true), true)] {
+            assert!(
+                tone_of(scene(sex_addict, is_virgin)).await.is_null(),
+                "{sex_addict:?} virgin={is_virgin}: no roll"
+            );
+        }
+    }
+
+    /// An accepted `sex_together` that comes with a picture: the text request
+    /// is `erotic`, and the composer is sent what it is sent without the key.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_sex_picture_turn_keeps_its_image_request(pool: PgPool) {
+        let run = |tones: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let (_frames, mock, _umid) = run_together_turn_toned(
+                    &pool,
+                    eros_engine_core::types::UserAction::sex_together(),
+                    Some("accept"),
+                    "reply_text",
+                    true,
+                    &[],
+                    true,
+                    None,
+                    Some(0.7),
+                    tones,
+                    |_| {},
+                )
+                .await;
+                let reqs = mock.received_requests().await.unwrap();
+                let body = |r: &wiremock::Request| String::from_utf8_lossy(&r.body).into_owned();
+                let composer: Vec<_> = reqs
+                    .iter()
+                    .filter(|r| body(r).contains("\"model\":\"composer\""))
+                    .collect();
+                assert_eq!(composer.len(), 1, "one composer call");
+                let replies = reqs
+                    .iter()
+                    .map(body)
+                    .filter(|b| b.contains("\"model\":\"deepseek/x\""))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (composer_payload(composer[0]), replies)
+            }
+        };
+        let (plain_payload, plain_replies) = run("").await;
+        let (erotic_payload, erotic_replies) = run("tones = { erotic = 1.0 }").await;
+        assert_eq!(erotic_payload, plain_payload);
+        assert!(!plain_replies.contains(EROTIC_LINES[1]), "{plain_replies}");
+        assert!(erotic_replies.contains(EROTIC_LINES[1]), "{erotic_replies}");
+    }
+
+    fn tone_inputs(
+        erotic_p: Option<f64>,
+        listed_emotional: bool,
+        emotional_p: Option<f64>,
+        focused_p: Option<f64>,
+    ) -> ToneInputs {
+        ToneInputs {
+            erotic_p,
+            listed_emotional,
+            emotional_p,
+            focused_p,
+        }
+    }
+
+    #[test]
+    fn a_won_erotic_roll_reads_no_other_roll() {
+        use eros_engine_core::tone::Tone;
+        let i = tone_inputs(Some(0.125), false, Some(1.0), Some(1.0));
+        // The other two rolls would each win: neither is read.
+        assert_eq!(decide_tone(&i, [0.1, 0.0, 0.0]), Some(Tone::Erotic));
+    }
+
+    #[test]
+    fn a_lost_erotic_roll_leaves_the_others_as_today() {
+        use eros_engine_core::tone::Tone;
+        let lost = [0.2, 0.0, 0.0];
+        assert_eq!(
+            decide_tone(&tone_inputs(Some(0.125), false, Some(1.0), Some(1.0)), lost),
+            Some(Tone::Emotional)
+        );
+        assert_eq!(
+            decide_tone(&tone_inputs(Some(0.125), false, Some(0.0), Some(1.0)), lost),
+            Some(Tone::Focused)
+        );
+        assert_eq!(
+            decide_tone(&tone_inputs(Some(0.125), false, Some(0.0), None), lost),
+            Some(Tone::Default)
+        );
+        assert_eq!(
+            decide_tone(&tone_inputs(Some(0.125), false, None, None), lost),
+            Some(Tone::Default),
+            "the erotic roll alone was made, and lost"
+        );
+    }
+
+    #[test]
+    fn a_listed_action_falls_back_to_emotional() {
+        use eros_engine_core::tone::Tone;
+        let lost = [0.9, 0.0, 0.0];
+        assert_eq!(
+            decide_tone(&tone_inputs(Some(0.5), true, None, None), lost),
+            Some(Tone::Emotional)
+        );
+        assert_eq!(
+            decide_tone(&tone_inputs(Some(0.5), false, None, None), lost),
+            Some(Tone::Default)
+        );
+    }
+
+    /// With no erotic roll the decision is the one made before the tone
+    /// existed: a listed action is `emotional`; else the emotional draw; a
+    /// turn that did not come up `emotional` takes the focused roll; no roll
+    /// at all records nothing.
+    #[test]
+    fn no_erotic_roll_is_todays_decision() {
+        use eros_engine_core::tone::Tone;
+        let d = |listed, e, f, rolls| decide_tone(&tone_inputs(None, listed, e, f), rolls);
+        let (win, lose) = ([0.0, 0.0, 0.0], [0.0, 0.99, 0.99]);
+        assert_eq!(d(false, None, None, win), None);
+        assert_eq!(d(true, None, None, lose), Some(Tone::Emotional));
+        assert_eq!(d(true, None, Some(1.0), win), Some(Tone::Emotional));
+        assert_eq!(d(false, Some(0.5), None, win), Some(Tone::Emotional));
+        assert_eq!(d(false, Some(0.5), None, lose), Some(Tone::Default));
+        assert_eq!(d(false, Some(0.5), Some(1.0), win), Some(Tone::Emotional));
+        assert_eq!(
+            d(false, Some(0.5), Some(0.5), [0.0, 0.99, 0.0]),
+            Some(Tone::Focused)
+        );
+        assert_eq!(d(false, Some(0.5), Some(0.5), lose), Some(Tone::Default));
+        assert_eq!(d(false, None, Some(0.5), win), Some(Tone::Focused));
+        assert_eq!(d(false, None, Some(0.5), lose), Some(Tone::Default));
     }
 }
