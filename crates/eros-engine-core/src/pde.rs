@@ -66,6 +66,37 @@ pub fn refuses_give(event: &Event, habits: Habits, roll: f64) -> bool {
     }
 }
 
+/// How often a persona who loves dancing takes a dance before the judge is
+/// asked (spec 2026-11-28-dance-styles-design.md §7).
+pub const DANCE_LOVER_ACCEPT: f64 = 2.0 / 3.0;
+
+/// The dance roll (spec 2026-11-28-dance-styles-design.md §7), made before
+/// the judge on an `ask_dancing` or a `dance_together`, with or without a
+/// style: a persona who loves dancing accepts when `roll` (uniform in
+/// [0, 1)) is below `DANCE_LOVER_ACCEPT`; one who dislikes it refuses as the
+/// habit roll does, when `roll` is at or above `UNUSED_SUBSTANCE_ACCEPT`.
+/// `None` leaves the turn to the judge: the rest of each roll, a neutral
+/// persona, and every other action, `dance_naked_together` included.
+pub fn dance_roll(
+    event: &Event,
+    taste: crate::events::DanceTaste,
+    roll: f64,
+) -> Option<ActionResponse> {
+    use crate::events::DanceTaste;
+    let Event::UserMessage {
+        action: Some(UserAction::AskDancing { .. } | UserAction::DanceTogether { .. }),
+        ..
+    } = event
+    else {
+        return None;
+    };
+    match taste {
+        DanceTaste::Love if roll < DANCE_LOVER_ACCEPT => Some(ActionResponse::Accept),
+        DanceTaste::Dislike if roll >= UNUSED_SUBSTANCE_ACCEPT => Some(ActionResponse::Refuse),
+        _ => None,
+    }
+}
+
 /// Whether this turn's gesture is ruled out before the judge for romance:
 /// a `strip` (spec 2026-11-08-strip-and-world-setting-design.md §2.1) or a
 /// gesture with the passion attribute (spec 2026-11-28-dance-massage-and-
@@ -1415,7 +1446,7 @@ mod tests {
             0.1
         ));
         for a in [
-            UserAction::DanceTogether,
+            UserAction::dance_together(),
             UserAction::AdventureTogether,
             UserAction::PlayWithFireTogether,
             UserAction::SingTogether,
@@ -1734,10 +1765,68 @@ mod tests {
             UserAction::HugFromBehind,
             UserAction::MassageTogether,
             UserAction::MassageNakedTogether,
-            UserAction::DanceNakedTogether,
-            UserAction::DanceTogether,
+            UserAction::dance_naked_together(),
+            UserAction::dance_together(),
         ] {
             assert!(!romance_ruled_out(&action_msg(a.clone())), "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-28-dance-styles-design.md §7.
+    #[test]
+    fn the_dance_roll() {
+        use crate::events::DanceTaste::{Dislike, Love, Neutral};
+        use crate::types::{ActionResponse::*, DanceStyle, GivenItem};
+        let styled = UserAction::DanceTogether {
+            style: Some(DanceStyle::Tango),
+            name: None,
+        };
+        for a in [
+            UserAction::ask_dancing(),
+            UserAction::dance_together(),
+            styled,
+        ] {
+            let e = action_msg(a.clone());
+            assert_eq!(dance_roll(&e, Love, 0.0), Some(Accept), "{a:?}");
+            assert_eq!(
+                dance_roll(&e, Love, DANCE_LOVER_ACCEPT - 1e-9),
+                Some(Accept),
+                "{a:?}"
+            );
+            assert_eq!(dance_roll(&e, Love, DANCE_LOVER_ACCEPT), None, "{a:?}");
+            assert_eq!(dance_roll(&e, Love, 0.99), None, "{a:?}");
+            assert_eq!(
+                dance_roll(&e, Dislike, UNUSED_SUBSTANCE_ACCEPT - 1e-9),
+                None,
+                "{a:?}"
+            );
+            assert_eq!(
+                dance_roll(&e, Dislike, UNUSED_SUBSTANCE_ACCEPT),
+                Some(Refuse),
+                "{a:?}"
+            );
+            assert_eq!(dance_roll(&e, Dislike, 0.99), Some(Refuse), "{a:?}");
+            for roll in [0.0, 0.5, 0.99] {
+                assert_eq!(dance_roll(&e, Neutral, roll), None, "{a:?}");
+            }
+        }
+        assert!((DANCE_LOVER_ACCEPT - 2.0 / 3.0).abs() < 1e-12);
+        for a in [
+            UserAction::dance_naked_together(),
+            UserAction::Kiss,
+            UserAction::JogTogether,
+            UserAction::Give {
+                item: GivenItem::Food,
+                name: None,
+                quantity: 1,
+            },
+        ] {
+            let e = action_msg(a.clone());
+            for taste in [Love, Dislike] {
+                for roll in [0.0, 0.99] {
+                    assert_eq!(dance_roll(&e, taste, roll), None, "{a:?} {taste:?}");
+                }
+            }
         }
     }
 }

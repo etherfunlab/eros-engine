@@ -1126,6 +1126,28 @@ pub enum Place {
     Indoor,
 }
 
+/// `art_metadata.dance`: whether she loves dancing or dislikes it (spec
+/// 2026-11-28-dance-styles-design.md §7). Absent or unknown reads as
+/// `Neutral`. Read by the dance roll alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DanceTaste {
+    Love,
+    #[default]
+    Neutral,
+    Dislike,
+}
+
+impl DanceTaste {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "love" => Some(DanceTaste::Love),
+            "neutral" => Some(DanceTaste::Neutral),
+            "dislike" => Some(DanceTaste::Dislike),
+            _ => None,
+        }
+    }
+}
+
 /// `art_metadata.outdoorsy`: whether she leans outdoors or stays in (spec
 /// 2026-11-11-outdoorsy-missed-ride-and-accept-ends-incident-design.md §5).
 /// Absent or unknown reads as `Neutral`.
@@ -1184,6 +1206,8 @@ pub struct PersonaTraits {
     pub habits: Habits,
     /// `art_metadata.outdoorsy`: scales the outdoor and indoor kinds.
     pub outdoorsy: Outdoorsy,
+    /// `art_metadata.dance`: read by the dance roll, not by the draw.
+    pub dance: DanceTaste,
     /// `art_metadata.species` is `robot` or `android`: never draws
     /// `pregnancy_scare` or `using_toilet`, and never has a period (spec
     /// 2026-11-19-vehicles-actions-species-design.md §5; spec 2026-11-20-
@@ -5115,5 +5139,17 @@ mod tests {
         assert!(EventKind::ENDS_ON_CHEMISTRY_DROP.contains(&NakedDancingTogether));
         assert!(EventKind::ENDS_ON_CHEMISTRY_DROP.contains(&NakedMassagingTogether));
         assert!(!EventKind::ENDS_ON_CHEMISTRY_DROP.contains(&MassagingTogether));
+    }
+
+    #[test]
+    fn the_dance_taste_reads_its_three_values() {
+        assert_eq!(DanceTaste::parse("love"), Some(DanceTaste::Love));
+        assert_eq!(DanceTaste::parse("neutral"), Some(DanceTaste::Neutral));
+        assert_eq!(DanceTaste::parse("dislike"), Some(DanceTaste::Dislike));
+        for other in ["LOVE", "like", "hate", ""] {
+            assert_eq!(DanceTaste::parse(other), None, "{other}");
+        }
+        assert_eq!(DanceTaste::default(), DanceTaste::Neutral);
+        assert_eq!(PersonaTraits::default().dance, DanceTaste::Neutral);
     }
 }
