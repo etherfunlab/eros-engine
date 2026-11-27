@@ -130,7 +130,7 @@ pub enum UserAction {
     Pat,
     Wink,
     Blink,
-    /// She asks the user to give her a massage: a gesture with the passion
+    /// The user asks her to give them a massage: a gesture with the passion
     /// attribute (spec 2026-11-28-dance-massage-and-passion-actions-design.md
     /// §5, §6).
     AskMassage,
