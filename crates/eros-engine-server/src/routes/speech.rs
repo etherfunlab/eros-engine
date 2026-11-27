@@ -702,6 +702,44 @@ mod tests {
         assert_eq!(body["items"][0]["truncated"], true);
     }
 
+    /// A hop that produces only whitespace has produced nothing: no `delta`
+    /// leaves for it, and the chain goes on to the fallback.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_blank_hop_falls_through_to_the_fallback(pool: PgPool) {
+        let mock = MockServer::start().await;
+        for (model, reply) in [
+            ("\"model\":\"speech\"", "   "),
+            ("\"model\":\"backup\"", "[sighs] LINE-OK"),
+        ] {
+            Mock::given(wm_path("/api/v1/chat/completions"))
+                .and(body_string_contains(model))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_raw(sse(reply, None), "text/event-stream"),
+                )
+                .mount(&mock)
+                .await;
+        }
+        let (user, _, session) = scene(&pool, "text").await;
+        let id = row(&pool, session, "assistant", "LINE-OK", None, 1).await;
+        let toml = format!("{SPEECH}fallback = [\"backup\"]\n");
+        let mut app = build_router(with_speech(pool.clone(), &mock, &toml));
+        let resp = post(&mut app, session, user, json!({"message_ids": [id]}), true).await;
+        let frames = read_sse(resp).await;
+        let deltas: Vec<&Value> = frames.iter().filter(|f| f["type"] == "delta").collect();
+        assert!(
+            deltas
+                .iter()
+                .all(|d| !d["content"].as_str().unwrap().trim().is_empty()),
+            "no blank delta: {frames:?}"
+        );
+        let done: Vec<&Value> = frames.iter().filter(|f| f["type"] == "done").collect();
+        assert_eq!(done.len(), 1, "{frames:?}");
+        assert_eq!(done[0]["text"], "[sighs] LINE-OK");
+        assert_eq!(calls(&mock).await.len(), 2, "the fallback was tried");
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn rewrite_switches_the_mode_sentence(pool: PgPool) {
         use eros_engine_llm::model_config::{SPEECH_MODE_REWRITE, SPEECH_MODE_VERBATIM};

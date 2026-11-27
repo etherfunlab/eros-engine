@@ -305,6 +305,9 @@ fn item(
             last_usage = None;
             served_model = None;
             truncated = false;
+            // Only a hop that produced nothing but whitespace reaches the next
+            // one: nothing of it was sent, so nothing of it is kept.
+            acc.clear();
             let stream = match tokio::time::timeout(
                 STREAM_OPEN_TIMEOUT,
                 state.openrouter.execute_stream_as(&req, &model_id),
@@ -314,13 +317,13 @@ fn item(
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     tracing::warn!(model = %model_id, error = %e, "speech: open stream failed");
-                    if acc.is_empty() { continue 'candidates; }
+                    if acc.trim().is_empty() { continue 'candidates; }
                     truncated = true;
                     break 'candidates;
                 }
                 Err(_) => {
                     tracing::warn!(model = %model_id, "speech: open timeout");
-                    if acc.is_empty() { continue 'candidates; }
+                    if acc.trim().is_empty() { continue 'candidates; }
                     truncated = true;
                     break 'candidates;
                 }
@@ -332,7 +335,7 @@ fn item(
                     Ok(next) => next,
                     Err(_) => {
                         tracing::warn!(model = %model_id, "speech: total timeout");
-                        if acc.is_empty() { continue 'candidates; }
+                        if acc.trim().is_empty() { continue 'candidates; }
                         truncated = true;
                         break 'candidates;
                     }
@@ -342,9 +345,15 @@ fn item(
                         if chunk.usage.is_some() { last_usage = chunk.usage.clone(); }
                         if chunk.generation_id.is_some() { last_gen_id = chunk.generation_id.clone(); }
                         if chunk.model.is_some() { served_model = chunk.model.clone(); }
+                        // Whitespace before the first words is held back, so a
+                        // hop that produces only whitespace sends no `delta`.
                         if let Some(text) = chunk.content {
+                            let held = acc.trim().is_empty();
                             acc.push_str(&text);
-                            yield ProtocolFrame::Delta { message_id: message_id.clone(), content: text };
+                            if !acc.trim().is_empty() {
+                                let content = if held { acc.clone() } else { text };
+                                yield ProtocolFrame::Delta { message_id: message_id.clone(), content };
+                            }
                         }
                         if matches!(chunk.finish_reason.as_deref(), Some("length") | Some("content_filter")) {
                             truncated = true;
@@ -352,12 +361,12 @@ fn item(
                     }
                     Some(Err(e)) => {
                         tracing::warn!(model = %model_id, error = %e, "speech: mid-stream error");
-                        if acc.is_empty() { continue 'candidates; }
+                        if acc.trim().is_empty() { continue 'candidates; }
                         truncated = true;
                         break 'candidates;
                     }
                     None => {
-                        if acc.is_empty() { continue 'candidates; }
+                        if acc.trim().is_empty() { continue 'candidates; }
                         break 'candidates;
                     }
                 }
