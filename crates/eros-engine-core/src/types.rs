@@ -417,8 +417,6 @@ impl UserAction {
         )
     }
 
-    /// The group of the kind this together action places (spec 2026-11-27
-    /// §4.1); `None` for every other action.
     /// Whether this gesture carries the passion attribute (spec
     /// 2026-11-28-dance-massage-and-passion-actions-design.md §6): it is
     /// refused before the judge for a pair that is not romance-compatible,
@@ -435,6 +433,8 @@ impl UserAction {
         )
     }
 
+    /// The group of the kind this together action places (spec 2026-11-27
+    /// §4.1); `None` for every other action.
     pub fn together_group(&self) -> Option<TogetherGroup> {
         self.together_kind().and_then(EventKind::together_group)
     }

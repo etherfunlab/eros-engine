@@ -284,6 +284,8 @@ roll can refuse whatever the judge says
   refused whatever the judge says, and drops Chemistry like any refused
   physical action. So is a `sex_together` from such a pair, unless it says
   `ignore_orientation`, and it drops the lines a refused `sex_together` drops; so is a
+  `french_kiss`, `tease`, `lick`, `touch` or `ask_massage` from such a pair
+  ([the passion attribute](life-events-needs.md#the-passion-attribute)), dropping Chemistry; so is a
   `toilet_together` to a machine persona. A
   `fight_together` to a persona whose `setting` is not `fantasy`, and a `cycle_together` to one
   whose `setting` is, are refused the same way and drop no line. The other together actions,
@@ -299,7 +301,8 @@ roll can refuse whatever the judge says
   it started, a refused action's drop included, ends a naturism or passion event at once
   (`showering_together`, `bathing_together`, `streaking_together`, `skinny_dipping_together`,
   `naked_horse_riding_together`, `naked_yoga_together`, `naked_hiking_together`,
-  `naked_hot_spring_together`, `having_sex_together`;
+  `naked_hot_spring_together`, `naked_dancing_together`, `naked_massaging_together`,
+  `having_sex_together`;
   [life-events-needs.md](life-events-needs.md#when-chemistry-falls-the-intimate-event-ends)).
 - **Proposal and break-up:** a refused `propose` or `break_up` drops no line; the turn is
   graded like any other. Before the judge, a `propose` from a status other than `dating`,

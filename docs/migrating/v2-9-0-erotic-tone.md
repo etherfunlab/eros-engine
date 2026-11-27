@@ -10,6 +10,8 @@ No migration, no route and no request or response field. One new `model_config.t
 
 **Design:** [`2026-11-27-erotic-tone-design.md`](../superpowers/specs/2026-11-27-erotic-tone-design.md)
 
+The other note for this release is [dancing and massage together, and the passion attribute](v2-9-0-dance-massage-passion.md), which adds the accepted passion gestures to the fixed moments below.
+
 The rules are in [tones](../model-config.md#tones--chat-tones-chat-task-only) and [when she wants you](../life-events-needs.md#when-she-wants-you).
 
 ## What users will notice

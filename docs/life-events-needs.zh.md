@@ -189,16 +189,16 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 时长写成区间的，在事件开始时按整小时均匀抽定。
 
-另有三十七种永远不会被抽到：`taking_space`（说好暂时分开）、`fell_out`（为分开的事闹得不愉快）、`traveling_together`（和对方一起旅行）、`bathing_together`（和对方一起洗澡）、`on_a_date`（和对方约会）、`showering_together`（和对方一起淋浴）、`sauna_together`（和对方一起蒸桑拿），其余一起做的动作写入的二十九种，从 `using_toilet_together` 到 `naked_hot_spring_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)），以及 `custom_together`（和对方一起做一件事，见[用用户自己的话一起做](#用用户自己的话一起做)）。
+另有四十种永远不会被抽到：`taking_space`（说好暂时分开）、`fell_out`（为分开的事闹得不愉快）、`traveling_together`（和对方一起旅行）、`bathing_together`（和对方一起洗澡）、`on_a_date`（和对方约会）、`showering_together`（和对方一起淋浴）、`sauna_together`（和对方一起蒸桑拿），其余一起做的动作写入的三十二种，从 `using_toilet_together` 到 `naked_massaging_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)），以及 `custom_together`（和对方一起做一件事，见[用用户自己的话一起做](#用用户自己的话一起做)）。
 前两种属于已经退役的提出分开：engine 不再写入它们，它们只留在存量数据里（见[选择存在哪](#选择存在哪)）。
 它们按形态是 `mid` 插曲，其中 `taking_space` 超出了这个类别的 4 小时：它持续 12 到 24 小时。
 `traveling_together` 是 `trip` 类的背景，用户接受她的提议时由 engine 写入（见[一起去旅行](#一起去旅行)）；
 `showering_together` 和 `bathing_together` 是 30 分钟的 `short` 插曲，用户答应和她一起洗澡时由 engine 写入其中之一，两者机会均等（见[一起洗澡](#一起洗澡)），她答应用户的 `shower_together` 或 `bath_together` 时也会写入；
 `sauna_together` 是 1 小时的 `short` 插曲，她答应用户的 `sauna_together` 时由 engine 写入（见[一起淋浴、泡澡和蒸桑拿](#一起淋浴泡澡和蒸桑拿)）；
-其余二十九种是她答应用户其余一起做的动作时由 engine 写入的插曲，除 `asleep_together`、`fighting_together`、`hiking_together`、`adventuring_together`、`fishing_together` 和 `naked_hiking_together` 是 `mid` 外都是 `short`（`having_sex_together` 和 `asleep_together` 在用户答应她的 `sleep_together` 或 `fall_asleep_together` 时也会写入，见[浪漫选择](#浪漫选择)）；
+其余三十二种是她答应用户其余一起做的动作时由 engine 写入的插曲，除 `asleep_together`、`fighting_together`、`hiking_together`、`adventuring_together`、`fishing_together` 和 `naked_hiking_together` 是 `mid` 外都是 `short`（`having_sex_together` 和 `asleep_together` 在用户答应她的 `sleep_together` 或 `fall_asleep_together` 时也会写入，见[浪漫选择](#浪漫选择)）；
 `custom_together` 是 1 小时的 `short` 插曲，她答应用户的 `custom_together` 时由 engine 写入；
 `on_a_date` 是 1 或 4 小时的 `short` 插曲，她答应用户的约会邀约时由 engine 写入（见 [activities.zh.md](activities.zh.md#事件)）。
-这三十七种都没有抽取规则，调用方的 `kinds` 也拒绝它们。
+这四十种都没有抽取规则，调用方的 `kinds` 也拒绝它们。
 
 ### 抽取
 
@@ -402,12 +402,12 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 对象里，`allow` 不带或为 `null` 表示全部允许，`[]` 表示一种都不允许；`disallow` 不带、为 `null` 或 `[]` 都不去掉任何种类；
 两边都列了的种类不抽。只写 `{"disallow": […]}` 就能排除种类而不冻结其余种类，engine 以后新增的种类也会照常抽取。
 对象里出现未知的键，或任何地方出现未知种类，请求都会被拒绝，所以拼错的 `disallow` 不会悄悄放出本想排除的种类；
-代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together`、`sauna_together`、其余一起做的动作写入的二十九种和 `custom_together` 永远不会被抽到，
+代价是调用方要等 engine 认识某个新种类之后才能列它。`taking_space`、`fell_out`、`traveling_together`、`bathing_together`、`on_a_date`、`showering_together`、`sauna_together`、其余一起做的动作写入的三十二种和 `custom_together` 永远不会被抽到，
 所以在 `kinds` 的任何位置写它们，都按同样的方式被拒绝。
 
 有七种带成人题材：`sudden_desire`、`strip`、`streaking`、`having_sex`、`just_have_sex`、`masturbating`，以及隐含性行为的 `pregnancy_scare`。engine 不内建这类分组；只对部分用户提供这类内容的调用方，
 把它们列进 `disallow`。`having_sex_together`、`streaking_together`、`skinny_dipping_together`、`naked_horse_riding_together`、
-`naked_yoga_together`、`naked_hiking_together` 和 `naked_hot_spring_together` 也带成人题材，但不会被抽到：只有写入它们的那个动作被接受时才会写入，所以这样的调用方不发这些动作。`scolded_by_superior` 与 `scolded_superior` 假定她有上级，在她的世界里读作老板、上司、领导、主人或君主；
+`naked_yoga_together`、`naked_hiking_together`、`naked_hot_spring_together`、`naked_dancing_together` 和 `naked_massaging_together` 也带成人题材，但不会被抽到：只有写入它们的那个动作被接受时才会写入，所以这样的调用方不发这些动作。`scolded_by_superior` 与 `scolded_superior` 假定她有上级，在她的世界里读作老板、上司、领导、主人或君主；
 没有上级的角色同样交给 `disallow` 排除。
 
 ### 发起一次抽取
@@ -528,13 +528,14 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 | 哪条消息 | 用 `erotic` 的机会 |
 |---|---|
 | 她接受 [`sex_together`](#激情组) 时的那条回复 | `tones.erotic` 的值 |
+| 她接受带[激情属性](#激情属性)的动作时的那条回复 | `tones.erotic` 的值 |
 | 用户接受她提的 `sleep_together` 或 `bathe_together` 时，她的那条回复 | `tones.erotic` 的值 |
 | `sudden_desire` 开始时发的那条消息 | `tones.erotic` 的值 |
 | 不带用户动作的 1:1 文字回合，`sex_addict` 为 `true`（[角色设置](#角色设置)），chemistry 在档 3 及以上，没有插曲在进行，或进行中的是 `sudden_desire`、`strip`、`streaking`、`just_have_sex`、`masturbating`，或天然组、激情组的事件 | 八分之一，不管这个键取多少 |
 | 其他 | 没有 |
 
 每一行前面都有三个条件：这条消息的 `affinity_scope` 含暧昧感轴，不在冷战中，`is_virgin` 为 `true` 的角色
-chemistry 在档 4 及以上。有一条不满足，消息就和没有这个键时一样。前三行里各只有那一条消息用 `erotic`；
+chemistry 在档 4 及以上。有一条不满足，消息就和没有这个键时一样。前四行里各只有那一条消息用 `erotic`；
 事件持续期间之后的回合照常掷。
 
 未经人事的角色的这条线只读卡上的 `is_virgin`，后来发生过什么都不改。上面的事件抽取把同一个键当作事实，
@@ -780,7 +781,7 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 ### 一起淋浴、泡澡和蒸桑拿
 
 用户可以请她一起淋浴、泡澡或蒸桑拿：`shower_together`、`bath_together`、`sauna_together` 三种动作，都不带字段
-（见[发送路由](api-reference.zh.md#post-compchatsession_idmessagestream)）。另有二十九种一起做的动作，请她和用户一起做别的事（见下表）；除了字段全部可选的 `sex_together`（见[激情组](#激情组)），都不带字段。
+（见[发送路由](api-reference.zh.md#post-compchatsession_idmessagestream)）。另有三十二种一起做的动作，请她和用户一起做别的事（见下表）；除了字段全部可选的 `sex_together`（见[激情组](#激情组)），都不带字段。
 `custom_together` 请她做用户用话说出来的事（见[用用户自己的话一起做](#用用户自己的话一起做)）。每个一起做的动作都属于一个组，engine 怎么处理它，由它所在的组和它是不是在水里做来决定（见[一起做的动作的分组](#一起做的动作的分组)）。
 和任何动作一样，由判官决定。在判官之前，
 性向不相容的一对发来的 `sex_together` 和 `strip` 一样被判为拒绝，除非它带 `ignore_orientation`：不管判官怎么答，也不管有没有 LLM 判官，她都拒绝。
@@ -831,13 +832,16 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 | `yoga_naked_together` | `naked_yoga_together` | 和对方一起裸体做瑜伽 | 1 小时 | 天然组 | |
 | `hike_naked_together` | `naked_hiking_together` | 和对方一起裸体爬山 | 2–3 小时 | 天然组 | |
 | `hot_spring_naked_together` | `naked_hot_spring_together` | 和对方一起裸体泡温泉 | 1 小时 | 天然组 | 是 |
+| `dance_naked_together` | `naked_dancing_together` | 和对方一起裸舞 | 1 小时 | 天然组 | |
+| `massage_together` | `massaging_together` | 让对方给自己按摩 | 30 分钟 | 一般组 | |
+| `massage_naked_together` | `naked_massaging_together` | 和对方脱了衣服互相按摩 | 30 分钟 | 天然组 | |
 
 除 `asleep_together`、`fighting_together`、`hiking_together`、`adventuring_together`、`fishing_together` 和 `naked_hiking_together` 是 `mid` 插曲、时长按整小时抽定外，都是 `short` 插曲。
 开始时结束正在进行的插曲，在途的背景照常继续，和她提出的洗澡一样。事件以用户那条消息为键，所以被重新驱动的回合只写一次。
 她的约会进行期间什么都不写：约会的 `on_a_date` 保持原样，约会继续。她不把这个事件当作事件来讲，因为她对这个动作的回复已经说了；
-它不离线，`asleep_together` 期间她也照常回复；三十二种都不会被抽到。除 `fighting_together` 和 `cycling_together` 外，两种世界都适用（见[她的世界](#她的世界)）。期间它就是正在进行的插曲，所以 `正在经历`、判官和画图合成器像读其他插曲一样读它。
+它不离线，`asleep_together` 期间她也照常回复；三十五种都不会被抽到。除 `fighting_together` 和 `cycling_together` 外，两种世界都适用（见[她的世界](#她的世界)）。期间它就是正在进行的插曲，所以 `正在经历`、判官和画图合成器像读其他插曲一样读它。
 天然组的种类、`having_sex_together`、`using_toilet_together` 和 `asleep_together`
-不进故事导演读的事件，和她同睡请求的结果一样；其余二十一种会进。
+不进故事导演读的事件，和她同睡请求的结果一样；其余二十二种会进。
 
 `dance_together`、`adventure_together`、`play_with_fire_together`、`sing_together`、`skinny_dip_together` 和 `commit_crime_together`
 分别请她和用户一起跳舞、冒险、玩火、唱歌、裸泳、去犯罪。每种都和 `jog_together` 一样：没有性向门槛，
@@ -849,6 +853,10 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 `fish_together` 请她和用户一起去钓鱼，和 `hike_together` 一样，持续两到三小时；钓没钓到鱼，engine 不做判断。`ride_horse_naked_together`、
 `yoga_naked_together`、`hike_naked_together` 和 `hot_spring_naked_together` 分别是 `ride_horse_together`、`yoga_together`、`hike_together`
 和 `hot_spring_together` 在天然组的对应动作，时长和对应的一般组动作相同；四种里只有温泉在水里，所以经期里只有它要掷骰。
+
+`massage_together` 是用户给她按摩，30 分钟，和 `dance_together` 一样处理。`dance_naked_together` 和两人互相按摩的 `massage_naked_together`
+分别是 `dance_together` 和 `massage_together` 在天然组的对应动作，时长和对应的一般组动作相同；两种都不在水里，经期里都不掷骰。
+请她给用户按摩是 `ask_massage`，一个不写事件的动作（见[激情属性](#激情属性)）。
 
 `smoke_together`、`smoke_weed_together` 和 `drink_together` 只在三件事上算作给了她 1 份
 `cigarette`、`herb` 或 `alcohol` 的 give：习惯掷骰（见[角色设置](#角色设置)）、被接受时挪动的需求（见 [give 会改动需求](#give-会改动需求)），
@@ -863,7 +871,7 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 被接受的一起做的动作，在请求带 `image`、部署配了 composer 时是一个出图回合，和被接受的 `photo`、`strip`、`ask_dancing` 一样：先是她的话，
 再是一条 `image_request`。合成器会被告知这个事件是她此刻的状态，所以图里画的就是它；在约会里什么都不写时，这个动作的种类只作为这一回合她的状态。
 被拒的只回文字。部署的 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务) 大于 0 时，对每个天然组和激情组动作（`shower_together`、`bath_together`、
-`streak_together`、`skinny_dip_together`、`ride_horse_naked_together`、`yoga_naked_together`、`hike_naked_together`、`hot_spring_naked_together`、`sex_together`）的回复用 `emotional` 语气，接受、拒绝都一样；
+`streak_together`、`skinny_dip_together`、`ride_horse_naked_together`、`yoga_naked_together`、`hike_naked_together`、`hot_spring_naked_together`、`dance_naked_together`、`massage_naked_together`、`sex_together`）的回复用 `emotional` 语气，接受、拒绝都一样；
 其余一起做的动作不用。
 
 ### 一起做的动作的分组
@@ -872,8 +880,8 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 
 | 组 | 动作 |
 |---|---|
-| 一般组 | `walk_together`、`jog_together`、`yoga_together`、`stargaze_together`、`ride_horse_together`、`drink_together`、`smoke_together`、`smoke_weed_together`、`toilet_together`、`fall_asleep_together`、`workout_together`、`swim_together`、`cycle_together`、`hike_together`、`fish_together`、`dance_together`、`sing_together`、`hot_spring_together`、`sauna_together`、`custom_together` |
-| 天然组 | `shower_together`、`bath_together`、`streak_together`、`skinny_dip_together`、`ride_horse_naked_together`、`yoga_naked_together`、`hike_naked_together`、`hot_spring_naked_together` |
+| 一般组 | `walk_together`、`jog_together`、`yoga_together`、`stargaze_together`、`ride_horse_together`、`drink_together`、`smoke_together`、`smoke_weed_together`、`toilet_together`、`fall_asleep_together`、`workout_together`、`swim_together`、`cycle_together`、`hike_together`、`fish_together`、`dance_together`、`sing_together`、`hot_spring_together`、`sauna_together`、`massage_together`、`custom_together` |
+| 天然组 | `shower_together`、`bath_together`、`streak_together`、`skinny_dip_together`、`ride_horse_naked_together`、`yoga_naked_together`、`hike_naked_together`、`hot_spring_naked_together`、`dance_naked_together`、`massage_naked_together` |
 | 刺激组 | `adventure_together`、`commit_crime_together`、`play_with_fire_together`、`fight_together` |
 | 激情组 | `sex_together` |
 
@@ -883,7 +891,7 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 **在水里。** `swimming_together`、`hot_spring_together`、`sauna_together`、`showering_together`、`bathing_together`、`skinny_dipping_together`
 和 `naked_hot_spring_together` 在水里。刺激组和激情组没有在水里的种类。
 
-**对应关系。** 六个天然组种类是一般组种类的赤身版本：
+**对应关系。** 八个天然组种类是一般组种类的赤身版本：
 
 | 天然组 | 一般组 |
 |---|---|
@@ -893,6 +901,8 @@ composer 照着她的话画（见 [api-reference](api-reference.zh.md#post-v2com
 | `naked_hot_spring_together` | `hot_spring_together` |
 | `naked_yoga_together` | `yoga_together` |
 | `naked_horse_riding_together` | `horse_riding_together` |
+| `naked_dancing_together` | `dancing_together` |
+| `naked_massaging_together` | `massaging_together` |
 
 `showering_together` 和 `bathing_together` 没有对应的种类。
 
@@ -965,6 +975,18 @@ engine 不自带任何名称：客户端每次请求时传它想要的那个，e
 （见[合成器](model-config.zh.md#taskschat_image_prompt_compose--出图-prompt-合成器图片轮次必需)）。
 群聊的图和事件消息的图手上没有动作，也没有 `user_gender`：那里 `having_sex_together` 读作 什么都没穿 和不带名称的标签，没有 `[亲密]`。
 
+### 激情属性
+
+一起做的动作属于某个组；不是一起做的动作的那些动作，可以带激情属性。带它的有五种：`french_kiss`、`tease`、`lick`、`touch`，
+以及 `ask_massage`，即用户请她给用户按摩（标记是 想让你帮忙按摩）。这五种都不带字段，不写事件，也不是出图回合。
+`strip`、`kiss` 和 `hug_from_behind` 不带这个属性；`strip` 有自己的门槛，规则相同。
+
+- **门槛。** 性向不相容的一对发来的这类动作，和 `sex_together` 一样在判官之前被拒，不管判官怎么答，也不管有没有 LLM 判官；
+  判官的 `[用户动作]` 一行末尾是 `，这次你不会答应`。没有任何办法越过这道门槛：`ignore_orientation` 只属于 `sex_together`。被拒时降 chemistry，和被判官拒绝一样。
+- **她的回复。** 被接受时，她的回复是 `erotic` 语气的一个固定时刻（见[她想要你的时候](#她想要你的时候)）。被拒，或没掷中、某个条件不满足时，
+  回复和没有 `tones.erotic` 时一样：部署的 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务) 大于 0 时，`french_kiss`、`tease` 和 `touch` 用 `emotional`，接受、拒绝都一样；
+  `lick` 和 `ask_massage` 没有自己的语气。
+
 ### 用用户自己的话一起做
 
 `custom_together` 带一个 `text`，1 到 100 个字符，校验和 `custom` 相同
@@ -1032,7 +1054,7 @@ engine 不自带任何名称：客户端每次请求时传它想要的那个，e
 ### 亲密事件提前结束
 
 天然组的种类和激情组的种类（`showering_together`、`bathing_together`、`streaking_together`、`skinny_dipping_together`、`naked_horse_riding_together`、
-`naked_yoga_together`、`naked_hiking_together`、`naked_hot_spring_together` 和 `having_sex_together`），在用户于事件开始之后做的某件事
+`naked_yoga_together`、`naked_hiking_together`、`naked_hot_spring_together`、`naked_dancing_together`、`naked_massaging_together` 和 `having_sex_together`），在用户于事件开始之后做的某件事
 让这一对的 chemistry 档位下降时结束。规则看种类，不看是谁提的：她自己被接受的 `bathe_together` 或 `sleep_together` 请求写下的行也这样结束。
 
 - **算数的。** 聊天回合的 affinity 写入，条件是这一回合的用户消息在事件开始之后发出：被拒的动作降档是最常见的情形，让 chemistry 跨过档位边界的打分回合同样算。
@@ -1186,7 +1208,7 @@ engine 不自带任何名称：客户端每次请求时传它想要的那个，e
 
 开启 [World Stories](world-system.zh.md#world-stories人生故事) 时，故事导演直接读该实例的事件，每件带标签、相对时间和她讲述时的那条
 消息，另外还读在途背景、这一对的关系状态和冷战，以及这对关系里的 `confess`、`partner_up`、`propose`、`break_up` 选择（还有存量的 `ask_for_space`）和结果，
-并把它们当作既成事实。约会、每个天然组种类（一起洗澡、一起淋浴、`streaking_together`、`skinny_dipping_together`、`naked_horse_riding_together`、`naked_yoga_together`、`naked_hiking_together`、`naked_hot_spring_together`），以及 `having_sex_together`、`using_toilet_together`、`asleep_together` 和 `custom_together` 不在其中：
+并把它们当作既成事实。约会、每个天然组种类（一起洗澡、一起淋浴、`streaking_together`、`skinny_dipping_together`、`naked_horse_riding_together`、`naked_yoga_together`、`naked_hiking_together`、`naked_hot_spring_together`、`naked_dancing_together`、`naked_massaging_together`），以及 `having_sex_together`、`using_toilet_together`、`asleep_together` 和 `custom_together` 不在其中：
 和她同睡、洗澡、旅行请求的结果一样，它们只留在对话里。她主动发的消息不进它的聊天证据，所以一件事
 不会被读成她对一句不相干的话的回答。World Memories 导演对名单里的每个角色读在途背景，不论开没开 stories，住院中的角色
 就不会被写进聚会。两位导演都只读事件行：她的第一次月经和任何事件一样会被读到，[她的周期](#她的周期)推导出的经期不会，
@@ -1542,9 +1564,9 @@ engine 不接收性别或性取向，也不判断谁会被谁吸引。
 ## 代码指引
 
 - `crates/eros-engine-core/src/needs.rs`：水平、漂移常量、`Habits`、`carried`、`after_give`（give 的挪动）。
-- `crates/eros-engine-core/src/pde.rs`：`refuses_give` 与 `UNUSED_SUBSTANCE_ACCEPT`，即 give 时掷的那一次；`period_refuses` 与 `PERIOD_ACCEPT`，即经期里掷的那一次；`together_ruled_out`，即激情组的门槛和机器角色的上厕所。
+- `crates/eros-engine-core/src/pde.rs`：`refuses_give` 与 `UNUSED_SUBSTANCE_ACCEPT`，即 give 时掷的那一次；`period_refuses` 与 `PERIOD_ACCEPT`，即经期里掷的那一次；`together_ruled_out`，即激情组的门槛和机器角色的上厕所；`romance_ruled_out`，即 `strip` 和激情属性的门槛。
 - `crates/eros-engine-core/src/events.rs`：类别和种类、每个种类的规则、门槛、需求与角色系数、`is_offline` 与 `is_told`、`slot`、`draw`、`lookback`；一起做的动作的属性 `together_group`、`is_wet`、`clothed_counterpart`，以及由它们推出的 `ENDS_ON_CHEMISTRY_DROP` 和 `HOLDS_BACK_INTIMATE_ASKS`。
-- `crates/eros-engine-core/src/types.rs`：`UserAction::together_kind`、`together_group`、`refusal_lines` 与 `speaks_emotionally`。
+- `crates/eros-engine-core/src/types.rs`：`UserAction::together_kind`、`together_group`、`is_passion`、`refusal_lines` 与 `speaks_emotionally`。
 - `crates/eros-engine-core/src/cycle.rs`：她的周期、`state`、`next_period_start` 与各常量。
 - `crates/eros-engine-server/src/routes/session_events.rs`：events 路由、抽取的输入、离线类的两道门槛。
 - `crates/eros-engine-server/src/routes/life_choices.rs`：结算端点。

@@ -46,9 +46,10 @@
 # should show it, and let it win over [此刻穿着] where the two disagree. The
 # section is absent when nothing is live. While the state is one of these, the
 # engine writes [此刻穿着] itself: a naturism kind (a shower, a bath, a streak,
-# a skinny dip, the naked ride, yoga, hike or hot spring), 什么都没穿; a swim
-# or a hot spring, a swimsuit from a fixed ladder by the persona's gender,
-# romance compatibility, virginity and chemistry tier (什么都没穿 from 0.95);
+# a skinny dip, the naked ride, yoga, hike, hot spring, dance or massage),
+# 什么都没穿; a swim or a hot spring, a swimsuit from a fixed ladder by the
+# persona's gender, romance compatibility, virginity and chemistry tier
+# (什么都没穿 from 0.95);
 # a hot spring for a persona whose gender is neither female nor male, and a
 # sauna, a towel (身上只松松地裹着一条浴巾 for a romance-compatible pair,
 # 身上只裹着一条浴巾 otherwise); sex, 什么都没穿 unless a 1:1 picture's act
