@@ -183,7 +183,7 @@ crates/
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
 │       ├── relationship.rs   # 关系状态、冷战的连续规则、组合关系
 │       ├── scope.rs          # 逐请求注入范围（InsightMode / MemoryScope）
-│       ├── tone.rs           # 一轮聊天抽到的语气（default / emotional / focused / erotic）
+│       ├── tone.rs           # 一轮聊天抽到的语气（default / emotional / focused / erotic / mean / drowsy）
 │       └── types.rs          # ActionType / Event / DecisionInput / ConversationSignals
 ├── eros-engine-llm/
 │   └── src/

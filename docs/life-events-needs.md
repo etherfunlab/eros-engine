@@ -91,9 +91,9 @@ moves two needs by one level each:
 
 | `give` item | `social` | `indulgence` |
 |---|---|---|
-| `cigarette`, `alcohol`, `herb`, `cuisine` | +1 | +1 |
+| `cigarette`, `alcohol`, `herb`, `cuisine`, `dessert` | +1 | +1 |
 | `medicine`, `coffee` | −1 | −1 |
-| any other item, `food` included | | |
+| any other item, `food` and `soup` included | | |
 
 −1 is one level toward `low` and +1 one level toward `high`, stopping at the ends. The
 quantity is ignored: one give moves one level. An accepted `smoke_together`,
@@ -144,7 +144,8 @@ the rating, and stops there:
 
 Time away makes her want company; emotional need and the wish to go out or stay in settle
 toward the middle. A `low` social rated at noon reads `mid` at midnight and `high` from noon
-the next day. The habits are the persona's `smoking`, `alcoholic`, `drug`, `coffee` and `gluttony` keys
+the next day. The habits are the persona's `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`,
+`sugar`, `salty` and `spicy` keys
 ([Persona settings](#persona-settings)); `false` and absent count alike. The more of them are
 `true`, the sooner the craving comes back after the judge rated it down. A rating
 stored without `outing` and `indulgence` reads both as `mid`; one that still carries `hunger`
@@ -190,7 +191,8 @@ again shows the judge the same line.
 
   `indulgence` shows only at `high`. It names one thing she uses, picked at random each turn
   among the habit keys set to `true`: `smoking` 很想抽根烟, `alcoholic` 很想喝一杯, `drug`
-  很想抽口大麻, `coffee` 很想喝杯咖啡, `gluttony` 很想吃顿好的. With no key `true` it reads 很想放纵一下. Every need at `mid` (a `low`
+  很想抽口大麻, `coffee` 很想喝杯咖啡, `gluttony` 很想吃顿好的, `sugar` 很想吃点甜的, `salty`
+  很想吃点咸的, `spicy` 很想吃点辣的. With no key `true` it reads 很想放纵一下. Every need at `mid` (a `low`
   `indulgence` counts the same), or no rating, adds nothing and leaves the prompt
   unchanged. A judged turn's reply is written with the levels the turn ends with: the
   levels written to its row (with the needs an accepted give moved taken from the baseline), otherwise the
@@ -411,7 +413,8 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in ([below](#her-world)); a persona that is not `fantasy` refuses the user's `fight_together`, and a `fantasy` one the user's `cycle_together` ([together actions](#showering-bathing-and-the-sauna-together)); any other value reads as `modern` |
 | `species` | any word | `"robot"` and `"android"` are machines: she has no period, never draws `pregnancy_scare` or `using_toilet`, and refuses the user's `toilet_together` ([together actions](#showering-bathing-and-the-sauna-together)). Any other word but `"human"` gives her no period unless `period` is `true`, and leaves the rest of the draw alone. What the word does to the prompt is in [eros-character-v1.1.md](eros-character-v1.1.md) |
 | `period` | `true`, `false`, absent (default) | whether she has a period ([her cycle](#her-cycle)). Absent: a female human (`species` absent, blank or `"human"`) has one, a female of any other species none. `true` or `false` decides for a female who is not a machine; a machine, and a persona whose `gender` is not `"female"`, never has one |
-| `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee, loves good food (`false`: she keeps off rich food): how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing, or the user's ask to smoke, smoke weed or drink with her (below); `smoking`, `alcoholic` and `drug` set to `true` also let her draw `smoking`, `drinking` and `smoking_weed` |
+| `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`, `sugar`, `salty`, `spicy` | each `true`, `false`, absent (default) | whether she smokes, drinks, uses weed, drinks coffee, loves good food (`false`: she keeps off rich food), has a sweet tooth, a taste for salt, a taste for spice: how fast `indulgence` comes back ([drift](#drift-between-ratings)), what a high `indulgence` names in the reply, and how she takes a give of that thing (`sugar`: a `dessert`; `salty` and `spicy` are the key of no item), or the user's ask to smoke, smoke weed or drink with her (below); `smoking`, `alcoholic` and `drug` set to `true` also let her draw `smoking`, `drinking` and `smoking_weed` |
+| `diet` | `true`, `false`, absent (default) | `true`: she is on a diet, and a give of `food`, `cuisine` or `dessert` takes the habit roll (below), whatever her other keys say. It is not a habit: it does not move `indulgence` and is never named |
 
 `prefer_trip` says whether she moves at all; `homesick` says where she goes when she does. A
 flight attendant with both `true` travels often, works her trips as before, and spends her
@@ -451,7 +454,7 @@ category and sets how long her period lasts; after her first period, the one the
 her, the rest come on [her cycle](#her-cycle). `prefer_trip` raises the odds of a trip, not
 its frequency: the weekly category cooldown holds.
 
-The five habit keys reach the draw through the drift of `indulgence`, and three of them
+The eight habit keys reach the draw through the drift of `indulgence`, and three of them
 (`smoking`, `alcoholic`, `drug`) also gate the habit kinds
 ([below](#getting-lost-her-habits-and-sex)). The judge's
 persona block (`[角色人格]`) does not list them, so she does not bring up tobacco, alcohol,
@@ -459,8 +462,11 @@ weed, coffee or food at every turn; a persona whose habits should colour her tal
 never writes them.
 
 **A give of something she does not use.** When a turn's action is a `give` of `cigarette`,
-`alcohol`, `herb`, `coffee` or `cuisine` and the matching key (`smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`) is `false`, the
-engine rolls once before the judge runs. One time in three the turn goes on as usual.
+`alcohol`, `herb`, `coffee`, `cuisine` or `dessert` and the matching key (`smoking`, `alcoholic`,
+`drug`, `coffee`, `gluttony`, `sugar`) is `false`, or a `give` of `food`, `cuisine` or `dessert` to
+a persona whose `diet` is `true`, the engine rolls once before the judge runs. A diet decides
+alone: a `true` `gluttony` or `sugar` does not exempt a dish or a dessert, and a turn rolls once
+whichever reason applies. A `soup` and every drink pass a diet. One time in three the turn goes on as usual.
 Otherwise she refuses this give:
 
 - the judge's `[用户动作]` line ends with `，这次你不会收下`, so its `inner_state` is written for
@@ -471,8 +477,8 @@ Otherwise she refuses this give:
 It is an ordinary refusal from there: the `action_response` frame and the stored `response`
 say `refuse`, the give leaves no lingering effect, the bond line drops one tier
 ([refused actions](affinity-model.md#refused-actions)), and the reply is written for a
-refusal. The judge's own answer stays in its audit payload. `true` and absent never roll, nor
-does any other item. A re-driven turn rolls again, as the judge decides again.
+refusal. The judge's own answer stays in its audit payload. A habit key that is `true` or absent
+never rolls, nor does a `diet` that is `false` or absent, nor any other item. A re-driven turn rolls again, as the judge decides again.
 
 A `smoke_together`, `smoke_weed_together` or `drink_together` is rolled the same way, as a give
 of one `cigarette`, `herb` or `alcohol`, on the `smoking`, `drug` or `alcoholic` key. Refused,
@@ -726,6 +732,38 @@ character: having slept with the user does not change who she is.
 `erotic` comes before `emotional`, and `emotional` before `focused`. The message's rows carry
 `metadata.tone = "erotic"`. The lines and the rest of the draw are in
 [model-config.md](model-config.md#tones--chat-tones-chat-task-only).
+
+### When she wakes beside you
+
+While the deployment has [`tones.drowsy`](model-config.md#tones--chat-tones-chat-task-only)
+above 0, her first reply after the pair slept together or went to bed together is written in the
+`drowsy` tone: the `emotional` tone, plus who the user is to her (`[relationship]`) and one
+`[this_turn]` line saying she just woke beside them, set by the pair's chemistry tier (the higher,
+the more she plays up to them).
+
+The roll, against the key's value, is made on a 1:1 text turn without a user action when:
+
+- the newest `asleep_together` or `having_sex_together` event the session placed has ended, no
+  more than 12 hours ago. An event cut short counts;
+- she has written no line with text in the session since it ended. Whatever that first line is
+  (her reply to an action, a proactive message, a reply whose roll was lost) uses the moment up;
+- no incident is under way.
+
+There is no romance condition and no chemistry floor. `drowsy` comes after `mean` and before
+`erotic`. The message's rows carry `metadata.tone = "drowsy"`.
+
+### In a cold war
+
+While the deployment has [`tones.mean`](model-config.md#tones--chat-tones-chat-task-only) above
+0 and the session's [cold war](affinity-model.md#the-cold-war) is on, a 1:1 text turn without a
+user action is written in the `mean` tone with the key's probability: the default reply with its
+history, `[reply_length]` at its lowest tier, and one `[this_turn]` line set by the pair's bond
+tier (the closer the pair, the less she explains). The turn that starts the cold war and the
+message that announces it are not `mean`; a date's turns during a cold war are. `mean` comes
+before every other tone. The message's rows carry `metadata.tone = "mean"`.
+
+Her replies are part of what the judge reads, and a cold war ends on three judged turns above the
+lowest patience level, so it may last longer with the tone on.
 
 ### Offline kinds
 
@@ -2109,7 +2147,7 @@ choice's session with the two wordings in
 | Offline kinds | silence turns as with the judge, since the check runs before it: the ghosting switch and the action and forced-image exemptions apply |
 | The life choices and the cold war | unchanged: the triggers read the affinity evaluator's judged turns and patience levels, not the PDE judge. The user's `propose` and `break_up` keep their status gate, and past it the rule engine accepts |
 | Together actions | the rules before the judge still refuse (the passion gate, a machine's toilet, her world, her period, the habit roll); past them the rule engine accepts, an incompatible pair's naturism action included |
-| `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | a `false` key still rolls on a give, or on the together action that counts as one, and can turn it into a refusal; `smoking`, `alcoholic` and `drug` still gate the habit kinds; there is no `indulgence` to drift, name or weigh them |
+| `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`, `sugar`, `salty`, `spicy`, `diet` | a `false` habit key, or a `true` `diet`, still rolls on a give, or on the together action that counts as one, and can turn it into a refusal; `smoking`, `alcoholic` and `drug` still gate the habit kinds; there is no `indulgence` to drift, name or weigh them |
 
 ## Code pointers
 
@@ -2141,7 +2179,9 @@ choice's session with the two wordings in
   choices read.
 - `crates/eros-engine-core/src/tone.rs`: `at_work` and `focused_probability`, the chance of a
   `focused` turn; `EroticGate`, `fixed_erotic_probability` and `everyday_erotic_probability`,
-  the conditions and the chance of an `erotic` message.
+  the conditions and the chance of an `erotic` message; `mean_probability` and
+  `drowsy_probability`, the chance of a `mean` and of a `drowsy` turn.
+- `crates/eros-engine-store/src/events.rs::just_woke`: whether she just woke beside the user.
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`: the needs read and write (the
   accepted give's move goes through `after_give`), the `[需求]` and `[近期事件]` lines
   (`build_pde_ctx`), the offline branch ahead of the judge, the give roll's refusal

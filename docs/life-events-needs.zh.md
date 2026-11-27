@@ -71,9 +71,9 @@
 
 | `give` 的物品 | `social` | `indulgence` |
 |---|---|---|
-| `cigarette`、`alcohol`、`herb`、`cuisine` | +1 | +1 |
+| `cigarette`、`alcohol`、`herb`、`cuisine`、`dessert` | +1 | +1 |
 | `medicine`、`coffee` | −1 | −1 |
-| 其他任何物品，包括 `food` | | |
+| 其他任何物品，包括 `food` 和 `soup` | | |
 
 −1 是朝 `low` 方向一档，+1 是朝 `high` 方向一档，到头就停。数量不计：一次 give 只挪一档。
 被接受的 `smoke_together`、`smoke_weed_together` 或 `drink_together`，按一次给 1 份 `cigarette`、`herb` 或 `alcohol` 的 give 挪动（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）。
@@ -114,7 +114,7 @@
 | `indulgence`，三项及以上习惯为 `true` | `high` | 4 小时 |
 
 离开得越久，她越想找人说话；情感需求和想出门或想待着的念头则向中间回落。中午评成 `low` 的社交欲，午夜读作 `mid`，
-第二天中午起读作 `high`。习惯指角色的 `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` 五个键（见[角色设置](#角色设置)）；`false` 和不写算作一样。
+第二天中午起读作 `high`。习惯指角色的 `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`、`sugar`、`salty`、`spicy` 八个键（见[角色设置](#角色设置)）；`false` 和不写算作一样。
 为 `true` 的越多，判官把这份渴求评低之后，它回来得越快。存下时没有 `outing` 和 `indulgence` 的评定，这两项都读作 `mid`；还带着 `hunger` 或 `stamina` 的评定，读的时候忽略这两个键。
 BYOC 角色的这几个键在她的卡片上，engine 只在一轮对话里才打开卡片：在对话之外（`GET …/effects`，以及回放时退回到推算水平的那一步），
 她的 `indulgence` 按没有习惯的角色漂移。常量在 `crates/eros-engine-core/src/needs.rs`。
@@ -149,7 +149,7 @@ BYOC 角色的这几个键在她的卡片上，engine 只在一轮对话里才�
   ```
 
   `indulgence` 只在 `high` 时出现。它点名一样她用的东西，每一轮从值为 `true` 的习惯键里随机挑一个：`smoking` 是很想抽根烟，
-  `alcoholic` 是很想喝一杯，`drug` 是很想抽口大麻，`coffee` 是很想喝杯咖啡，`gluttony` 是很想吃顿好的；没有键为 `true` 时读作很想放纵一下。各项都是 `mid`（`low` 的 `indulgence` 在这里也按 `mid` 算），
+  `alcoholic` 是很想喝一杯，`drug` 是很想抽口大麻，`coffee` 是很想喝杯咖啡，`gluttony` 是很想吃顿好的，`sugar` 是很想吃点甜的，`salty` 是很想吃点咸的，`spicy` 是很想吃点辣的；没有键为 `true` 时读作很想放纵一下。各项都是 `mid`（`low` 的 `indulgence` 在这里也按 `mid` 算），
   或还没有评定，就什么都不加，prompt 保持不变。被判官评过的回合，回复按这一回合最终的水平来写：
   写在这一行上的水平（被接受的 give 挪动的那几项取自基线），否则用判官看到的那组推算后的水平。
   配置了判官的部署里，规则引擎回合用推算后的水平，再加上被接受的 give 的挪动。
@@ -310,7 +310,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界（见[下文](#她的世界)）；不是 `fantasy` 的角色拒绝用户的 `fight_together`，`fantasy` 的角色拒绝用户的 `cycle_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）；其他值按 `modern` 读 |
 | `species` | 任意词 | `"robot"` 和 `"android"` 是机器：她没有月经，不会抽到 `pregnancy_scare`、`using_toilet`，也拒绝用户的 `toilet_together`（见[一起做的动作](#一起淋浴泡澡和蒸桑拿)）。`"human"` 以外的其他词让她没有月经，除非 `period` 为 `true`；抽取的其余部分不受影响。这个词对 prompt 的作用见 [eros-character-v1.1.md](eros-character-v1.1.md) |
 | `period` | `true`、`false`、不写（默认） | 她有没有月经（见[她的周期](#她的周期)）。不写时，人类女性（`species` 不写、留空或为 `"human"`）有，其他物种的女性没有。`true` 或 `false` 对不是机器的女性说了算；机器，以及 `gender` 不是 `"female"` 的角色，一律没有 |
-| `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（`false` 表示她忌口、节食）：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西、怎么对待用户请她一起抽烟、抽大麻或喝酒（见下）；`smoking`、`alcoholic`、`drug` 为 `true` 时，她才会抽到 `smoking`、`drinking`、`smoking_weed` |
+| `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`、`sugar`、`salty`、`spicy` | 各为 `true`、`false`、不写（默认） | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（`false` 表示她忌口）、爱不爱吃甜、口味重不重咸、爱不爱吃辣：决定 `indulgence` 回来得多快（见[漂移](#两次评定之间的漂移)）、`high` 的 `indulgence` 在回复里点名什么，以及她怎么对待递来的这样东西（`sugar` 对应 `dessert`；`salty`、`spicy` 不对应任何物品）、怎么对待用户请她一起抽烟、抽大麻或喝酒（见下）；`smoking`、`alcoholic`、`drug` 为 `true` 时，她才会抽到 `smoking`、`drinking`、`smoking_weed` |
+| `diet` | `true`、`false`、不写（默认） | `true`：她在节食，递来的 `food`、`cuisine` 或 `dessert` 要过习惯那一掷（见下），不管其他键怎么写。它不是习惯：不影响 `indulgence`，也不会被点名 |
 
 `prefer_trip` 管她动不动，`homesick` 管她动起来往哪去。两者都为 `true` 的空姐角色经常出行、照常出差，
 放假回家而不是去别处。
@@ -339,18 +340,19 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 `health` 缩放整个 `body` 类别，也决定她的月经持续多久；抽取给她的第一次月经之后，其余的都按[她的周期](#她的周期)来。
 `prefer_trip` 提高的是出行的概率，不是频率：每周一次的类别冷却对它同样适用。
 
-五个习惯键通过 `indulgence` 的漂移影响抽取，其中三个（`smoking`、`alcoholic`、`drug`）还是习惯类事件的门槛（见[下文](#迷路习惯与性)）。判官的角色块（`[角色人格]`）不列它们，所以她不会每一轮都提烟、酒、大麻、咖啡或吃的；
-希望这些习惯带进她说话的角色，要在人设里自己写明。engine 从不写这五个键。
+八个习惯键通过 `indulgence` 的漂移影响抽取，其中三个（`smoking`、`alcoholic`、`drug`）还是习惯类事件的门槛（见[下文](#迷路习惯与性)）。判官的角色块（`[角色人格]`）不列它们，所以她不会每一轮都提烟、酒、大麻、咖啡或吃的；
+希望这些习惯带进她说话的角色，要在人设里自己写明。engine 从不写这些键。
 
-**递来她不用的东西。** 一轮的动作是 `give`，递的是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而对应的键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）
-为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况她这一次不收：
+**递来她不用的东西。** 一轮的动作是 `give`，递的是 `cigarette`、`alcohol`、`herb`、`coffee`、`cuisine` 或 `dessert`，而对应的键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`、`sugar`）
+为 `false` 时，或者她的 `diet` 为 `true` 而递的是 `food`、`cuisine` 或 `dessert` 时，engine 在判官运行之前掷一次。节食单独说了算：
+`gluttony` 或 `sugar` 为 `true` 也不豁免一道菜或一份甜点；不管哪条理由成立，一轮只掷一次。`soup` 和所有饮品不受节食影响。三次里有一次，这一轮照常进行。其余情况她这一次不收：
 
 - 判官的 `[用户动作]` 一行末尾加上 `，这次你不会收下`，判官的 `inner_state` 就按拒收来写；这一行只陈述结果，不给理由；
 - 不管判官怎么答，生效的回应都是 `refuse`；没有 LLM 判官时，规则引擎的接受同样变成 `refuse`。
 
 此后它就是一次普通的拒绝：`action_response` 帧和存下的 `response` 都是 `refuse`，这次 give 不留余效，bond 线降一档
 （见[被拒绝的动作](affinity-model.zh.md#被拒绝的动作)），回复也按拒收来写。判官自己的回答留在它的审计 payload 里。
-`true` 和不写从不掷，其他物品也不掷。被重新驱动的回合会重新掷一次，就像判官也会重新判一次。
+习惯键为 `true` 或不写时从不掷，`diet` 为 `false` 或不写时也不掷，其他物品也不掷。被重新驱动的回合会重新掷一次，就像判官也会重新判一次。
 
 `smoke_together`、`smoke_weed_together` 或 `drink_together` 也这样掷，按一次给 1 份 `cigarette`、`herb` 或 `alcohol` 的 give，
 看 `smoking`、`drug` 或 `alcoholic` 键。被拒时 `[用户动作]` 一行末尾改为 `，这次你不会答应`，降一档的是 chemistry 线，不是 bond。
@@ -543,6 +545,30 @@ chemistry 在档 4 及以上。有一条不满足，消息就和没有这个键�
 
 `erotic` 先于 `emotional`，`emotional` 先于 `focused`。消息的行带 `metadata.tone = "erotic"`。那三行话和其余的掷法见
 [model-config.zh.md](model-config.zh.md#tones--聊天语气仅限-chat-任务)。
+
+### 她在你身边醒来的时候
+
+部署打开 [`tones.drowsy`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，两人一起睡过或上过床之后，
+她的第一条回复用 `drowsy` 语气来写：`emotional` 语气，加上用户是她的什么人（`[relationship]`），再加 `[this_turn]` 里一行话，
+说她刚在对方身边睡醒，由这一对的 chemistry 档位决定（档位越高越撒娇）。
+
+这一掷按键的取值，在不带用户动作的 1:1 文字回合上进行，条件是：
+
+- 这个会话写入的最新一条 `asleep_together` 或 `having_sex_together` 事件已经结束，结束不超过 12 小时。被提前结束的事件也算；
+- 事件结束之后，她在这个会话里还没写过带文字的话。那第一句话不管是什么（对动作的回复、主动消息、没掷中的那条回复），
+  都会把这个时刻用掉；
+- 没有插曲在进行。
+
+没有性向条件，也没有 chemistry 门槛。`drowsy` 排在 `mean` 之后、`erotic` 之前。消息的行带 `metadata.tone = "drowsy"`。
+
+### 冷战的时候
+
+部署打开 [`tones.mean`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）、会话又在[冷战](affinity-model.zh.md#冷战)中时，
+不带用户动作的 1:1 文字回合按键的概率用 `mean` 语气来写：默认回复带着历史，`[reply_length]` 在最低一档，
+`[this_turn]` 里一行话由这一对的 bond 档位决定（两人越亲近，她解释得越少）。开启冷战的那一回合和宣布冷战的那条消息不是 `mean`；
+冷战期间约会里的回合是。`mean` 排在所有语气之前。消息的行带 `metadata.tone = "mean"`。
+
+她的回复是判官读到的内容之一，而冷战要连续三个判定回合的耐心高于最低档才结束，所以开着这个语气时冷战可能更久。
 
 ### 离线类
 
@@ -1559,7 +1585,7 @@ engine 不接收性别或性取向，也不判断谁会被谁吸引。
 | 离线类种类 | 和有判官时一样让轮次沉默，因为这个检查在判官之前：ghosting 开关以及动作、强制出图两种例外照样适用 |
 | 生活选择与冷战 | 不变：触发读的是 affinity 评估器评过的回合和其中的耐心档，不是 PDE 判官。用户的 `propose` 和 `break_up` 照样过状态门槛，过了之后规则引擎按接受处理 |
 | 一起做的动作 | 判官之前的规则照样拒绝（激情组的门槛、机器角色的上厕所、她的世界、她的经期、习惯掷骰）；过了之后规则引擎按接受处理，性向不相容的一对发来的天然组动作也一样 |
-| `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 为 `false` 的键在 give 时照样掷（算作 give 的一起做的动作也一样），可能把它变成拒收；`smoking`、`alcoholic`、`drug` 照样是习惯类事件的门槛；没有 `indulgence` 可漂移、可点名、可加权 |
+| `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`、`sugar`、`salty`、`spicy`、`diet` | 为 `false` 的习惯键、为 `true` 的 `diet` 在 give 时照样掷（算作 give 的一起做的动作也一样），可能把它变成拒收；`smoking`、`alcoholic`、`drug` 照样是习惯类事件的门槛；没有 `indulgence` 可漂移、可点名、可加权 |
 
 ## 代码指引
 
@@ -1575,7 +1601,8 @@ engine 不接收性别或性取向，也不判断谁会被谁吸引。
 - `crates/eros-engine-server/src/pipeline/life_choice.rs`：冷战、各种触发与她的请求、不理会的转换、冷战的增长缩放。
 - `crates/eros-engine-core/src/relationship.rs`：关系状态、`settle`、`leading_line`、冷战的连续规则与 `sleep_ask_is_sex`。
 - `crates/eros-engine-core/src/scope.rs`：`romance_compatible`，浪漫选择读的那条判据。
-- `crates/eros-engine-core/src/tone.rs`：`at_work` 与 `focused_probability`，一轮落在 `focused` 语气的机会；`EroticGate`、`fixed_erotic_probability` 与 `everyday_erotic_probability`，一条消息用 `erotic` 语气的条件和机会。
+- `crates/eros-engine-core/src/tone.rs`：`at_work` 与 `focused_probability`，一轮落在 `focused` 语气的机会；`EroticGate`、`fixed_erotic_probability` 与 `everyday_erotic_probability`，一条消息用 `erotic` 语气的条件和机会；`mean_probability` 与 `drowsy_probability`，一轮落在 `mean`、`drowsy` 语气的机会。
+- `crates/eros-engine-store/src/events.rs::just_woke`：她是不是刚在用户身边睡醒。
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`：需求的读取与写入（被接受的 give 的挪动走 `after_give`）、`[需求]` 与 `[近期事件]` 两行
   （`build_pde_ctx`）、判官之前的 offline 分支、掷出拒收后的改判（`apply_give_refusal`）、`body_state_frame`。
 - `crates/eros-engine-server/src/prompt.rs`：`needs_line`、`events_judge_text`、`events_reply_text`、

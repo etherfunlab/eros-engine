@@ -539,7 +539,9 @@ status underneath unchanged.
 - **The anchor** is the later of the session's newest life choice (its ask, its
   answer) and its newest `relationship` event, so every start and end of a cold
   war, and every status change, begins a fresh streak.
-- **While it lasts** she keeps replying, coldly: `[relationship]` says so. Every
+- **While it lasts** she keeps replying, coldly: `[relationship]` says so, and
+  with [`tones.mean`](model-config.md#tones--chat-tones-chat-task-only) above 0
+  a text turn without a user action is written in the `mean` tone. Every
   positive committed delta on the four line axes is halved
   ([above](#life-choice-drops-and-the-cold-war-halving)). She asks nothing warm
   (`confess`, `partner_up`, `propose`, her sleep ask, `bathe_together`,

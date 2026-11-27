@@ -89,6 +89,8 @@ tone. BYOC does not serve life events yet.
 
 ## Versions
 
+The current version is 1.2: [eros-character-v1.2.md](eros-character-v1.2.md).
+
 - **1.1** adds the `gluttony` habit key and the `setting`, `hygienic`,
   `employed`, `outdoorsy` and `moody` keys. Nothing else about the document changes.
 - **1** is the first version, documented in [eros-character-v1.md](eros-character-v1.md).

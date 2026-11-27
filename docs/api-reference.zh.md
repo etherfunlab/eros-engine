@@ -403,16 +403,16 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 | `gift` | `kind`：`item` \| `clothing`（必填）；`name`：必填，1–64 字 |
 | `date` | `duration`：`short`（1 小时）\| `mid`（4 小时），必填；`place`：必填，1–40 字；`content`：必填，1–120 字；两者都不能含换行或控制字符 |
 
-**`give` 能递什么。** 消耗品会在角色身上留下余效（见下）。贵重物没有余效，也不会进她的物品清单；想让她收着，用 `gift`。`cash` 是当面递过去的现金，按张数计；带金额的是 `tip`。`cuisine` 是一道正经的菜或一顿饭，`food` 是吃的东西。
+**`give` 能递什么。** 消耗品会在角色身上留下余效（见下）。贵重物没有余效，也不会进她的物品清单；想让她收着，用 `gift`。`cash` 是当面递过去的现金，按张数计；带金额的是 `tip`。`cuisine` 是一道正经的菜或一顿饭，`food` 是吃的东西。`dessert` 是甜点，`soup` 是一碗汤。
 
 | 分组 | `item`（单位） |
 |---|---|
-| 消耗品 | `cigarette`（支）、`alcohol`（杯）、`medicine`（片）、`food`（份）、`soft_drink`（瓶）、`tea`（杯）、`coffee`（杯）、`herb`（包）、`cuisine`（道） |
+| 消耗品 | `cigarette`（支）、`alcohol`（杯）、`medicine`（片）、`food`（份）、`soft_drink`（瓶）、`tea`（杯）、`coffee`（杯）、`herb`（包）、`cuisine`（道）、`dessert`（份）、`soup`（碗） |
 | 贵重物 | `watch`（块）、`gem`（颗）、`gold`（块）、`camera`（台）、`cash`（张）、`antique`（件）、`artwork`（件）、`handmade`（份）、`credit_card`（张）、`flower`（朵）、`jewelry`（件）、`car`（辆）、`motorcycle`（辆）、`boat`（艘）、`horse`（匹） |
 
 **`give` 的余效。** 被接受的消耗品会在这个 session 之后的 `min(quantity, 5)` 个文字回合里继续影响角色；接受它的那一回合不算在内。每个回合角色处在曲线上的某一步，档位 1–4：
 
-| 回合数 | 前强：`cigarette`、`food`、`soft_drink`、`tea`、`cuisine` | 后强：`alcohol` | 中间强：`medicine`、`coffee`、`herb` |
+| 回合数 | 前强：`cigarette`、`food`、`soft_drink`、`tea`、`cuisine`、`dessert`、`soup` | 后强：`alcohol` | 中间强：`medicine`、`coffee`、`herb` |
 |---|---|---|---|
 | 1 | 3 | 1 | 3 |
 | 2 | 3 1 | 1 3 | 3 3 |
@@ -423,7 +423,7 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 一个回合指文字 session 或它的约会子会话里的一条用户消息；产品咨询消息和语音通话不计数，也没有时间上限。这份状态会进判官、回复 prompt 和画图 composer，并经 `body_state` 帧和 [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects) 给到调用方。被拒绝的 give 没有余效。被接受的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 按一次给 1 份 `cigarette`、`herb` 或 `alcohol`、不带 `name` 的 give 留下余效。设计文档：[余效 spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md)、[give 品类 spec](superpowers/specs/2026-10-13-give-categories-design.md)。
 
-**递来她不用的东西。** 角色的 `art_metadata.smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` 表示她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃（表在[下文](#post-v2compsessionsession_idevents)）。递 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine` 而对应的键为 `false` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况回应就是 `refuse`，不管判官怎么答，也不管有没有 LLM 判官：`action_response` 帧和两套历史接口返回的 `response` 都是 `refuse`，这次 give 不留余效，并像任何被拒的 give 一样让 bond 线降一档。判官会被告知这个结果（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。`smoke_together`、`smoke_weed_together` 或 `drink_together` 也这样掷，按一次给 1 份 `cigarette`、`herb` 或 `alcohol` 的 give；被拒时降的是 chemistry 线，不是 bond。键为 `true` 或不写时从不掷，其他物品和其他动作也不掷。
+**递来她不用的东西。** 角色的 `art_metadata.smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`、`sugar` 表示她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃、爱不爱吃甜，`art_metadata.diet` 表示她是不是在节食（表在[下文](#post-v2compsessionsession_idevents)）。递 `cigarette`、`alcohol`、`herb`、`coffee`、`cuisine` 或 `dessert` 而对应的键为 `false` 时，或者她的 `diet` 为 `true` 而递的是 `food`、`cuisine` 或 `dessert` 时，engine 在判官运行之前掷一次。三次里有一次，这一轮照常进行。其余情况回应就是 `refuse`，不管判官怎么答，也不管有没有 LLM 判官：`action_response` 帧和两套历史接口返回的 `response` 都是 `refuse`，这次 give 不留余效，并像任何被拒的 give 一样让 bond 线降一档。判官会被告知这个结果（见 [model-config.zh.md](model-config.zh.md#taskspde_decision--opt-in-llm-pde-判断器)）。`smoke_together`、`smoke_weed_together` 或 `drink_together` 也这样掷，按一次给 1 份 `cigarette`、`herb` 或 `alcohol` 的 give；被拒时降的是 chemistry 线，不是 bond。习惯键为 `true` 或不写时从不掷，`diet` 为 `false` 或不写时也不掷，其他物品和其他动作也不掷；`soup` 从不掷。
 
 **社交动作。** `bluff`、`threaten`、`trick` 的回应表示她有没有中招：`accept` 是信了、被吓到了、上当了，`refuse` 是没信、没吃这一套、识破了。`challenge`、`bet` 的回应表示她接不接：`accept` 是应战了、答应打这个赌，`refuse` 是没应战、没答应。不判输赢；挑战或赌的是什么，由用户在这条消息里说。和所有动作一样，没有判定时算 `accept`。识破或不接都不降档，这一轮由亲密度判官照常评。
 
@@ -488,9 +488,14 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复，被接受的 `ask_dancing`（用户想看她跳支舞，图是她在跳舞）和任何被接受的一起做的动作也一样。被拒的 `photo`、`strip`、`ask_dancing` 或一起做的动作，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
 
-**情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、天然组或激情组的一起做的动作（`shower_together`、`bath_together`、`streak_together`、`skinny_dip_together`、`ride_horse_naked_together`、`yoga_naked_together`、`hike_naked_together`、`hot_spring_naked_together`、`dance_naked_together`、`massage_naked_together`、`sex_together`）、`propose`、`break_up`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。不带动作的回合可能抽一次语气（见[语气](model-config.zh.md#tones--聊天语气仅限-chat-任务)）；只有抽过签时，它的 assistant 行才带 `metadata.tone`（`"erotic"`、`"emotional"`、`"focused"` 或 `"default"`）。
+**情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、天然组或激情组的一起做的动作（`shower_together`、`bath_together`、`streak_together`、`skinny_dip_together`、`ride_horse_naked_together`、`yoga_naked_together`、`hike_naked_together`、`hot_spring_naked_together`、`dance_naked_together`、`massage_naked_together`、`sex_together`）、`propose`、`break_up`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。不带动作的回合可能抽一次语气（见[语气](model-config.zh.md#tones--聊天语气仅限-chat-任务)）；只有抽过签时，它的 assistant 行才带 `metadata.tone`（`"mean"`、`"drowsy"`、`"erotic"`、`"emotional"`、`"focused"` 或 `"default"`）。
 
 **erotic 回复。** 部署打开 [`tones.erotic`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，她接受 `sex_together` 的那条回复可能改用 `erotic` 语气：在 `emotional` 回复之上，再告诉她用户是她的什么人。她接受激情动作（`french_kiss`、`tease`、`lick`、`touch`、`ask_massage`）的那条回复、用户接受她提的 `sleep_together` 或 `bathe_together` 时她的那条回复、`sudden_desire` 开始时发的那条消息、以及 `sex_addict` 为 `true` 的角色的日常回合也可能如此。这一对要在那条消息的 `affinity_scope` 上是性向相容的，所以回答她的邀请时，请求应带上和聊天回合相同的 scope。这类消息的行带 `metadata.tone = "erotic"`。
+
+**mean 与 drowsy 回复。** 不带动作的回合还有两种语气。部署打开 [`tones.mean`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）、
+这一对又在[冷战](affinity-model.zh.md#冷战)中时，她的回复可能用 `mean` 语气：照默认回复来写，但压得很短，话里带刺。
+部署打开 `tones.drowsy` 时，`asleep_together` 或 `having_sex_together` 事件结束后她的第一条文字回复可能用 `drowsy` 语气：
+她刚在用户身边睡醒，回复时面前没有聊天历史。这些行带 `metadata.tone = "mean"` 或 `"drowsy"`。
 
 **约会。** `date` 是约她出去。先过 engine 的门槛：`short` 没有门槛，`mid` 要求 bond 达到第 2 档，她离线或正在另一场约会里时一律不通过；
 门槛不通过就是拒绝，不管判官怎么答。被拒时这一回合是没有代价的普通回合。被接受时，这一回合的 `final` 帧带 `activity`：
@@ -1086,7 +1091,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内被抽到的概率分别是原来的三分之一 / 一倍 / 三倍，`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读。`full_time` 还表示有事业心：[`tones.focused`](model-config.zh.md#tones--聊天语气仅限-chat-任务) 大于 0 时，可以抽语气、不在上班、也没有插曲在进行的回合，有八分之一用 `focused` 语气回复（见[上班时](life-events-needs.zh.md#上班时)） |
   | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | `outdoor`：户外种类在各自类别内被抽到的概率是原来的 3 倍，室内种类是三分之一；`indoor` 反过来。可能让她离线的种类算中性，不受影响；每种的场所见 [life-events-needs.zh.md](life-events-needs.zh.md#户外还是室内)；其他值按 `neutral` 读 |
   | `setting` | `"modern"`（默认）、`"fantasy"` | 她生活的世界：`fantasy` 的角色不会抽到 `police_encounter`、`showering`、`taking_selfie`、`gaming`、`watching_show`、`business_trip`、`hospitalized`、`post_surgery`、`temp_work`、`scolded_superior`、`saw_bag`、`saw_clothes`、`out_shopping`、`want_to_quit_job`、`admiring_art`，不管 `kinds` 或 `prefer_events` 怎么写；不是 `fantasy` 的角色拒绝用户的 `fight_together`，`fantasy` 的角色拒绝用户的 `cycle_together`（见[上文](#post-compchatsession_idmessagestream)）；其他值按 `modern` 读 |
-  | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西，或拒绝对应的一起做的动作（`smoking` 对应 `smoke_together`、`drug` 对应 `smoke_weed_together`、`alcoholic` 对应 `drink_together`）（见[上文](#post-compchatsession_idmessagestream)）；`smoking`、`alcoholic`、`drug` 为 `true` 时她才会抽到 `smoking`、`drinking`、`smoking_weed` |
+  | `smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`、`sugar`、`salty`、`spicy` | 各为 `true` / `false` / 不写 | 她抽不抽烟、喝不喝酒、用不用大麻、喝不喝咖啡、贪不贪吃、爱不爱吃甜、口味重不重咸、爱不爱吃辣：为 `true` 的越多，她的 `indulgence` 回到 `high` 越快，进而给抽取加权；为 `false` 的键可能让她拒收递来的这样东西（`sugar` 对应 `dessert`；`salty`、`spicy` 不对应任何物品），或拒绝对应的一起做的动作（`smoking` 对应 `smoke_together`、`drug` 对应 `smoke_weed_together`、`alcoholic` 对应 `drink_together`）（见[上文](#post-compchatsession_idmessagestream)）；`smoking`、`alcoholic`、`drug` 为 `true` 时她才会抽到 `smoking`、`drinking`、`smoking_weed` |
+  | `diet` | `true` / `false` / 不写 | `true`：她在节食，可能拒收递来的 `food`、`cuisine` 或 `dessert`（见[上文](#post-compchatsession_idmessagestream)）；它不是习惯，不影响 `indulgence` |
 
   取值形状不对、种类未知，或种类不在 `mid` 里，一律忽略。偏好不会绕过任何门槛。
 - **只要有符合条件的种类，抽取就一定得到一个事件。** 她的一天有多热闹，取决于调用方什么时候来要。
@@ -1715,7 +1721,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 TTS 模型。部署没有 [`[tasks.chat_speech]`](model-config.zh.md#taskschat_speech--聊天消息的语气标注opt-in) 时关闭。
 engine 自己不发声，也不存结果：合成一次，把音频留下。
 
-每条消息按 engine 对它知道的事来判断：角色写好的人设、这条消息写成的语气（`metadata.tone`）、两人此刻的关系
+每条消息按 engine 对它知道的事来判断：角色写好的人设、这条消息写成的语气（`metadata.tone`；`emotional`、`erotic`、`focused`、`mean`、`drowsy` 各有自己的一句提示）、两人此刻的关系
 （语音频道那句关系描述，取这个会话的亲密度、这条消息记下的 scope；约会读母会话的）、以及它前面的四行。
 每条消息调一次模型，同时进行。
 
@@ -1782,7 +1788,7 @@ curl -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/json"
 
 ## 自带角色（BYOC）
 
-BYOC 实例是一个角色引擎从不存储的角色实例。两个路由负责创建；之后 stream、compose 和图片编辑路由在 `character` 字段里接受封装好的角色卡（见上面 stream 端点的「自带角色」段落）。两个路由都需要 bearer token 和 `X-Byoc-Caller-Secret`，后者必须与部署的 `BYOC_CALLER_SECRET` 相符。它们的拒绝响应使用流前错误的响应体 `{code, message, user_message}`。流程、封装格式和记录的内容见 [byoc.zh.md](byoc.zh.md)；卡片格式见 [eros-character-v1.1.md](eros-character-v1.1.md)。
+BYOC 实例是一个角色引擎从不存储的角色实例。两个路由负责创建；之后 stream、compose 和图片编辑路由在 `character` 字段里接受封装好的角色卡（见上面 stream 端点的「自带角色」段落）。两个路由都需要 bearer token 和 `X-Byoc-Caller-Secret`，后者必须与部署的 `BYOC_CALLER_SECRET` 相符。它们的拒绝响应使用流前错误的响应体 `{code, message, user_message}`。流程、封装格式和记录的内容见 [byoc.zh.md](byoc.zh.md)；卡片格式见 [eros-character-v1.2.md](eros-character-v1.2.md)。
 
 ### `POST /v2/comp/byoc/init`
 
@@ -2734,7 +2740,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 
 ### `POST /svc/v1/genomes`
 
-用一张 [eros-character](eros-character-v1.1.md) 卡片创建一个角色 genome，供自己编写角色的下游服务器使用，这样它不必直接写 `engine.persona_genomes`。需要 `x-genome-write-secret: <GENOME_WRITE_SECRET>`（缺失或错误回 403）。请求里没有用户，engine 不做归属检查：归属由调用方自己负责。
+用一张 [eros-character](eros-character-v1.2.md) 卡片创建一个角色 genome，供自己编写角色的下游服务器使用，这样它不必直接写 `engine.persona_genomes`。需要 `x-genome-write-secret: <GENOME_WRITE_SECRET>`（缺失或错误回 403）。请求里没有用户，engine 不做归属检查：归属由调用方自己负责。
 
 ```bash
 curl -X POST -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: application/json" \
@@ -2742,14 +2748,14 @@ curl -X POST -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: 
         "id": "5b7e0c1a-3d2f-4a6b-9c8d-1e2f3a4b5c6d",
         "card": {
           "spec": "eros-character",
-          "spec_version": "1.1",
+          "spec_version": "1.2",
           "data": { "name": "Aria", "system_prompt": "You are Aria …", "tip_personality": null, "art_metadata": {} }
         }
       }' \
   "http://localhost:8080/svc/v1/genomes"
 ```
 
-`id` 可选。不带时由 engine 生成；带上时用这个 id 创建。`card` 是整份文档，由打开 BYOC 卡片的同一个函数校验：`spec` 为 `"eros-character"`，`spec_version` 为 `"1"` 或 `"1.1"`，`data` 里只有 `name`、`system_prompt`、`tip_personality`、`art_metadata`。序列化后至多 64 KiB。请求体里的其他字段一律回 `400`。
+`id` 可选。不带时由 engine 生成；带上时用这个 id 创建。`card` 是整份文档，由打开 BYOC 卡片的同一个函数校验：`spec` 为 `"eros-character"`，`spec_version` 为 `"1"`、`"1.1"` 或 `"1.2"`，`data` 里只有 `name`、`system_prompt`、`tip_personality`、`art_metadata`。序列化后至多 64 KiB。请求体里的其他字段一律回 `400`。
 
 | 状态码 | 响应体 | 何时 |
 |---|---|---|
@@ -2766,7 +2772,7 @@ curl -X POST -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: 
 
 ```bash
 curl -X PUT -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: application/json" \
-  -d '{ "card": { "spec": "eros-character", "spec_version": "1.1", "data": { "name": "Aria", "system_prompt": "You are Aria …" } } }' \
+  -d '{ "card": { "spec": "eros-character", "spec_version": "1.2", "data": { "name": "Aria", "system_prompt": "You are Aria …" } } }' \
   "http://localhost:8080/svc/v1/genomes/5b7e0c1a-3d2f-4a6b-9c8d-1e2f3a4b5c6d"
 ```
 

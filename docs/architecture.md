@@ -197,7 +197,7 @@ crates/
 │       ├── persona.rs        # PersonaGenome + Instance + CompanionPersona
 │       ├── relationship.rs   # relationship status, cold-war streaks, composed relation
 │       ├── scope.rs          # per-request injection scope (InsightMode / MemoryScope)
-│       ├── tone.rs           # the chat tone a turn draws (default / emotional / focused / erotic)
+│       ├── tone.rs           # the chat tone a turn draws (default / emotional / focused / erotic / mean / drowsy)
 │       └── types.rs          # ActionType / Event / DecisionInput / ConversationSignals
 ├── eros-engine-llm/
 │   └── src/

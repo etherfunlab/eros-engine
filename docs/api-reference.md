@@ -478,16 +478,16 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 | `gift` | `kind`: `item` \| `clothing` (required); `name`: required, 1–64 chars |
 | `date` | `duration`: `short` (1 h) \| `mid` (4 h), required; `place`: required, 1–40 chars; `content`: required, 1–120 chars; neither may hold a line break or a control character |
 
-**What `give` hands over.** Consumables linger on the persona (below). Valuables do not, and they do not join her items: `gift` is the action for something she keeps. `cash` is money handed over in person, counted in notes; `tip` is the action that carries an amount. `cuisine` is a proper dish or meal; `food` is something to eat.
+**What `give` hands over.** Consumables linger on the persona (below). Valuables do not, and they do not join her items: `gift` is the action for something she keeps. `cash` is money handed over in person, counted in notes; `tip` is the action that carries an amount. `cuisine` is a proper dish or meal; `food` is something to eat. `dessert` is something sweet; `soup` is a bowl of soup.
 
 | group | `item` (unit) |
 |---|---|
-| consumable | `cigarette` (支), `alcohol` (杯), `medicine` (片), `food` (份), `soft_drink` (瓶), `tea` (杯), `coffee` (杯), `herb` (包), `cuisine` (道) |
+| consumable | `cigarette` (支), `alcohol` (杯), `medicine` (片), `food` (份), `soft_drink` (瓶), `tea` (杯), `coffee` (杯), `herb` (包), `cuisine` (道), `dessert` (份), `soup` (碗) |
 | valuable | `watch` (块), `gem` (颗), `gold` (块), `camera` (台), `cash` (张), `antique` (件), `artwork` (件), `handmade` (份), `credit_card` (张), `flower` (朵), `jewelry` (件), `car` (辆), `motorcycle` (辆), `boat` (艘), `horse` (匹) |
 
 **Lingering effects of a `give`.** An accepted consumable keeps affecting the persona on the next `min(quantity, 5)` text turns of the session; the turn that accepts it is not one of them. Each turn the persona is at one step of a curve, at a level from 1 to 4:
 
-| turns | front: `cigarette`, `food`, `soft_drink`, `tea`, `cuisine` | back: `alcohol` | middle: `medicine`, `coffee`, `herb` |
+| turns | front: `cigarette`, `food`, `soft_drink`, `tea`, `cuisine`, `dessert`, `soup` | back: `alcohol` | middle: `medicine`, `coffee`, `herb` |
 |---|---|---|---|
 | 1 | 3 | 1 | 3 |
 | 2 | 3 1 | 1 3 | 3 3 |
@@ -498,7 +498,7 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 
 A turn is a user message of the text session or of one of its dates' sub-sessions; product-QA messages and voice calls do not count, and there is no time limit. The state reaches the judge, the reply prompt and the image composer, and the caller through the `body_state` frame and [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects). A refused give has no effect. An accepted `smoke_together`, `smoke_weed_together` or `drink_together` lingers as a give of one `cigarette`, `herb` or `alcohol`, with no `name`. Design: [lingering effects spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md), [give categories spec](superpowers/specs/2026-10-13-give-categories-design.md).
 
-**A give of something she does not use.** The persona's `art_metadata.smoking`, `alcoholic`, `drug`, `coffee` and `gluttony` say whether she smokes, drinks, uses weed, drinks coffee and loves good food (table [below](#post-v2compsessionsession_idevents)). A `give` of `cigarette`, `alcohol`, `herb`, `coffee` or `cuisine` whose key is `false` is rolled once before the judge runs. One time in three the turn goes on as usual. Otherwise the response is `refuse`, whatever the judge answers and with or without the LLM judge: the `action_response` frame and the `response` the history routes return say `refuse`, the give leaves no effect, and it costs the bond line a tier like any refused give. The judge is told the outcome (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)). A `smoke_together`, `smoke_weed_together` or `drink_together` is rolled the same way, as a give of one `cigarette`, `herb` or `alcohol`; its refusal costs the chemistry line a tier, not bond. A key that is `true` or absent never rolls, nor does any other item or action.
+**A give of something she does not use.** The persona's `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` and `sugar` say whether she smokes, drinks, uses weed, drinks coffee, loves good food and has a sweet tooth, and `art_metadata.diet` whether she is on a diet (table [below](#post-v2compsessionsession_idevents)). A `give` of `cigarette`, `alcohol`, `herb`, `coffee`, `cuisine` or `dessert` whose key is `false`, and a `give` of `food`, `cuisine` or `dessert` to a persona whose `diet` is `true`, is rolled once before the judge runs. One time in three the turn goes on as usual. Otherwise the response is `refuse`, whatever the judge answers and with or without the LLM judge: the `action_response` frame and the `response` the history routes return say `refuse`, the give leaves no effect, and it costs the bond line a tier like any refused give. The judge is told the outcome (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)). A `smoke_together`, `smoke_weed_together` or `drink_together` is rolled the same way, as a give of one `cigarette`, `herb` or `alcohol`; its refusal costs the chemistry line a tier, not bond. A habit key that is `true` or absent never rolls, nor does a `diet` that is `false` or absent, nor any other item or action; a `soup` never rolls.
 
 **Social actions.** For `bluff`, `threaten` and `trick` the response says whether she falls for it: `accept` is 信了, 被吓到了 or 上当了, and `refuse` is 没信, 没吃这一套 or 识破了. For `challenge` and `bet` it says whether she takes the user up on it: `accept` is 应战了 or 答应打这个赌, and `refuse` is 没应战 or 没答应. No winner is decided; what the challenge or the bet is, the user says in the message. As for every action, an undecided response is `accept`. Seeing through one, or turning one down, costs nothing; the affinity judge grades the turn as it grades any other.
 
@@ -575,7 +575,7 @@ her response, without the chat history, the user profile or the affinity conclus
 response itself is decided as above. The reply's rows carry `metadata.tone = "emotional"`. A
 turn without an action may draw a tone instead
 ([tones](model-config.md#tones--chat-tones-chat-task-only)); its assistant rows carry
-`metadata.tone` (`"erotic"`, `"emotional"`, `"focused"` or `"default"`) only when a draw was made.
+`metadata.tone` (`"mean"`, `"drowsy"`, `"erotic"`, `"emotional"`, `"focused"` or `"default"`) only when a draw was made.
 
 **Erotic replies.** While the deployment has
 [`tones.erotic`](model-config.md#tones--chat-tones-chat-task-only) above 0, her reply to a
@@ -586,6 +586,14 @@ also told who the user is to her. So may her reply to a passion gesture she acce
 persona whose `sex_addict` is `true`. The pair has to be romantically compatible on that message's
 `affinity_scope`, so the answer to her ask should carry the scope the chat turns carry. Such a
 message's rows carry `metadata.tone = "erotic"`.
+
+**Mean and drowsy replies.** Two more tones apply to a turn without an action. While the
+deployment has [`tones.mean`](model-config.md#tones--chat-tones-chat-task-only) above 0 and the
+pair's [cold war](affinity-model.md#the-cold-war) is on, her reply may be written in the `mean` tone:
+the default reply, kept short, with an edge. While it has `tones.drowsy` above 0, her first text
+reply after an `asleep_together` or `having_sex_together` event ended may be written in the
+`drowsy` tone: she just woke beside the user, and answers without the chat history. The rows carry
+`metadata.tone = "mean"` or `"drowsy"`.
 
 **A date.** `date` asks her out. An engine gate runs first: none for `short`,
 bond at tier 2 for `mid`, and never while she is offline or on another date; a
@@ -1408,7 +1416,8 @@ The draw:
   | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` come up a third as often / as they are / three times as often within their categories, and a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time`. `full_time` is also career-minded: with [`tones.focused`](model-config.md#tones--chat-tones-chat-task-only) above 0, a turn that may draw a tone, off work and with no incident under way, is answered in the `focused` tone 1 time in 8 ([at work](life-events-needs.md#at-work)) |
   | `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | `outdoor`: the outdoor kinds come up three times as often and the indoor kinds a third as often within their categories; `indoor` the reverse. Kinds that can take her offline are neutral and untouched; the place of each kind is listed in [life-events-needs.md](life-events-needs.md#outdoors-or-in); any other value reads as `neutral` |
   | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in: a `fantasy` persona never draws `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery`, `temp_work`, `scolded_superior`, `saw_bag`, `saw_clothes`, `out_shopping`, `want_to_quit_job` or `admiring_art`, whatever `kinds` or `prefer_events` say; a persona that is not `fantasy` refuses the user's `fight_together`, and a `fantasy` one the user's `cycle_together` ([above](#post-compchatsession_idmessagestream)); any other value reads as `modern` |
-  | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee, loves good food: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing, or the together action that takes it (`smoking`: `smoke_together`, `drug`: `smoke_weed_together`, `alcoholic`: `drink_together`) ([above](#post-compchatsession_idmessagestream)); `smoking`, `alcoholic` and `drug` set to `true` let her draw `smoking`, `drinking` and `smoking_weed` |
+  | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`, `sugar`, `salty`, `spicy` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee, loves good food, has a sweet tooth, a taste for salt, a taste for spice: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing (`sugar`: `dessert`; `salty` and `spicy` are the key of no item), or the together action that takes it (`smoking`: `smoke_together`, `drug`: `smoke_weed_together`, `alcoholic`: `drink_together`) ([above](#post-compchatsession_idmessagestream)); `smoking`, `alcoholic` and `drug` set to `true` let her draw `smoking`, `drinking` and `smoking_weed` |
+  | `diet` | `true` / `false` / absent | `true`: she is on a diet, and can refuse a `give` of `food`, `cuisine` or `dessert` ([above](#post-compchatsession_idmessagestream)); it is not a habit and does not move `indulgence` |
 
   A value of the wrong shape, an unknown kind or a kind outside `mid` is
   ignored. A preference never lifts a gate.
@@ -2249,7 +2258,8 @@ The engine speaks nothing itself, and stores no result: synthesise once and keep
 the audio.
 
 Each message is judged from what the engine knows about it: the persona's
-authored prompt, the tone the message was written in (`metadata.tone`), where
+authored prompt, the tone the message was written in (`metadata.tone`; each of
+`emotional`, `erotic`, `focused`, `mean` and `drowsy` has its own sentence), where
 the pair stands (the voice channel's relationship line, read from the session's
 affinity under the scope the message recorded; a date reads its parent
 session's), and the four rows before it. One model call per message; the calls
@@ -2334,7 +2344,7 @@ bearer token and `X-Byoc-Caller-Secret`, which must match the deployment's
 `BYOC_CALLER_SECRET`. Their refusals use the pre-stream body
 `{code, message, user_message}`. The flow, the sealing format and what is
 stored are in [byoc.md](byoc.md); the card format is in
-[eros-character-v1.1.md](eros-character-v1.1.md).
+[eros-character-v1.2.md](eros-character-v1.2.md).
 
 ### `POST /v2/comp/byoc/init`
 
@@ -3406,7 +3416,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 
 ### `POST /svc/v1/genomes`
 
-Create a persona genome from an [eros-character](eros-character-v1.1.md) card, for a downstream server that authors personas, so that it need not write `engine.persona_genomes` itself. Requires `x-genome-write-secret: <GENOME_WRITE_SECRET>` (403 when missing or wrong). No user is on the request and the engine checks no ownership: the caller does its own.
+Create a persona genome from an [eros-character](eros-character-v1.2.md) card, for a downstream server that authors personas, so that it need not write `engine.persona_genomes` itself. Requires `x-genome-write-secret: <GENOME_WRITE_SECRET>` (403 when missing or wrong). No user is on the request and the engine checks no ownership: the caller does its own.
 
 ```bash
 curl -X POST -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: application/json" \
@@ -3414,14 +3424,14 @@ curl -X POST -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: 
         "id": "5b7e0c1a-3d2f-4a6b-9c8d-1e2f3a4b5c6d",
         "card": {
           "spec": "eros-character",
-          "spec_version": "1.1",
+          "spec_version": "1.2",
           "data": { "name": "Aria", "system_prompt": "You are Aria …", "tip_personality": null, "art_metadata": {} }
         }
       }' \
   "http://localhost:8080/svc/v1/genomes"
 ```
 
-`id` is optional. Without it the engine mints one; with it the genome is created under that id. `card` is the whole document, validated by the same function that opens a BYOC card, so `spec` is `"eros-character"`, `spec_version` is `"1"` or `"1.1"`, and `data` holds only `name`, `system_prompt`, `tip_personality` and `art_metadata`. Serialised, it is at most 64 KiB. Any other field in the body is a `400`.
+`id` is optional. Without it the engine mints one; with it the genome is created under that id. `card` is the whole document, validated by the same function that opens a BYOC card, so `spec` is `"eros-character"`, `spec_version` is `"1"`, `"1.1"` or `"1.2"`, and `data` holds only `name`, `system_prompt`, `tip_personality` and `art_metadata`. Serialised, it is at most 64 KiB. Any other field in the body is a `400`.
 
 | Status | Body | When |
 |---|---|---|
@@ -3438,7 +3448,7 @@ Overwrite a persona genome from a card. Requires `x-genome-write-secret: <GENOME
 
 ```bash
 curl -X PUT -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: application/json" \
-  -d '{ "card": { "spec": "eros-character", "spec_version": "1.1", "data": { "name": "Aria", "system_prompt": "You are Aria …" } } }' \
+  -d '{ "card": { "spec": "eros-character", "spec_version": "1.2", "data": { "name": "Aria", "system_prompt": "You are Aria …" } } }' \
   "http://localhost:8080/svc/v1/genomes/5b7e0c1a-3d2f-4a6b-9c8d-1e2f3a4b5c6d"
 ```
 
