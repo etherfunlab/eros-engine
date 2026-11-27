@@ -607,6 +607,126 @@
         ]
       }
     },
+    "/comp/chat/{session_id}/messages/speech": {
+      "post": {
+        "tags": [
+          "companion"
+        ],
+        "operationId": "speech_markup",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Chat session id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpeechRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Each requested message as a line with inline audio tags, or its own error. With `stream: true` or `Accept: text/event-stream`: per item `delta`… then `done` (carrying `text`), or `item_error`; then one `final`. Frames of different items interleave and name their message by `message_id`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpeechResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "missing or invalid bearer"
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPreErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/comp/chat/{session_id}/messages/{message_id}/image-request": {
       "get": {
         "tags": [
@@ -8344,6 +8464,117 @@
           }
         ],
         "description": "What one side of a `sex_together` wears (spec 2026-11-27 §5.2)."
+      },
+      "SpeechItem": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "message_id",
+              "text",
+              "truncated"
+            ],
+            "properties": {
+              "generation_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "message_id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "model": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text": {
+                "type": "string",
+                "description": "The line with inline audio tags."
+              },
+              "truncated": {
+                "type": "boolean",
+                "description": "The model stopped early; the text is incomplete."
+              },
+              "usage": {}
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "message_id",
+              "error"
+            ],
+            "properties": {
+              "error": {
+                "$ref": "#/components/schemas/SpeechItemError"
+              },
+              "message_id": {
+                "type": "string",
+                "format": "uuid"
+              }
+            }
+          }
+        ],
+        "description": "A marked-up line, or why it could not be made."
+      },
+      "SpeechItemError": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "`not_found`, `not_speakable` or `generation_failed`."
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "SpeechRequest": {
+        "type": "object",
+        "required": [
+          "message_ids"
+        ],
+        "properties": {
+          "message_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "1 to 8 distinct ids of her messages in this session."
+          },
+          "rewrite": {
+            "type": "boolean",
+            "description": "`true` lets the model rephrase her line for the ear; by default her\nwords are kept and only tags are added."
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "`true` (or an `Accept: text/event-stream` header) answers as a stream."
+          }
+        }
+      },
+      "SpeechResponse": {
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SpeechItem"
+            },
+            "description": "One per requested id, in request order."
+          }
+        }
       },
       "StartChatRequest": {
         "type": "object",
