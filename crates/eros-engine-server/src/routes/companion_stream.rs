@@ -367,12 +367,18 @@ pub enum SideClothingDto {
 #[serde(untagged)]
 pub enum RemainClothingDto {
     Flag(bool),
-    Sides {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        active: Option<SideClothingDto>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        passive: Option<SideClothingDto>,
-    },
+    Sides(ClothingSidesDto),
+}
+
+/// Each side's clothing; a missing side is `full_naked`, an unknown key is
+/// malformed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClothingSidesDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<SideClothingDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passive: Option<SideClothingDto>,
 }
 
 /// How long a `date` lasts: `short` is one hour, `mid` four.
@@ -453,7 +459,9 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// judge, and that refusal costs nothing. `custom_together` asks her to do something with the user in the
 /// user's own `text` (required): accepted, it starts a `custom_together`
 /// event (one hour) whose `message_id` is the user's message, and nothing
-/// rules it out before the judge; refused, it costs chemistry.
+/// rules it out before the judge; refused, it costs chemistry. An accepted
+/// `sex_together`'s `having_sex_together` event also has the user's message
+/// as its `message_id`.
 /// `propose` asks her to marry the user and starts no event: it
 /// is refused unless the pair is `dating`, `fwb` or `situationship`, and
 /// accepted, the pair is `engaged`. `break_up` ends the relationship and
@@ -628,9 +636,9 @@ impl UserActionDto {
                 let remain_clothing = match &self.remain_clothing {
                     None => RemainClothing::default(),
                     Some(RemainClothingDto::Flag(b)) => RemainClothing::Flag(*b),
-                    Some(RemainClothingDto::Sides { active, passive }) => RemainClothing::Sides {
-                        active: active.as_ref().map(side).transpose()?,
-                        passive: passive.as_ref().map(side).transpose()?,
+                    Some(RemainClothingDto::Sides(sides)) => RemainClothing::Sides {
+                        active: sides.active.as_ref().map(side).transpose()?,
+                        passive: sides.passive.as_ref().map(side).transpose()?,
                     },
                 };
                 UserAction::SexTogether {
@@ -723,7 +731,8 @@ pub enum ActionResponseDto {
 }
 
 /// A user row's action as the history routes return it: the action fields as
-/// sent, plus the decided `response` once the turn has taken effect.
+/// sent (a `sex_together`'s act and custom clothing always as base64), plus
+/// the decided `response` once the turn has taken effect.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct UserActionView {
     #[serde(flatten)]
@@ -4528,6 +4537,22 @@ data: [DONE]\n\n";
         assert!(sex_dto(json!({"type": "sex_together",
                                "remain_clothing": {"active": {"custom_base64": "!!!"}}}))
         .is_err());
+    }
+
+    /// §5.1: a clothing object with an unknown key is malformed, not "both
+    /// sides absent".
+    #[test]
+    fn sex_together_rejects_unknown_clothing_keys() {
+        for rc in [
+            json!({"actve": "half_naked"}),
+            json!({"custom": "只穿袜子"}),
+            json!({"active": "half_naked", "extra": true}),
+        ] {
+            assert!(
+                sex_dto(json!({"type": "sex_together", "remain_clothing": rc.clone()})).is_err(),
+                "{rc}"
+            );
+        }
     }
 
     /// §5.3: a read returns the act and custom clothing as base64 only,

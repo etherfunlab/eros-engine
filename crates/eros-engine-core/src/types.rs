@@ -386,9 +386,10 @@ impl UserAction {
 
     /// Whether her reply to this action is written in the `emotional` tone,
     /// accepted or refused, when the deployment has the tone on (spec
-    /// 2026-11-12-emotional-action-replies-design.md §2): every nude together
-    /// action (spec 2026-11-27-together-action-groups-design.md §5.1) and
-    /// the gestures and status asks below.
+    /// 2026-11-12-emotional-action-replies-design.md §2): every naturism and
+    /// passion together action (spec 2026-11-27-together-action-groups-
+    /// design.md §5.1; spec 2026-11-27-passion-group-design.md §4) and the
+    /// gestures and status asks below.
     pub fn speaks_emotionally(&self) -> bool {
         matches!(
             self.together_group(),
@@ -465,8 +466,9 @@ impl UserAction {
         }
     }
 
-    /// The user's own words of a `custom_together`: what the event it places
-    /// is about. `None` for every other action.
+    /// The user's own words of a `custom_together`, or a `sex_together`'s act
+    /// name: what the event it places is about. `None` for every other
+    /// action.
     pub fn together_text(&self) -> Option<&str> {
         match self {
             UserAction::CustomTogether { text } => Some(text),
@@ -495,9 +497,10 @@ impl UserAction {
     /// (`bond`): handing something over, giving something to keep, a thrill
     /// action, or a jog, a hike, a fishing trip, a bike ride or a horse ride,
     /// which she may turn down only for not caring for the outdoors. Both
-    /// lines: the nude counterpart of one of those outdoor five (a streak, a
-    /// naked hike, a naked ride). Romance (`chemistry`): every other physical
-    /// gesture. None: a tip (spec 2026-10-11 §6), seeing through a bluff, a
+    /// lines: the naturism counterpart of one of those outdoor five (a
+    /// streak, a naked hike, a naked ride), and a `sex_together` that names
+    /// its act (spec 2026-11-27-passion-group-design.md §6). Romance
+    /// (`chemistry`): every other physical gesture. None: a tip (spec 2026-10-11 §6), seeing through a bluff, a
     /// threat or a trick (spec 2026-11-08 §2.2), turning down a date, a
     /// proposal, a break-up, a challenge or a bet.
     pub fn refusal_lines(&self) -> &'static [AffinityLine] {

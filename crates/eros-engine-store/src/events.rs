@@ -14,9 +14,8 @@ use crate::life_choices::pending_for_instance_on;
 /// One event. `session_id` is where it was drawn and told, `message_id` the
 /// message that told it; either is `None` once its row is gone, and
 /// `message_id` is `None` for an event that is never told. On a
-/// `custom_together` `message_id` is the user's message that asked (spec
-/// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-custom-
-/// together-design.md §8.3).
+/// `custom_together`, or a `having_sex_together` a user's action placed,
+/// `message_id` is the user's message that asked ([`points_at_the_user`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventRecord {
     pub id: Uuid,
@@ -151,6 +150,19 @@ pub(crate) async fn lock_instance(
 
 pub struct EventRepo<'a> {
     pub pool: &'a PgPool,
+}
+
+/// Whether a row of `kind` that a user's action places points at the user's
+/// message that asked, not at hers: a `custom_together`'s text and a
+/// `sex_together`'s act ride on it (spec 2026-11-26-more-together-actions-
+/// bath-outfit-chemistry-drop-and-custom-together-design.md §8.3; spec
+/// 2026-11-27-passion-group-design.md §5.3). Every other placed row points at
+/// no message.
+pub fn points_at_the_user(kind: EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::CustomTogether | EventKind::HavingSexTogether
+    )
 }
 
 impl EventRepo<'_> {
@@ -351,11 +363,9 @@ impl EventRepo<'_> {
     /// or a date being opened, is waited for and then seen. Nothing here
     /// commits.
     ///
-    /// `user_message_id` is the user's message that asked. A `custom_together`
-    /// row points at it (`message_id`), as the user's words live there (spec
-    /// 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
-    /// custom-together-design.md §8.3); a row of any other kind points at no
-    /// message. One message places at most one row, so
+    /// `user_message_id` is the user's message that asked. A row of a kind
+    /// [`points_at_the_user`] names points at it (`message_id`); a row of any
+    /// other kind points at no message. One message places at most one row, so
     /// `persona_events_message_uidx` holds.
     pub async fn place_together_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -375,13 +385,7 @@ impl EventRepo<'_> {
         {
             return Ok(());
         }
-        // A custom_together's text and a sex_together's act ride on the
-        // user's message (spec 2026-11-27-passion-group-design.md §5.3).
-        let message_id = matches!(
-            e.kind,
-            EventKind::CustomTogether | EventKind::HavingSexTogether
-        )
-        .then_some(user_message_id);
+        let message_id = points_at_the_user(e.kind).then_some(user_message_id);
         Self::insert_preempting_pointing_in_tx(tx, e, message_id).await?;
         Ok(())
     }

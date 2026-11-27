@@ -119,6 +119,11 @@ The action rides on the user's message as `custom_together`'s text does:
 no table. The `having_sex_together` row a user's `sex_together` places
 points at that message (`message_id`), as a `custom_together` row does, so
 every 1:1 picture while the event lasts reads the same act and clothing.
+The asynchronous send route's queue row (`chat_turn_queue.params`) keeps
+the request as sent, the action included, so a queued or revived turn runs
+as asked; that snapshot is the request's, is never read back by any route,
+and goes with its message. It is not a second copy of the act. *(Owner's
+ruling.)*
 *(Owner's ruling: stored with the user's message, used for the whole event.
 Engine's call: the row pointer.)*
 

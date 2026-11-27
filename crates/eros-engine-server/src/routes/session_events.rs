@@ -61,8 +61,9 @@ const MAX_EVENT_KEY_CHARS: usize = 128;
 /// `naked_hiking_together`, `naked_hot_spring_together` and
 /// `custom_together` are placed by the
 /// engine, never drawn: they appear in responses only, and a `kinds` filter
-/// that lists one is rejected. A `custom_together`'s `message_id` is the
-/// user's message that asked, not hers.
+/// that lists one is rejected. A `custom_together`'s `message_id`, and a
+/// `having_sex_together`'s a user's action placed, is the user's message
+/// that asked, not hers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKindDto {
@@ -444,8 +445,9 @@ impl From<eros_engine_core::events::EventCategory> for EventCategoryDto {
 
 /// A life event: what happened, when it started and ends, whether it keeps
 /// the persona offline while it lasts, and the message that told it (`null`
-/// for an event that is not told). On a `custom_together` `message_id` is
-/// the user's message that asked, not hers.
+/// for an event that is not told). On a `custom_together`, and on a
+/// `having_sex_together` a user's action placed, `message_id` is the user's
+/// message that asked, not hers.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct EventView {
     pub kind: EventKindDto,
@@ -675,9 +677,9 @@ async fn respond(
 }
 
 /// [`respond`]'s parts: the event, the row that told it, her picture. A
-/// `custom_together`'s `message_id` is the user's message that asked, never
-/// hers (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-
-/// and-custom-together-design.md §8.3): it returns no message.
+/// `custom_together`'s or a user-placed `having_sex_together`'s `message_id`
+/// is the user's message that asked, never hers
+/// ([`eros_engine_store::events::points_at_the_user`]): it returns no message.
 async fn stored(
     state: &AppState,
     session_id: Uuid,
@@ -699,7 +701,7 @@ async fn stored(
     };
     let told_by = event
         .message_id
-        .filter(|_| event.kind != EventKind::CustomTogether);
+        .filter(|_| !eros_engine_store::events::points_at_the_user(event.kind));
     let message = match told_by {
         Some(id) => {
             ChatRepo { pool: &state.pool }
@@ -4249,6 +4251,50 @@ mod tests {
         let body = serde_json::to_value(&out).unwrap();
         assert_eq!(body["message"], json!(null), "{body}");
         assert!(body.get("image_request").is_none(), "{body}");
+        assert!(calls(&mock).await.is_empty(), "nothing is generated");
+    }
+
+    /// Spec 2026-11-27-passion-group-design.md §5.3: a user's sex row points
+    /// at the user's message too, so a draw under its key returns no message
+    /// and no act text.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_draw_under_a_sex_rows_key_never_returns_the_user_row(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let (instance_id, session_id) = setup(&pool, user_id).await;
+        let mock = MockServer::start().await;
+        mount_companion(&mock, "好").await;
+        let state = with_companion(test_state(pool.clone()), &mock.uri());
+        let now = Utc::now();
+        let (asked, key) = accept_together(
+            &pool,
+            instance_id,
+            session_id,
+            json!({"type": "sex_together", "name": "姿势甲"}),
+            EventKind::HavingSexTogether,
+            now - chrono::Duration::minutes(10),
+        )
+        .await;
+        let out = draw_event_at(
+            &state,
+            session_id,
+            user_id,
+            DrawEventRequest {
+                image: Some(EventImageParams::default()),
+                ..req(&key, None)
+            },
+            now,
+            rolls(0.5),
+        )
+        .await
+        .unwrap();
+        let e = out.event.as_ref().expect("the placed event");
+        assert_eq!(e.kind, EventKindDto::HavingSexTogether);
+        assert_eq!(e.message_id, Some(asked));
+        assert_eq!(e.text, None);
+        let body = serde_json::to_value(&out).unwrap();
+        assert_eq!(body["message"], json!(null), "{body}");
+        assert!(body.get("image_request").is_none(), "{body}");
+        assert!(!body.to_string().contains("姿势甲"), "{body}");
         assert!(calls(&mock).await.is_empty(), "nothing is generated");
     }
 }

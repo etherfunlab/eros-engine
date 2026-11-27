@@ -5280,6 +5280,33 @@
           }
         }
       },
+      "ClothingSidesDto": {
+        "type": "object",
+        "description": "Each side's clothing; a missing side is `full_naked`, an unknown key is\nmalformed.",
+        "properties": {
+          "active": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SideClothingDto"
+              }
+            ]
+          },
+          "passive": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SideClothingDto"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "ComposeRequest": {
         "type": "object",
         "required": [
@@ -5858,7 +5885,7 @@
       },
       "EventKindDto": {
         "type": "string",
-        "description": "A kind of life event. `taking_space`, `fell_out`, `traveling_together`,\n`bathing_together`, `on_a_date`, `showering_together`, `sauna_together`\nthe twelve kinds from `using_toilet_together` to `drinking_together`,\n`hot_spring_together`, `fighting_together`, `working_out_together`,\n`swimming_together`, `cycling_together`, `hiking_together`,\n`dancing_together`, `adventuring_together`, `playing_with_fire_together`,\n`singing_together`, `skinny_dipping_together`,\n`committing_crime_together`, `fishing_together`,\n`naked_horse_riding_together`, `naked_yoga_together`,\n`naked_hiking_together`, `naked_hot_spring_together` and\n`custom_together` are placed by the\nengine, never drawn: they appear in responses only, and a `kinds` filter\nthat lists one is rejected. A `custom_together`'s `message_id` is the\nuser's message that asked, not hers.",
+        "description": "A kind of life event. `taking_space`, `fell_out`, `traveling_together`,\n`bathing_together`, `on_a_date`, `showering_together`, `sauna_together`\nthe twelve kinds from `using_toilet_together` to `drinking_together`,\n`hot_spring_together`, `fighting_together`, `working_out_together`,\n`swimming_together`, `cycling_together`, `hiking_together`,\n`dancing_together`, `adventuring_together`, `playing_with_fire_together`,\n`singing_together`, `skinny_dipping_together`,\n`committing_crime_together`, `fishing_together`,\n`naked_horse_riding_together`, `naked_yoga_together`,\n`naked_hiking_together`, `naked_hot_spring_together` and\n`custom_together` are placed by the\nengine, never drawn: they appear in responses only, and a `kinds` filter\nthat lists one is rejected. A `custom_together`'s `message_id`, and a\n`having_sex_together`'s a user's action placed, is the user's message\nthat asked, not hers.",
         "enum": [
           "police_encounter",
           "animal_encounter",
@@ -5971,7 +5998,7 @@
       },
       "EventView": {
         "type": "object",
-        "description": "A life event: what happened, when it started and ends, whether it keeps\nthe persona offline while it lasts, and the message that told it (`null`\nfor an event that is not told). On a `custom_together` `message_id` is\nthe user's message that asked, not hers.",
+        "description": "A life event: what happened, when it started and ends, whether it keeps\nthe persona offline while it lasts, and the message that told it (`null`\nfor an event that is not told). On a `custom_together`, and on a\n`having_sex_together` a user's action placed, `message_id` is the user's\nmessage that asked, not hers.",
         "required": [
           "kind",
           "category",
@@ -8161,29 +8188,7 @@
             "type": "boolean"
           },
           {
-            "type": "object",
-            "properties": {
-              "active": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/SideClothingDto"
-                  }
-                ]
-              },
-              "passive": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/SideClothingDto"
-                  }
-                ]
-              }
-            }
+            "$ref": "#/components/schemas/ClothingSidesDto"
           }
         ],
         "description": "What both sides of a `sex_together` wear (spec 2026-11-27 §5.2)."
@@ -8624,7 +8629,7 @@
       },
       "UserActionDto": {
         "type": "object",
-        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\neach line the action touches (`give`, `gift`, the thrill actions\n`adventure_together`, `commit_crime_together`, `play_with_fire_together`\nand `fight_together`, and `jog_together`, `hike_together`,\n`fish_together`, `cycle_together` and `ride_horse_together` → bond;\n`streak_together`, `hike_naked_together`, `ride_horse_naked_together` and\na `sex_together` with a `name` → bond and chemistry; every other physical\nor custom action →\nchemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `break_up`,\n`challenge` or `bet` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe. A `date` asks her\nout; accepted, it runs in a session of its own for its `duration`, and\nnothing else is sent to the persona's text sessions meanwhile. An accepted\n`shower_together`, `bath_together` or `sauna_together` starts a\n`showering_together` (30 minutes), `bathing_together` (30 minutes) or\n`sauna_together` (one hour) event, ending the incident under way; on a\ndate it starts none. Twelve more together actions do the same:\n`toilet_together` → `using_toilet_together`, `smoke_together` →\n`smoking_together`, `smoke_weed_together` → `smoking_weed_together` and\n`streak_together` → `streaking_together` (30 minutes each);\n`sex_together` → `having_sex_together`, `walk_together` →\n`walking_together`, `jog_together` → `jogging_together`, `yoga_together`\n→ `yoga_together`, `stargaze_together` → `stargazing_together`,\n`ride_horse_together` → `horse_riding_together` and `drink_together` →\n`drinking_together` (one hour each); `fall_asleep_together` →\n`asleep_together` (one to four hours, and she still answers). An accepted\n`smoke_together`, `smoke_weed_together` or `drink_together` also counts as\na `give` of one cigarette, herb or alcohol. `hot_spring_together` starts\n`hot_spring_together` (one hour) and `fight_together` starts\n`fighting_together` (one to two hours); a `fight_together` to a persona\nwhose `setting` is not `fantasy` is refused and costs nothing.\n`workout_together` → `working_out_together`, `swim_together` →\n`swimming_together` and `cycle_together` → `cycling_together` (one hour\neach); `hike_together` → `hiking_together` (two to three hours). A\n`cycle_together` to a persona whose `setting` is `fantasy` is refused and\ncosts nothing. Six more together actions start an event the same way:\n`dance_together` → `dancing_together`, `play_with_fire_together` →\n`playing_with_fire_together`, `sing_together` → `singing_together`,\n`skinny_dip_together` → `skinny_dipping_together` and\n`commit_crime_together` → `committing_crime_together` (one hour each);\n`adventure_together` → `adventuring_together` (two to three hours).\n`fish_together` → `fishing_together` (two to three hours) and\n`ride_horse_naked_together` → `naked_horse_riding_together` (one hour)\nstart an event the same way, as do `yoga_naked_together` →\n`naked_yoga_together` and `hot_spring_naked_together` →\n`naked_hot_spring_together` (one hour each) and `hike_naked_together` →\n`naked_hiking_together` (two to three hours). Only a `sex_together` is\nrefused before the judge for the pair's scopes, when they are not\nromance-compatible and the action does not say `ignore_orientation`; the\njudge decides every other together action. A `sex_together` may name the\nact (`name` or `name_base64`), say who leads (`active`) and what each side\nwears (`remain_clothing`); these shape her picture, and a read returns the\nact and custom clothing as base64. During her period a\n`sex_together`, or a together action that happens in water\n(`swim_together`, `hot_spring_together`, `sauna_together`,\n`shower_together`, `bath_together`, `skinny_dip_together`,\n`hot_spring_naked_together`), is refused two times in three before the\njudge, and that refusal costs nothing. `custom_together` asks her to do something with the user in the\nuser's own `text` (required): accepted, it starts a `custom_together`\nevent (one hour) whose `message_id` is the user's message, and nothing\nrules it out before the judge; refused, it costs chemistry.\n`propose` asks her to marry the user and starts no event: it\nis refused unless the pair is `dating`, `fwb` or `situationship`, and\naccepted, the pair is `engaged`. `break_up` ends the relationship and\nstarts no event: it is refused unless the pair's status is breakable\n(`dating`, `partner`, `fwb`, `situationship`, `engaged`); accepted, the\npair is `ex`, and refused, a cold war starts. On a BYOC instance no status\nmoves: `propose` is hers to answer and `break_up` is always refused. On a\ndate both act on the inviting session's relationship. `challenge` and `bet`\nask whether she takes the user up on it; no winner is decided and a\nrefusal costs nothing.",
+        "description": "An action the user does to the persona this turn, besides talking. The\npersona accepts or does not; a refusal costs the relationship one tier on\neach line the action touches (`give`, `gift`, the thrill actions\n`adventure_together`, `commit_crime_together`, `play_with_fire_together`\nand `fight_together`, and `jog_together`, `hike_together`,\n`fish_together`, `cycle_together` and `ride_horse_together` → bond;\n`streak_together`, `hike_naked_together`, `ride_horse_naked_together` and\na `sex_together` with a `name` → bond and chemistry; every other physical\nor custom action →\nchemistry); a refused `tip`, `bluff`, `threaten`, `trick`, `propose`, `break_up`,\n`challenge` or `bet` costs nothing.\nAn accepted `gift` joins the persona's items or wardrobe. A `date` asks her\nout; accepted, it runs in a session of its own for its `duration`, and\nnothing else is sent to the persona's text sessions meanwhile. An accepted\n`shower_together`, `bath_together` or `sauna_together` starts a\n`showering_together` (30 minutes), `bathing_together` (30 minutes) or\n`sauna_together` (one hour) event, ending the incident under way; on a\ndate it starts none. Twelve more together actions do the same:\n`toilet_together` → `using_toilet_together`, `smoke_together` →\n`smoking_together`, `smoke_weed_together` → `smoking_weed_together` and\n`streak_together` → `streaking_together` (30 minutes each);\n`sex_together` → `having_sex_together`, `walk_together` →\n`walking_together`, `jog_together` → `jogging_together`, `yoga_together`\n→ `yoga_together`, `stargaze_together` → `stargazing_together`,\n`ride_horse_together` → `horse_riding_together` and `drink_together` →\n`drinking_together` (one hour each); `fall_asleep_together` →\n`asleep_together` (one to four hours, and she still answers). An accepted\n`smoke_together`, `smoke_weed_together` or `drink_together` also counts as\na `give` of one cigarette, herb or alcohol. `hot_spring_together` starts\n`hot_spring_together` (one hour) and `fight_together` starts\n`fighting_together` (one to two hours); a `fight_together` to a persona\nwhose `setting` is not `fantasy` is refused and costs nothing.\n`workout_together` → `working_out_together`, `swim_together` →\n`swimming_together` and `cycle_together` → `cycling_together` (one hour\neach); `hike_together` → `hiking_together` (two to three hours). A\n`cycle_together` to a persona whose `setting` is `fantasy` is refused and\ncosts nothing. Six more together actions start an event the same way:\n`dance_together` → `dancing_together`, `play_with_fire_together` →\n`playing_with_fire_together`, `sing_together` → `singing_together`,\n`skinny_dip_together` → `skinny_dipping_together` and\n`commit_crime_together` → `committing_crime_together` (one hour each);\n`adventure_together` → `adventuring_together` (two to three hours).\n`fish_together` → `fishing_together` (two to three hours) and\n`ride_horse_naked_together` → `naked_horse_riding_together` (one hour)\nstart an event the same way, as do `yoga_naked_together` →\n`naked_yoga_together` and `hot_spring_naked_together` →\n`naked_hot_spring_together` (one hour each) and `hike_naked_together` →\n`naked_hiking_together` (two to three hours). Only a `sex_together` is\nrefused before the judge for the pair's scopes, when they are not\nromance-compatible and the action does not say `ignore_orientation`; the\njudge decides every other together action. A `sex_together` may name the\nact (`name` or `name_base64`), say who leads (`active`) and what each side\nwears (`remain_clothing`); these shape her picture, and a read returns the\nact and custom clothing as base64. During her period a\n`sex_together`, or a together action that happens in water\n(`swim_together`, `hot_spring_together`, `sauna_together`,\n`shower_together`, `bath_together`, `skinny_dip_together`,\n`hot_spring_naked_together`), is refused two times in three before the\njudge, and that refusal costs nothing. `custom_together` asks her to do something with the user in the\nuser's own `text` (required): accepted, it starts a `custom_together`\nevent (one hour) whose `message_id` is the user's message, and nothing\nrules it out before the judge; refused, it costs chemistry. An accepted\n`sex_together`'s `having_sex_together` event also has the user's message\nas its `message_id`.\n`propose` asks her to marry the user and starts no event: it\nis refused unless the pair is `dating`, `fwb` or `situationship`, and\naccepted, the pair is `engaged`. `break_up` ends the relationship and\nstarts no event: it is refused unless the pair's status is breakable\n(`dating`, `partner`, `fwb`, `situationship`, `engaged`); accepted, the\npair is `ex`, and refused, a cold war starts. On a BYOC instance no status\nmoves: `propose` is hers to answer and `break_up` is always refused. On a\ndate both act on the inviting session's relationship. `challenge` and `bet`\nask whether she takes the user up on it; no winner is decided and a\nrefusal costs nothing.",
         "required": [
           "type"
         ],
@@ -8839,7 +8844,7 @@
             }
           }
         ],
-        "description": "A user row's action as the history routes return it: the action fields as\nsent, plus the decided `response` once the turn has taken effect."
+        "description": "A user row's action as the history routes return it: the action fields as\nsent (a `sex_together`'s act and custom clothing always as base64), plus\nthe decided `response` once the turn has taken effect."
       },
       "UserInsightResponse": {
         "type": "object",

@@ -400,8 +400,8 @@ impl EventKind {
         EventKind::CustomTogether,
     ];
 
-    /// The kinds a chemistry drop ends while they are under way: the nude
-    /// kinds, whoever asked, so a row her accepted `bathe_together` or
+    /// The kinds a chemistry drop ends while they are under way: the naturism
+    /// kinds and the passion kind, whoever asked, so a row her accepted `bathe_together` or
     /// `sleep_together` ask placed ends too (spec 2026-11-26-more-together-
     /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md §6;
     /// spec 2026-11-27-together-action-groups-design.md §5.1). A test pins it

@@ -1108,9 +1108,9 @@ mod tests {
         assert!(!strip_ruled_out(&user_msg("hi")));
     }
 
-    /// No together action is ruled out before the judge for romance
-    /// compatibility any more: a shower, a bath and a sauna reach the judge on
-    /// any scopes (spec 2026-11-27-together-action-groups-design.md §5.1).
+    /// No naturism action is ruled out before the judge for romance
+    /// compatibility: a shower, a bath and a sauna reach the judge on any
+    /// scopes (spec 2026-11-27-together-action-groups-design.md §5.1).
     #[test]
     fn a_shower_or_a_bath_together_reaches_the_judge_on_any_scopes() {
         use crate::scope::{AffinityScope, MemoryScope};
@@ -1371,7 +1371,7 @@ mod tests {
     /// Spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
     /// custom-together-design.md §4: `skinny_dip_together` is rolled as
     /// `swim_together` is; its five siblings are neither rolled nor
-    /// world-bound. No together action is gated (spec 2026-11-27-together-
+    /// world-bound. No naturism action is gated (spec 2026-11-27-together-
     /// action-groups-design.md §5.1).
     #[test]
     fn skinny_dip_is_rolled_on_her_period() {

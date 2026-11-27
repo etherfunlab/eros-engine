@@ -3110,9 +3110,10 @@ fn build_pde_ctx(
     // 2026-10-28-outing-indulgence-needs-and-habits-design.md §3.1; a strip an
     // incompatible pair cannot have, spec 2026-11-08-strip-and-world-setting-
     // design.md §2.1; a machine's toilet together, spec 2026-11-23-twelve-
-    // together-actions-and-propose-design.md §4.1, §5 — no together action is
-    // ruled out for compatibility, spec 2026-11-27-together-action-groups-
-    // design.md §5.1;
+    // together-actions-and-propose-design.md §4.1, §5; a sex_together from an
+    // incompatible pair that does not ignore orientation, spec 2026-11-27-
+    // passion-group-design.md §4 — no naturism action is ruled out for
+    // compatibility;
     // sex or water her period's roll refused, spec 2026-11-24-period-cycle-
     // design.md §8; a date the gate turns down, spec 2026-11-12-activity-sub-
     // session-design.md §4.3; a proposal or break-up the status does not
@@ -5538,8 +5539,9 @@ pub(crate) fn run_stream_with(
         let strip_refused = pde::strip_ruled_out(&input.event);
         // So is a together action the persona cannot have: a machine's toilet
         // (spec 2026-11-23-twelve-together-actions-and-propose-design.md
-        // §4.1). None is ruled out for the pair's compatibility (spec
-        // 2026-11-27-together-action-groups-design.md §5.1).
+        // §4.1), and a sex_together from a pair that is not romance-compatible
+        // unless it ignores orientation (spec 2026-11-27-passion-group-
+        // design.md §4); no naturism action is.
         let together_refused = pde::together_ruled_out(&input.event, traits.machine);
         // A together action her world does not have, a fight in a modern
         // one or a cycle in a fantasy one (spec 2026-11-23-hot-spring-fight-
