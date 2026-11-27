@@ -704,6 +704,7 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
             None,
             None,
             Some(&event_lines),
+            false,
         )
         .await?
     } else {

@@ -1507,6 +1507,11 @@ pub(crate) async fn build_reply_request_with(
 /// what it shows of the relationship is its latest episodes. The caller adds
 /// the one user message: the driving line of a chat turn, or an event's cue
 /// (spec 2026-11-12-emotional-event-messages-design.md §4).
+///
+/// `erotic = true` builds the `erotic` tone's system prompt instead (spec
+/// 2026-11-27-erotic-tone-design.md §7): the same, plus the `[relationship]`
+/// block and the chemistry tier's line, read from `input.affinity` and the
+/// event's affinity scope.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_emotional_system_request(
     state: &AppState,
@@ -1518,21 +1523,30 @@ pub(crate) async fn build_emotional_system_request(
     body_state: Option<&str>,
     needs: Option<&str>,
     event: Option<&crate::prompt::EventLines>,
+    erotic: bool,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
-    let (quote, tier, requested_traits, memory_scope) = match &input.event {
+    let (quote, tier, requested_traits, memory_scope, affinity_scope) = match &input.event {
         Event::UserMessage {
             quote,
             tier,
             prompt_traits,
             memory_scope,
+            affinity_scope,
             ..
         } => (
             quote.as_ref(),
             tier.as_deref(),
             prompt_traits.as_slice(),
             *memory_scope,
+            *affinity_scope,
         ),
-        _ => (None, None, &[][..], MemoryScope::default()),
+        _ => (
+            None,
+            None,
+            &[][..],
+            MemoryScope::default(),
+            Default::default(),
+        ),
     };
 
     let resolved = state.model_config.resolve(CHAT_TASK, tier);
@@ -1580,21 +1594,41 @@ pub(crate) async fn build_emotional_system_request(
             })
     };
 
-    let system_prompt = crate::prompt::build_emotional_prompt(
-        &input.persona,
-        plan.reply_mode,
-        plan.clothing.as_deref(),
-        &kept_traits,
-        world.as_ref(),
-        stories.as_ref(),
-        quote,
-        character_state.as_ref(),
-        now,
-        body_state,
-        needs,
-        event,
-        shared_memories.as_deref(),
-    );
+    let system_prompt = if erotic {
+        crate::prompt::build_erotic_prompt(
+            &input.persona,
+            plan.reply_mode,
+            plan.clothing.as_deref(),
+            &kept_traits,
+            world.as_ref(),
+            stories.as_ref(),
+            quote,
+            character_state.as_ref(),
+            now,
+            body_state,
+            needs,
+            event,
+            shared_memories.as_deref(),
+            &input.affinity,
+            affinity_scope,
+        )
+    } else {
+        crate::prompt::build_emotional_prompt(
+            &input.persona,
+            plan.reply_mode,
+            plan.clothing.as_deref(),
+            &kept_traits,
+            world.as_ref(),
+            stories.as_ref(),
+            quote,
+            character_state.as_ref(),
+            now,
+            body_state,
+            needs,
+            event,
+            shared_memories.as_deref(),
+        )
+    };
 
     let injected_tags: Vec<String> = kept_traits.iter().map(|t| t.tag.clone()).collect();
     Ok((
@@ -1611,7 +1645,7 @@ pub(crate) async fn build_emotional_system_request(
 /// The reply request of an `emotional` turn (spec
 /// 2026-11-12-chat-tone-emotional-design.md §4): the system-only request of
 /// [`build_emotional_system_request`] and the driving user message, with no
-/// earlier row of the session.
+/// earlier row of the session. `erotic` is passed on to it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_emotional_reply_request(
     state: &AppState,
@@ -1625,6 +1659,7 @@ pub(crate) async fn build_emotional_reply_request(
     body_state: Option<&str>,
     needs: Option<&str>,
     event: Option<&crate::prompt::EventLines>,
+    erotic: bool,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let (mut req, injected_tags) = build_emotional_system_request(
         state,
@@ -1636,6 +1671,7 @@ pub(crate) async fn build_emotional_reply_request(
         body_state,
         needs,
         event,
+        erotic,
     )
     .await?;
     let (content, action) = match &input.event {
@@ -5459,6 +5495,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("build_emotional_reply_request succeeds");
@@ -5773,6 +5810,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("build_emotional_system_request succeeds");
@@ -5847,6 +5885,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("build_emotional_reply_request succeeds");
@@ -5948,5 +5987,261 @@ mod tests {
         .await;
         assert_eq!(req.messages.len(), 2, "{:?}", req.messages);
         assert_eq!(req.messages[1].content, "（伸手想摸你）在吗");
+    }
+
+    // ─── The erotic request (spec 2026-11-27-erotic-tone-design.md §7) ───
+
+    const EROTIC_TIER_4_LINE: &str = "- 你现在很想要对方：语气放软、放慢，带着勾人的意味";
+
+    /// A pair at chemistry tier 4 under the full scope, with a user action
+    /// when `action` names one. `erotic` is the builders' flag.
+    fn erotic_input(
+        session_id: Uuid,
+        owner: Uuid,
+        instance_id: Uuid,
+        driving: Uuid,
+        content: &str,
+        action: Option<eros_engine_core::types::UserAction>,
+    ) -> DecisionInput {
+        let mut affinity = ladder_test_affinity(session_id, owner, instance_id);
+        (affinity.intimacy, affinity.tension) = (0.7, 0.7);
+        assert_eq!(affinity.chem_tier(), 4);
+        DecisionInput {
+            event: Event::UserMessage {
+                content: content.into(),
+                message_id: driving,
+                prompt_traits: vec![],
+                audit: None,
+                tier: None,
+                memory_scope: MemoryScope::default(),
+                affinity_scope: eros_engine_core::scope::AffinityScope::full(),
+                quote: Default::default(),
+                action,
+                outfit: None,
+            },
+            affinity,
+            persona: ladder_test_persona(instance_id, owner),
+            signals: eros_engine_core::types::ConversationSignals {
+                message_count: 2,
+                hours_since_last_message: 0.1,
+                ghost_streak: 0,
+                hours_since_last_ghost: None,
+            },
+        }
+    }
+
+    fn erotic_plan(response: Option<eros_engine_core::types::ActionResponse>) -> ActionPlan {
+        ActionPlan {
+            action_type: eros_engine_core::types::ActionType::ReplyText,
+            reply_style: eros_engine_core::types::ReplyStyle::Neutral,
+            affinity_deltas: Default::default(),
+            energy_cost: 0.0,
+            context_hints: vec!["JUDGE-HINT".into()],
+            reply_mode: None,
+            nudges: Default::default(),
+            clothing: None,
+            image_caption: None,
+            image_ref: eros_engine_core::types::ImageRef::Face,
+            aspect_ratio: None,
+            action_response: response,
+            refusal_free: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn erotic_reply_request(
+        state: &AppState,
+        session_id: Uuid,
+        owner: Uuid,
+        instance_id: Uuid,
+        driving: Uuid,
+        content: &str,
+        action: Option<(
+            eros_engine_core::types::UserAction,
+            eros_engine_core::types::ActionResponse,
+        )>,
+        erotic: bool,
+    ) -> ChatRequest {
+        let (action, response) = action.unzip();
+        let input = erotic_input(session_id, owner, instance_id, driving, content, action);
+        let (req, _tags) = build_emotional_reply_request(
+            state,
+            &input,
+            &erotic_plan(response),
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            &crate::prompt::NowContext::default(),
+            None,
+            None,
+            None,
+            erotic,
+        )
+        .await
+        .expect("build_emotional_reply_request succeeds");
+        req
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_erotic_request_is_the_system_prompt_and_the_driving_line(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        emotional_row(&pool, session_id, "user", "早", 0.0, None).await;
+        emotional_row(&pool, session_id, "assistant", "早呀。", 1.0, None).await;
+        let driving = emotional_row(&pool, session_id, "user", "想你了", 2.0, None).await;
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let req = erotic_reply_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "想你了",
+            None,
+            true,
+        )
+        .await;
+
+        assert_eq!(req.messages.len(), 2, "{:?}", req.messages);
+        assert_eq!(req.messages[0].role, "system");
+        assert_eq!(req.messages[1].role, "user");
+        assert_eq!(req.messages[1].content, "想你了");
+        let system = &req.messages[0].content;
+        assert!(system.contains("[relationship]\n你是用户的"), "{system}");
+        assert!(
+            system.contains(&format!(
+                "[this_turn]（这一轮自然融入，别刻意）\n{EROTIC_TIER_4_LINE}"
+            )),
+            "{system}"
+        );
+        for gone in [
+            "早呀",
+            "[user_profile]",
+            "JUDGE-HINT",
+            "[inner_state]",
+            "[mood]",
+            "[feelings]",
+        ] {
+            assert!(!system.contains(gone), "{gone} must not render: {system}");
+        }
+        assert!(
+            system.contains("[reply_length]\n最多 1 句，不超过 40 字"),
+            "{system}"
+        );
+    }
+
+    /// The flag decides, not the affinity: the same warm pair under the same
+    /// scope gets the plain `emotional` request without it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_emotional_request_does_not_move(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let driving = emotional_row(&pool, session_id, "user", "今天好累", 0.0, None).await;
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let plain = emotional_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "今天好累",
+            MemoryScope::default(),
+        )
+        .await;
+        let off = erotic_reply_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "今天好累",
+            None,
+            false,
+        )
+        .await;
+        for gone in ["[relationship]", "[this_turn]", "很想要对方"] {
+            assert!(!off.messages[0].content.contains(gone), "{gone}");
+        }
+        assert_eq!(off.messages[0].content, plain.messages[0].content);
+        assert_eq!(off.messages[1].content, plain.messages[1].content);
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_erotic_action_request_keeps_user_action(pool: PgPool) {
+        use eros_engine_core::types::{ActionResponse, UserAction};
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let driving = emotional_row(
+            &pool,
+            session_id,
+            "user",
+            "",
+            0.0,
+            Some(serde_json::json!({"action": {"type": "sex_together"}})),
+        )
+        .await;
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let req = erotic_reply_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "",
+            Some((UserAction::sex_together(), ActionResponse::Accept)),
+            true,
+        )
+        .await;
+        assert_eq!(req.messages.len(), 2, "{:?}", req.messages);
+        assert_eq!(req.messages[1].content, "（想和你上床）");
+        let system = &req.messages[0].content;
+        assert!(system.contains("[user_action]\n"), "{system}");
+        assert!(system.contains(EROTIC_TIER_4_LINE), "{system}");
+        assert!(system.contains("[relationship]"), "{system}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_erotic_system_request_holds_the_system_message_alone(pool: PgPool) {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, owner).await;
+        let session_id = make_session(&pool, owner, Some(instance_id)).await;
+        let driving = emotional_row(&pool, session_id, "user", "想你了", 0.0, None).await;
+
+        let state = crate::routes::companion::test_state(pool.clone());
+        let full = erotic_reply_request(
+            &state,
+            session_id,
+            owner,
+            instance_id,
+            driving,
+            "想你了",
+            None,
+            true,
+        )
+        .await;
+        let input = erotic_input(session_id, owner, instance_id, driving, "想你了", None);
+        let (system_only, _tags) = build_emotional_system_request(
+            &state,
+            &input,
+            &erotic_plan(None),
+            owner,
+            instance_id,
+            &crate::prompt::NowContext::default(),
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("build_emotional_system_request succeeds");
+        assert_eq!(system_only.messages.len(), 1, "{:?}", system_only.messages);
+        assert_eq!(system_only.messages[0].content, full.messages[0].content);
     }
 }

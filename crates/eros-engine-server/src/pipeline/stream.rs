@@ -6880,6 +6880,7 @@ pub(crate) fn run_stream_with(
                         user_msg.user_message_id, &now_ctx,
                         body_state.as_deref(), needs_text.as_deref(),
                         Some(&event_lines),
+                        false,
                     ).await
                 } else if focused {
                     crate::pipeline::handlers::build_focused_reply_request(
