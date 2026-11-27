@@ -604,6 +604,28 @@ fn decide_tone(i: &ToneInputs, rolls: [f64; 3]) -> Option<eros_engine_core::tone
     decided.or(i.erotic_p.map(|_| Tone::Default))
 }
 
+/// The turn's tone with the two tones that come first (spec
+/// 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md §8):
+/// `mean` over `drowsy` over [`decide_tone`]'s three. `rolls` are the mean,
+/// the drowsy, the erotic, the emotional and the focused roll, each in
+/// `[0, 1)`; each chance is `None` when its roll is not made on this turn. A
+/// turn whose only rolls were lost `mean` or `drowsy` ones is `Default`.
+fn decide_turn_tone(
+    mean_p: Option<f64>,
+    drowsy_p: Option<f64>,
+    i: &ToneInputs,
+    rolls: [f64; 5],
+) -> Option<eros_engine_core::tone::Tone> {
+    use eros_engine_core::tone::{self, Tone};
+    if mean_p.is_some_and(|p| tone::won(p, rolls[0])) {
+        return Some(Tone::Mean);
+    }
+    if drowsy_p.is_some_and(|p| tone::won(p, rolls[1])) {
+        return Some(Tone::Drowsy);
+    }
+    decide_tone(i, [rolls[2], rolls[3], rolls[4]]).or(mean_p.or(drowsy_p).map(|_| Tone::Default))
+}
+
 /// [`drive_chat_burst`] for one group speaker: `speaker_session_id` is
 /// stamped on every assistant row the burst persists and on every `meta`
 /// frame it yields. `None` is the 1:1 burst. `tone` is the turn's drawn tone,
@@ -5942,7 +5964,37 @@ pub(crate) fn run_stream_with(
         } else {
             None
         };
-        let tone = decide_tone(
+        // The `mean` and the `drowsy` roll (spec
+        // 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+        // §6.1, §7.1, §8) come before the other three, on a text turn without
+        // a user action: `mean` while the cold war is on, `drowsy` when she
+        // just woke beside the user and no incident is under way. The
+        // just-woke read is made only on a turn that could roll `drowsy`.
+        let draws_first = plan.action_type.bears_text() && !action_turn;
+        let mean_p = draws_first
+            .then(|| {
+                eros_engine_core::tone::mean_probability(
+                    state.model_config.tone_mean_probability(),
+                    input.affinity.relationship.cold_war(),
+                )
+            })
+            .flatten();
+        let drowsy_key = state.model_config.tone_drowsy_probability();
+        let drowsy_p = if draws_first && drowsy_key > 0.0 && current.foreground.is_none() {
+            let just_woke = eros_engine_store::events::EventRepo { pool: &state.pool }
+                .just_woke(user_msg.session_id, user_msg.instance_id, current.at)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("stream: just-woke read failed: {e}");
+                    false
+                });
+            eros_engine_core::tone::drowsy_probability(drowsy_key, just_woke, None)
+        } else {
+            None
+        };
+        let tone = decide_turn_tone(
+            mean_p,
+            drowsy_p,
             &ToneInputs {
                 erotic_p,
                 listed_emotional: tone_on && listed_action,
@@ -5951,11 +6003,11 @@ pub(crate) fn run_stream_with(
             },
             rand::thread_rng().gen(),
         );
-        // An `erotic` turn is built on the `emotional` template, and whatever
-        // holds for an `emotional` turn holds for it.
+        // An `erotic` or a `drowsy` turn is built on the `emotional`
+        // template, a `mean` one on the `focused` template, and whatever
+        // holds for the template's own tone holds for it.
         let emotional = tone.is_some_and(|t| t.on_emotional_template());
-        let erotic = tone == Some(eros_engine_core::tone::Tone::Erotic);
-        let focused = tone == Some(eros_engine_core::tone::Tone::Focused);
+        let focused = tone.is_some_and(|t| t.on_focused_template());
         // An action turn rolls no dice: the action already fixes what the turn
         // is about (spec 2026-10-05 §5.2). Neither does an emotional turn: its
         // prompt carries no `[this_turn]`. A focused turn's `[this_turn]`
@@ -6971,11 +7023,7 @@ pub(crate) fn run_stream_with(
                         user_msg.user_message_id, &now_ctx,
                         body_state.as_deref(), needs_text.as_deref(),
                         Some(&event_lines),
-                        if erotic {
-                            eros_engine_core::tone::Tone::Erotic
-                        } else {
-                            eros_engine_core::tone::Tone::Emotional
-                        },
+                        tone.unwrap_or_default(),
                     ).await
                 } else if focused {
                     crate::pipeline::handlers::build_focused_reply_request(
@@ -6984,7 +7032,7 @@ pub(crate) fn run_stream_with(
                         user_msg.user_message_id, &now_ctx,
                         body_state.as_deref(), needs_text.as_deref(),
                         Some(&event_lines),
-                        eros_engine_core::tone::Tone::Focused,
+                        tone.unwrap_or_default(),
                     ).await
                 } else {
                     crate::pipeline::handlers::build_reply_request(
@@ -28423,6 +28471,12 @@ data: [DONE]\n\n"
         scope: Option<eros_engine_core::scope::AffinityScope>,
         sex_addict: Option<bool>,
         is_virgin: bool,
+        /// The session's cold war is on.
+        cold_war: bool,
+        /// An event of this kind, placed by the turn's own session, ended
+        /// this many seconds ago: after `EARLIER-REPLY` at 30, before it at
+        /// 90.
+        woke: Option<(eros_engine_core::events::EventKind, f64)>,
     }
 
     /// One 1:1 turn after an earlier exchange (`EARLIER-USER` /
@@ -28539,6 +28593,35 @@ data: [DONE]\n\n"
             .bind(user_id)
             .bind(instance_id)
             .bind(c)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        if scene.cold_war {
+            sqlx::query(
+                "INSERT INTO engine.companion_affinity \
+                   (session_id, user_id, instance_id, cold_war_since) \
+                 VALUES ($1, $2, $3, now()) \
+                 ON CONFLICT (session_id) DO UPDATE SET cold_war_since = now()",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .bind(instance_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        if let Some((kind, ended_secs_ago)) = scene.woke {
+            sqlx::query(
+                "INSERT INTO engine.persona_events \
+                   (instance_id, session_id, event_key, kind, started_at, ends_at) \
+                 VALUES ($1, $2, 'woke', $3, now() - interval '3 hours', \
+                         now() - make_interval(secs => $4))",
+            )
+            .bind(instance_id)
+            .bind(session_id)
+            .bind(kind.as_str())
+            .bind(ended_secs_ago)
             .execute(pool)
             .await
             .unwrap();
@@ -31437,6 +31520,393 @@ data: [DONE]\n\n"
         assert_eq!(d(false, Some(0.5), Some(0.5), lose), Some(Tone::Default));
         assert_eq!(d(false, None, Some(0.5), win), Some(Tone::Focused));
         assert_eq!(d(false, None, Some(0.5), lose), Some(Tone::Default));
+    }
+
+    // ── The `mean` and `drowsy` tones (spec
+    // 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+    // §6–§8) ──
+
+    /// `mean` over `drowsy` over the three older tones; the rolls are the
+    /// mean, the drowsy, the erotic, the emotional and the focused one.
+    #[test]
+    fn the_order_of_the_five_tones() {
+        use eros_engine_core::tone::Tone;
+        let all = tone_inputs(Some(1.0), false, Some(1.0), Some(1.0));
+        let win = [0.0; 5];
+        assert_eq!(
+            decide_turn_tone(Some(1.0), Some(1.0), &all, win),
+            Some(Tone::Mean)
+        );
+        let mean_lost = [0.5, 0.0, 0.0, 0.0, 0.0];
+        assert_eq!(
+            decide_turn_tone(Some(0.5), Some(1.0), &all, mean_lost),
+            Some(Tone::Drowsy)
+        );
+        let none = tone_inputs(None, false, None, None);
+        assert_eq!(
+            decide_turn_tone(Some(0.5), Some(0.5), &none, [0.5, 0.5, 0.0, 0.0, 0.0]),
+            Some(Tone::Default),
+            "only the two new rolls were made, and both lost"
+        );
+        assert_eq!(
+            decide_turn_tone(
+                Some(0.5),
+                None,
+                &tone_inputs(None, false, Some(1.0), Some(1.0)),
+                mean_lost
+            ),
+            Some(Tone::Emotional)
+        );
+        assert_eq!(
+            decide_turn_tone(
+                Some(0.5),
+                None,
+                &tone_inputs(None, false, None, Some(1.0)),
+                mean_lost
+            ),
+            Some(Tone::Focused)
+        );
+        assert_eq!(
+            decide_turn_tone(
+                None,
+                Some(0.5),
+                &tone_inputs(Some(0.125), false, None, None),
+                [0.0, 0.5, 0.0, 0.0, 0.0]
+            ),
+            Some(Tone::Erotic),
+            "a lost drowsy roll leaves the everyday erotic draw"
+        );
+        assert_eq!(decide_turn_tone(None, None, &none, win), None);
+        // Without the two new rolls the decision is `decide_tone`'s.
+        for rolls in [[0.9, 0.9, 0.1, 0.0, 0.0], [0.0, 0.0, 0.2, 0.99, 0.0]] {
+            assert_eq!(
+                decide_turn_tone(None, None, &all, rolls),
+                decide_tone(&all, [rolls[2], rolls[3], rolls[4]])
+            );
+        }
+    }
+
+    fn in_a_cold_war() -> ToneScene {
+        ToneScene {
+            cold_war: true,
+            ..ToneScene::default()
+        }
+    }
+
+    fn woke_from(kind: eros_engine_core::events::EventKind) -> ToneScene {
+        ToneScene {
+            woke: Some((kind, 30.0)),
+            ..ToneScene::default()
+        }
+    }
+
+    fn holds_a_mean_line(system: &str) -> bool {
+        [1, 3, 5]
+            .into_iter()
+            .any(|tier| system.contains(crate::prompt::mean_line(tier)))
+    }
+
+    fn holds_a_drowsy_line(system: &str) -> bool {
+        [1, 3, 5]
+            .into_iter()
+            .any(|tier| system.contains(crate::prompt::drowsy_line(tier)))
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_cold_war_turn_is_mean_and_keeps_its_history(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { mean = 1.0 }",
+            Some(plain_verdict()),
+            None,
+            false,
+            in_a_cold_war(),
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        assert!(
+            messages.len() > 2,
+            "a mean request keeps history: {messages:?}"
+        );
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(holds_a_mean_line(system), "{system}");
+        assert!(system.contains("你们正在冷战"), "{system}");
+        assert!(!system.contains(FOCUSED_WORK_LINE), "{system}");
+        assert_eq!(system.matches("[this_turn]").count(), 1, "{system}");
+        assert!(
+            system.contains("[reply_length]\n最多 1 句，不超过 40 字"),
+            "{system}"
+        );
+        assert!(!system.contains("[feelings]"), "{system}");
+        assert!(!system.contains("[emotional_context]"), "{system}");
+        let payload = tone_decision_payload(&pool, session_id).await;
+        assert!(
+            payload["nudges"].is_null(),
+            "no dice on a mean turn: {payload}"
+        );
+        assert_eq!(tone_reply_metadata(&pool, session_id).await["tone"], "mean");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn mean_comes_before_emotional_and_focused(pool: PgPool) {
+        let (_mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { emotional = 1.0, focused = 1.0, mean = 1.0 }",
+            None,
+            None,
+            false,
+            ToneScene {
+                cold_war: true,
+                ..at_temp_work()
+            },
+        )
+        .await;
+        assert_eq!(tone_reply_metadata(&pool, session_id).await["tone"], "mean");
+    }
+
+    /// No cold war, or a turn that carries a user action: no `mean` roll.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_outside_a_cold_war_or_with_an_action_is_not_mean(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { mean = 1.0 }",
+            None,
+            None,
+            false,
+            ToneScene::default(),
+        )
+        .await;
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "no roll, no key: {meta}");
+        let messages = tone_chat_messages(&mock).await;
+        assert!(!holds_a_mean_line(messages[0]["content"].as_str().unwrap()));
+
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { mean = 1.0 }",
+            None,
+            Some(eros_engine_core::types::UserAction::Touch),
+            false,
+            in_a_cold_war(),
+        )
+        .await;
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "an action turn: {meta}");
+        let messages = tone_chat_messages(&mock).await;
+        assert!(!holds_a_mean_line(messages[0]["content"].as_str().unwrap()));
+    }
+
+    /// With the key absent a cold-war turn rolls nothing and reads no line.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn without_the_mean_key_a_cold_war_turn_has_no_tone(pool: PgPool) {
+        let (mock, session_id) =
+            run_tone_turn_at(&pool, "", None, None, false, in_a_cold_war()).await;
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "{meta}");
+        let messages = tone_chat_messages(&mock).await;
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(!holds_a_mean_line(system), "{system}");
+        assert!(system.contains("你们正在冷战"), "{system}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_lost_mean_roll_records_the_default_tone(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { mean = 1e-12 }",
+            None,
+            None,
+            false,
+            in_a_cold_war(),
+        )
+        .await;
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "default"
+        );
+        let messages = tone_chat_messages(&mock).await;
+        assert!(!holds_a_mean_line(messages[0]["content"].as_str().unwrap()));
+    }
+
+    /// Her first reply after either kind ended is `drowsy`; that reply uses
+    /// the moment up. A session with no affinity row of its own making reads
+    /// the lowest band's line.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_turn_after_sleeping_together_is_drowsy(pool: PgPool) {
+        use eros_engine_core::events::EventKind::{AsleepTogether, HavingSexTogether};
+        for kind in [AsleepTogether, HavingSexTogether] {
+            let (mock, session_id) = run_tone_turn_at(
+                &pool,
+                "tones = { drowsy = 1.0 }",
+                Some(plain_verdict()),
+                None,
+                false,
+                woke_from(kind),
+            )
+            .await;
+            let messages = tone_chat_messages(&mock).await;
+            assert_eq!(messages.len(), 2, "{kind:?}: no history: {messages:?}");
+            let system = messages[0]["content"].as_str().unwrap();
+            assert!(
+                system.contains(crate::prompt::drowsy_line(1)),
+                "{kind:?}: {system}"
+            );
+            assert!(!system.contains("EARLIER-"), "{kind:?}: {system}");
+            assert!(!system.contains("[user_profile]"), "{kind:?}: {system}");
+            assert_eq!(system.matches("[this_turn]").count(), 1, "{system}");
+            assert_eq!(
+                tone_reply_metadata(&pool, session_id).await["tone"],
+                "drowsy",
+                "{kind:?}"
+            );
+            let instance_id: Uuid =
+                sqlx::query_scalar("SELECT instance_id FROM engine.chat_sessions WHERE id = $1")
+                    .bind(session_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(
+                !eros_engine_store::events::EventRepo { pool: &pool }
+                    .just_woke(session_id, instance_id, chrono::Utc::now())
+                    .await
+                    .unwrap(),
+                "{kind:?}: her reply used the moment up"
+            );
+        }
+    }
+
+    /// The line follows the chemistry tier, and the prompt says who the user
+    /// is to her.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_drowsy_turn_reads_the_relationship_and_its_tier_s_line(pool: PgPool) {
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { drowsy = 1.0 }",
+            None,
+            None,
+            false,
+            ToneScene {
+                chemistry: Some(0.95),
+                scope: Some(eros_engine_core::scope::AffinityScope::full()),
+                ..woke_from(eros_engine_core::events::EventKind::AsleepTogether)
+            },
+        )
+        .await;
+        let messages = tone_chat_messages(&mock).await;
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains(crate::prompt::drowsy_line(5)), "{system}");
+        assert!(system.contains("[relationship]"), "{system}");
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "drowsy"
+        );
+    }
+
+    /// Still asleep, her line already said, another incident under way, or a
+    /// turn that carries an action: no `drowsy` roll.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn drowsy_needs_the_moment(pool: PgPool) {
+        use eros_engine_core::events::EventKind::AsleepTogether;
+        let asleep = ToneScene {
+            foreground: Some(AsleepTogether),
+            ..ToneScene::default()
+        };
+        let already_said = ToneScene {
+            woke: Some((AsleepTogether, 90.0)),
+            ..ToneScene::default()
+        };
+        let busy = ToneScene {
+            woke: Some((AsleepTogether, 30.0)),
+            ..at_temp_work()
+        };
+        for (name, scene, action) in [
+            ("asleep", asleep, None),
+            ("already said", already_said, None),
+            ("busy", busy, None),
+            (
+                "an action",
+                woke_from(AsleepTogether),
+                Some(eros_engine_core::types::UserAction::Touch),
+            ),
+        ] {
+            let (mock, session_id) = run_tone_turn_at(
+                &pool,
+                "tones = { drowsy = 1.0 }",
+                None,
+                action,
+                false,
+                scene,
+            )
+            .await;
+            let meta = tone_reply_metadata(&pool, session_id).await;
+            assert!(meta.get("tone").is_none(), "{name}: {meta}");
+            let messages = tone_chat_messages(&mock).await;
+            assert!(
+                !holds_a_drowsy_line(messages[0]["content"].as_str().unwrap()),
+                "{name}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_lost_drowsy_roll_records_the_default_tone(pool: PgPool) {
+        let (_mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { drowsy = 1e-12 }",
+            None,
+            None,
+            false,
+            woke_from(eros_engine_core::events::EventKind::AsleepTogether),
+        )
+        .await;
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "default"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn mean_comes_before_drowsy(pool: PgPool) {
+        let (_mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { mean = 1.0, drowsy = 1.0 }",
+            None,
+            None,
+            false,
+            ToneScene {
+                cold_war: true,
+                ..woke_from(eros_engine_core::events::EventKind::AsleepTogether)
+            },
+        )
+        .await;
+        assert_eq!(tone_reply_metadata(&pool, session_id).await["tone"], "mean");
+    }
+
+    /// A date's turns read the inviting session's affinity row, so a date
+    /// held during a cold war rolls `mean` as the main chat does.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_date_turn_in_a_cold_war_is_mean(pool: PgPool) {
+        let mut s = date_scene(&pool, reply_text_verdict(), "").await;
+        s.state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\ntones = { mean = 1.0 }\n\
+                 [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n",
+            )
+            .unwrap(),
+        );
+        sqlx::query(
+            "UPDATE engine.companion_affinity SET cold_war_since = now() WHERE session_id = $1",
+        )
+        .bind(s.parent)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        s.send(1, serde_json::json!({"content": "到了！"})).await;
+
+        let system = system_prompt_of(&companion_requests(&s.mock).await[0]);
+        assert!(holds_a_mean_line(&system), "{system}");
+        assert_eq!(tone_reply_metadata(&pool, s.sub()).await["tone"], "mean");
     }
 
     // ── The passion attribute, dancing and massage (spec
