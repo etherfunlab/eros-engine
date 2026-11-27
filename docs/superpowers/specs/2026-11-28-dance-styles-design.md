@@ -1,12 +1,12 @@
-# Dance styles and the `dance` card key — Design
+# Dance styles and the taste keys `dance`, `naturism`, `risky` — Design
 
 - **Date:** 2026-11-28
 - **Status:** Approved
 - **Type:** Engine change. No migration. Wire change, additive: an
   optional `style` on three action types (`ask_dancing`, `dance_together`,
-  `dance_naked_together`), with `name` when the style is `custom`. One new
-  `art_metadata` key (`dance`), without effect when absent, listed by
-  character card 1.2. No new route, frame, event kind or config key.
+  `dance_naked_together`), with `name` when the style is `custom`. Three new
+  `art_metadata` keys (`dance`, `naturism`, `risky`), each without effect
+  when absent, listed by character card 1.2. No new route, frame, event kind or config key.
 - **Owner:** enriquephl (sole dev)
 - **Builds on:** `2026-11-19-vehicles-actions-species-design.md` §4
   (`ask_dancing`),
@@ -24,8 +24,9 @@ The user can say which dance. Today the three dance actions say only that
 there is a dance; with a style she, the judge and the picture know it is a
 tango, a ballet or a pole dance.
 
-And a persona can love dancing or dislike it: a card key that makes her
-take a dance more readily, or turn it down more often.
+And a persona can love or dislike three kinds of things: dancing, being
+naked with the user, taking risks. Each is a card key that makes her take
+such an action more readily, or turn it down more often.
 
 ## 2. Goals, non-goals, anti-goals
 
@@ -37,9 +38,9 @@ take a dance more readily, or turn it down more often.
   judge's `[用户动作]` line, her reply's action context, the event's line
   while it lasts, the picture's state, the history routes.
 - An action without a style reads, behaves and is stored exactly as today.
-- `art_metadata.dance` set to `love` makes her accept an `ask_dancing` or
-  a `dance_together` two times in three before the judge is asked; set to
-  `dislike`, refuse it two times in three (§7).
+- `art_metadata.dance`, `naturism` and `risky` set to `love` make her
+  accept an action of their kind two times in three before the judge is
+  asked; set to `dislike`, refuse it two times in three (§7).
 
 **Non-goals.**
 
@@ -48,9 +49,10 @@ take a dance more readily, or turn it down more often.
   the judge decides as it does today, with the style in front of it.
   *(Owner's ruling: wording only.)*
 - The `dance` key on `dance_naked_together`: whether she takes that one
-  turns on more than a love of dancing. *(Owner's ruling.)*
-- The `dance` key in the judge's `[角色人格]` block, in any prompt, or in
-  a life event's draw.
+  turns on more than a love of dancing; `naturism` reads it. *(Owner's
+  ruling.)*
+- The three keys in the judge's `[角色人格]` block, in any prompt, or in a
+  life event's draw.
 - `ask_for_dance`. It stays removed; a stored one still reads as a
   `dance_together` without a style.
 - A change to what the three actions do: their gates, their events and
@@ -64,7 +66,7 @@ take a dance more readily, or turn it down more often.
 
 - A second list of the styles or of their words: one enum with its words
   in `eros-engine-core`, beside the tier labels' words.
-- A second list of the actions the `dance` key rolls on: one function in
+- A second list of which action reads which key: one function in
   `eros-engine-core`.
 - A user-written name reaching a prompt unquoted.
 
@@ -161,20 +163,29 @@ dance kinds. Once that message is gone the event reads without a style.
 An accepted `ask_dancing` places no event; its picture reads the style
 from the action's phrase, as it reads the request today.
 
-## 7. The `dance` card key
+## 7. The taste keys
 
-`art_metadata.dance` is `"love"`, `"neutral"` or `"dislike"`; absent or
-any other value reads as `neutral`, as `outdoorsy` is read. Character card
-1.2, which this release introduces, lists it with the four keys of
+`art_metadata.dance`, `naturism` and `risky` are each `"love"`,
+`"neutral"` or `"dislike"`; absent or any other value reads as `neutral`,
+as `outdoorsy` is read. Character card 1.2, which this release
+introduces, lists them with the four keys of
 `2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md`.
+*(Owner's ruling: the three values, `dislike` spelled so.)*
 
-On a 1:1 turn whose action is `ask_dancing` or `dance_together`, with or
-without a style, the engine rolls once before the judge runs, unless a
-rule that refuses before the judge already refused the action. The
-`dislike` side is the habit roll of a `give` (the same one in three, the
-same forced refusal); the `love` side is its mirror:
+| key | the actions it reads |
+|---|---|
+| `dance` | `ask_dancing`, `dance_together`, with or without a style |
+| `naturism` | every naturism-group together action, `dance_naked_together` included |
+| `risky` | every thrill-group together action, and `bet` |
 
-| `dance` | the roll | then |
+On a 1:1 turn whose action one of the keys reads, the engine rolls once
+before the judge runs, unless a rule that refuses before the judge
+already refused the action (a fight outside a fantasy world, a water
+action during her period, and the rest). The `dislike` side is the habit
+roll of a `give` (the same one in three, the same forced refusal); the
+`love` side is its mirror:
+
+| the key | the roll | then |
 |---|---|---|
 | `love` | 2 times in 3 she takes it | the judge's `[用户动作]` line ends 「，这次你会答应」 and the response in effect is `accept`, whatever the judge answers |
 | `love` | 1 time in 3 | the turn goes on as usual: the judge decides |
@@ -185,14 +196,13 @@ same forced refusal); the `love` side is its mirror:
 The line states the outcome, not a reason, and the judge writes its
 `inner_state` for it. From there the turn is an ordinary accept or
 refusal: an accept places the event and shows the picture as any accept
-does; a refusal costs what a refusal of that action costs today and
-places nothing. The judge's own answer stays in its audit payload. A
-re-driven turn rolls again, as the judge decides again.
+does; a refusal costs what a refusal of that action costs today (a bet's
+costs nothing) and places nothing. The judge's own answer stays in its
+audit payload. A re-driven turn rolls again, as the judge decides again.
 
-The key is read from the card wherever the persona's other action rules
-are, a BYOC instance included. *(Owner's rulings: the roll before the
-judge, two in three each way, the two actions. Engine's calls: the three
-values, that a rolled refusal costs as any refusal, and the two endings.)*
+*(Owner's rulings: the roll before the judge, two in three each way, the
+actions each key reads. Engine's calls: that a rolled refusal costs as
+any refusal, and the two endings.)*
 
 ## 7.1 What changes for a live user
 
@@ -211,12 +221,11 @@ Nothing until a client sends `style` or a card sets `dance`.
   every style; a style-less action and event are byte-identical to today.
 - `eros-engine-store`: the event reads return the style of a dance event
   and none for any other kind or once the message is gone.
-- `eros-engine-core`: the `dance` roll: `love` accepts below two thirds
-  and leaves the rest to the judge, `dislike` refuses from one third up,
-  `neutral` never rolls; it rolls on `ask_dancing` and `dance_together`,
-  with and without a style, and on no other action, `dance_naked_together`
-  included.
-- `eros-engine-server`, prompt: `dance` reads its three values, and
+- `eros-engine-core`: the taste roll: `love` accepts below two thirds and
+  leaves the rest to the judge, `dislike` refuses from one third up,
+  `neutral` never rolls; each action reads its own key and no other;
+  actions no key reads never roll.
+- `eros-engine-server`, prompt: each key reads its three values, and
   anything else as `neutral`.
 - `eros-engine-server`, turn: a rolled accept ends the judge's line with
   「，这次你会答应」 and is `accept` although the judge answered `refuse`;
@@ -244,14 +253,15 @@ Nothing until a client sends `style` or a card sets `dance`.
 Owner's rulings: all three live dance actions take a style;
 `ask_for_dance` stays removed; a style is wording only; the 23 styles and
 `custom`; the style folded into the sentence; `oriental` is East Asian
-traditional dance; 古雅 is `courtly`, 宫廷舞; the `dance` key has three
-levels, rolls before the judge two in three each way, and leaves
-`dance_naked_together` alone.
+traditional dance; 古雅 is `courtly`, 宫廷舞; the three taste keys have
+three levels (`love` / `neutral` / `dislike`), roll before the judge two
+in three each way; `dance` reads the two clothed dances, `naturism` the
+naturism group, `risky` the thrill group and `bet`.
 
 Engine's calls, open to reversal: the keys and the words of §4; `custom`
 plus `name` as the request's shape, with the 32-character bound; plain
-text for the name; no outfit rule; the `dance` key's three values, its
-two endings, and that a rolled refusal costs as any refusal.
+text for the name; no outfit rule; the two endings, and that a rolled
+refusal costs as any refusal.
 
 ## 11. Left to the builder
 

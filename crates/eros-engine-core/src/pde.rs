@@ -66,33 +66,52 @@ pub fn refuses_give(event: &Event, habits: Habits, roll: f64) -> bool {
     }
 }
 
-/// How often a persona who loves dancing takes a dance before the judge is
-/// asked (spec 2026-11-28-dance-styles-design.md §7).
-pub const DANCE_LOVER_ACCEPT: f64 = 2.0 / 3.0;
+/// How often a persona who loves what an action is takes it before the
+/// judge is asked (spec 2026-11-28-dance-styles-design.md §7).
+pub const LOVER_ACCEPT: f64 = 2.0 / 3.0;
 
-/// The dance roll (spec 2026-11-28-dance-styles-design.md §7), made before
-/// the judge on an `ask_dancing` or a `dance_together`, with or without a
-/// style: a persona who loves dancing accepts when `roll` (uniform in
-/// [0, 1)) is below `DANCE_LOVER_ACCEPT`; one who dislikes it refuses as the
-/// habit roll does, when `roll` is at or above `UNUSED_SUBSTANCE_ACCEPT`.
-/// `None` leaves the turn to the judge: the rest of each roll, a neutral
-/// persona, and every other action, `dance_naked_together` included.
-pub fn dance_roll(
+/// The card key an action reads in the taste roll: `dance` for an
+/// `ask_dancing` or a `dance_together`, `naturism` for a naturism-group
+/// together action (the naked dance included), `risky` for a thrill-group
+/// together action and a `bet`. `None` for every other action.
+fn taste_of(
+    action: &UserAction,
+    persona: &crate::events::PersonaTraits,
+) -> Option<crate::events::Taste> {
+    use crate::events::TogetherGroup;
+    match action {
+        UserAction::AskDancing { .. } | UserAction::DanceTogether { .. } => Some(persona.dance),
+        UserAction::Bet => Some(persona.risky),
+        a => match a.together_group()? {
+            TogetherGroup::Nude => Some(persona.naturism),
+            TogetherGroup::Thrill => Some(persona.risky),
+            _ => None,
+        },
+    }
+}
+
+/// The taste roll (spec 2026-11-28-dance-styles-design.md §7), made before
+/// the judge on an action one of the persona's taste keys reads (`taste_of`):
+/// a persona who loves it accepts when `roll` (uniform in [0, 1)) is below
+/// `LOVER_ACCEPT`; one who dislikes it refuses as the habit roll does, when
+/// `roll` is at or above `UNUSED_SUBSTANCE_ACCEPT`. `None` leaves the turn to
+/// the judge: the rest of each roll, a neutral key, and every other action.
+pub fn taste_roll(
     event: &Event,
-    taste: crate::events::DanceTaste,
+    persona: &crate::events::PersonaTraits,
     roll: f64,
 ) -> Option<ActionResponse> {
-    use crate::events::DanceTaste;
+    use crate::events::Taste;
     let Event::UserMessage {
-        action: Some(UserAction::AskDancing { .. } | UserAction::DanceTogether { .. }),
+        action: Some(action),
         ..
     } = event
     else {
         return None;
     };
-    match taste {
-        DanceTaste::Love if roll < DANCE_LOVER_ACCEPT => Some(ActionResponse::Accept),
-        DanceTaste::Dislike if roll >= UNUSED_SUBSTANCE_ACCEPT => Some(ActionResponse::Refuse),
+    match taste_of(action, persona)? {
+        Taste::Love if roll < LOVER_ACCEPT => Some(ActionResponse::Accept),
+        Taste::Dislike if roll >= UNUSED_SUBSTANCE_ACCEPT => Some(ActionResponse::Refuse),
         _ => None,
     }
 }
@@ -1772,49 +1791,107 @@ mod tests {
         }
     }
 
-    /// Spec 2026-11-28-dance-styles-design.md §7.
+    /// Spec 2026-11-28-dance-styles-design.md §7: one roll, three keys.
     #[test]
-    fn the_dance_roll() {
-        use crate::events::DanceTaste::{Dislike, Love, Neutral};
+    fn the_taste_roll() {
+        use crate::events::{PersonaTraits, Taste, Taste::*};
         use crate::types::{ActionResponse::*, DanceStyle, GivenItem};
-        let styled = UserAction::DanceTogether {
-            style: Some(DanceStyle::Tango),
-            name: None,
+        let with = |dance: Taste, naturism: Taste, risky: Taste| PersonaTraits {
+            dance,
+            naturism,
+            risky,
+            ..PersonaTraits::default()
         };
-        for a in [
-            UserAction::ask_dancing(),
-            UserAction::dance_together(),
-            styled,
-        ] {
+        // Each action reads its own key and no other.
+        type Keyed = fn(Taste) -> PersonaTraits;
+        let cases: [(UserAction, Keyed); 9] = [
+            (UserAction::ask_dancing(), |t| PersonaTraits {
+                dance: t,
+                ..PersonaTraits::default()
+            }),
+            (UserAction::dance_together(), |t| PersonaTraits {
+                dance: t,
+                ..PersonaTraits::default()
+            }),
+            (
+                UserAction::DanceTogether {
+                    style: Some(DanceStyle::Tango),
+                    name: None,
+                },
+                |t| PersonaTraits {
+                    dance: t,
+                    ..PersonaTraits::default()
+                },
+            ),
+            (UserAction::dance_naked_together(), |t| PersonaTraits {
+                naturism: t,
+                ..PersonaTraits::default()
+            }),
+            (UserAction::YogaNakedTogether, |t| PersonaTraits {
+                naturism: t,
+                ..PersonaTraits::default()
+            }),
+            (UserAction::StreakTogether, |t| PersonaTraits {
+                naturism: t,
+                ..PersonaTraits::default()
+            }),
+            (UserAction::AdventureTogether, |t| PersonaTraits {
+                risky: t,
+                ..PersonaTraits::default()
+            }),
+            (UserAction::CommitCrimeTogether, |t| PersonaTraits {
+                risky: t,
+                ..PersonaTraits::default()
+            }),
+            (UserAction::Bet, |t| PersonaTraits {
+                risky: t,
+                ..PersonaTraits::default()
+            }),
+        ];
+        for (a, persona) in cases {
             let e = action_msg(a.clone());
-            assert_eq!(dance_roll(&e, Love, 0.0), Some(Accept), "{a:?}");
+            assert_eq!(taste_roll(&e, &persona(Love), 0.0), Some(Accept), "{a:?}");
             assert_eq!(
-                dance_roll(&e, Love, DANCE_LOVER_ACCEPT - 1e-9),
+                taste_roll(&e, &persona(Love), LOVER_ACCEPT - 1e-9),
                 Some(Accept),
                 "{a:?}"
             );
-            assert_eq!(dance_roll(&e, Love, DANCE_LOVER_ACCEPT), None, "{a:?}");
-            assert_eq!(dance_roll(&e, Love, 0.99), None, "{a:?}");
+            assert_eq!(taste_roll(&e, &persona(Love), LOVER_ACCEPT), None, "{a:?}");
             assert_eq!(
-                dance_roll(&e, Dislike, UNUSED_SUBSTANCE_ACCEPT - 1e-9),
+                taste_roll(&e, &persona(Dislike), UNUSED_SUBSTANCE_ACCEPT - 1e-9),
                 None,
                 "{a:?}"
             );
             assert_eq!(
-                dance_roll(&e, Dislike, UNUSED_SUBSTANCE_ACCEPT),
+                taste_roll(&e, &persona(Dislike), UNUSED_SUBSTANCE_ACCEPT),
                 Some(Refuse),
                 "{a:?}"
             );
-            assert_eq!(dance_roll(&e, Dislike, 0.99), Some(Refuse), "{a:?}");
-            for roll in [0.0, 0.5, 0.99] {
-                assert_eq!(dance_roll(&e, Neutral, roll), None, "{a:?}");
+            for roll in [0.0, 0.99] {
+                assert_eq!(taste_roll(&e, &persona(Neutral), roll), None, "{a:?}");
+            }
+            // The other two keys at their strongest change nothing.
+            let others = match persona(Love) {
+                p if p.dance == Love => with(Neutral, Love, Love),
+                p if p.naturism == Love => with(Love, Neutral, Love),
+                _ => with(Love, Love, Neutral),
+            };
+            for roll in [0.0, 0.99] {
+                assert_eq!(
+                    taste_roll(&e, &others, roll),
+                    None,
+                    "{a:?} reads only its key"
+                );
             }
         }
-        assert!((DANCE_LOVER_ACCEPT - 2.0 / 3.0).abs() < 1e-12);
+        assert!((LOVER_ACCEPT - 2.0 / 3.0).abs() < 1e-12);
+        let all_love = with(Love, Love, Love);
+        let all_dislike = with(Dislike, Dislike, Dislike);
         for a in [
-            UserAction::dance_naked_together(),
             UserAction::Kiss,
+            UserAction::Challenge,
             UserAction::JogTogether,
+            UserAction::sex_together(),
             UserAction::Give {
                 item: GivenItem::Food,
                 name: None,
@@ -1822,9 +1899,9 @@ mod tests {
             },
         ] {
             let e = action_msg(a.clone());
-            for taste in [Love, Dislike] {
+            for p in [&all_love, &all_dislike] {
                 for roll in [0.0, 0.99] {
-                    assert_eq!(dance_roll(&e, taste, roll), None, "{a:?} {taste:?}");
+                    assert_eq!(taste_roll(&e, p, roll), None, "{a:?}");
                 }
             }
         }

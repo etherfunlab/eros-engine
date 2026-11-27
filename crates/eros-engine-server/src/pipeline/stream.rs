@@ -2987,6 +2987,15 @@ fn apply_forced_refusal(plan: &mut eros_engine_core::types::ActionPlan, refused:
     }
 }
 
+/// An action the taste roll took before the judge (a dance, a naturism or a
+/// thrill action, a bet she loves; spec 2026-11-28-dance-styles-design.md
+/// §7) is accepted, whatever the judge or the rule engine settled on.
+fn apply_forced_accept(plan: &mut eros_engine_core::types::ActionPlan, accepted: bool) {
+    if accepted && plan.action_response.is_some() {
+        plan.action_response = Some(eros_engine_core::types::ActionResponse::Accept);
+    }
+}
+
 /// What an accepted turn has her take: the item of a `give`, or of a habit
 /// action (spec 2026-11-23-twelve-together-actions-and-propose-design.md §5);
 /// `None` on a refusal and on any other turn.
@@ -3070,6 +3079,8 @@ async fn store_action_response(
 }
 
 /// Build the judge's user payload from the shared transcript + the decision input.
+/// `refused_before_judge` is [`build_pde_ctx_decided`]'s `decided` of a refusal.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_pde_ctx(
     t: &JudgeTranscript,
@@ -3080,6 +3091,33 @@ fn build_pde_ctx(
     needs: Option<&eros_engine_core::needs::Needs>,
     event: Option<&str>,
     refused_before_judge: bool,
+) -> String {
+    build_pde_ctx_decided(
+        t,
+        input,
+        image_available,
+        product_qa_recent,
+        body_state,
+        needs,
+        event,
+        refused_before_judge.then_some(eros_engine_core::types::ActionResponse::Refuse),
+    )
+}
+
+/// [`build_pde_ctx`] with the response a rule decided before the judge, if
+/// any: the `[用户动作]` line ends with the outcome, so the judge writes for
+/// it (spec 2026-10-28 §3.1; a dance a lover takes, spec
+/// 2026-11-28-dance-styles-design.md §7).
+#[allow(clippy::too_many_arguments)]
+fn build_pde_ctx_decided(
+    t: &JudgeTranscript,
+    input: &eros_engine_core::types::DecisionInput,
+    image_available: bool,
+    product_qa_recent: Option<&str>,
+    body_state: Option<&str>,
+    needs: Option<&eros_engine_core::needs::Needs>,
+    event: Option<&str>,
+    decided: Option<eros_engine_core::types::ActionResponse>,
 ) -> String {
     let a = &input.affinity;
     let s = &input.signals;
@@ -3211,17 +3249,20 @@ fn build_pde_ctx(
             crate::prompt::social_outcomes(a)
                 .map(|(yes, no)| format!("（accept：{yes}；refuse：{no}）"))
                 .unwrap_or_default(),
-            match (refused_before_judge, a) {
-                (false, _) => "",
-                (true, eros_engine_core::types::UserAction::Strip) => "，这次你不会让对方这样做",
+            match (decided, a) {
+                (None, _) => "",
+                (Some(eros_engine_core::types::ActionResponse::Accept), _) => "，这次你会答应",
+                (_, eros_engine_core::types::UserAction::Strip) => "，这次你不会让对方这样做",
                 (
-                    true,
-                    eros_engine_core::types::UserAction::Date { .. }
+                    _,
+                    eros_engine_core::types::UserAction::AskDancing { .. }
+                    | eros_engine_core::types::UserAction::Bet
+                    | eros_engine_core::types::UserAction::Date { .. }
                     | eros_engine_core::types::UserAction::Propose
                     | eros_engine_core::types::UserAction::BreakUp,
                 ) => "，这次你不会答应",
-                (true, a) if a.together_kind().is_some() || a.is_passion() => "，这次你不会答应",
-                (true, _) => "，这次你不会收下",
+                (_, a) if a.together_kind().is_some() || a.is_passion() => "，这次你不会答应",
+                (_, _) => "，这次你不会收下",
             }
         ),
         _ => String::new(),
@@ -5682,17 +5723,33 @@ pub(crate) fn run_stream_with(
         // BYOC instance, nor when the gate refused, so a status that moved
         // after this read cannot turn that refusal into a cold war.
         let status_session = (genome && !status_refused).then_some(turn.relationship);
-        let refused_before_judge = give_refused
+        let refused_by_rule = give_refused
             || strip_refused
             || together_refused
             || world_refused
             || period_refused
             || date_refused
             || status_refused;
+        // The taste roll (spec 2026-11-28-dance-styles-design.md §7): only
+        // when no rule above refused. A persona who dislikes what the action
+        // is (`dance`, `naturism`, `risky`) refuses as the habit roll does;
+        // one who loves it accepts.
+        let taste_roll = (!refused_by_rule)
+            .then(|| pde::taste_roll(&input.event, &traits, rand::thread_rng().gen()))
+            .flatten();
+        let refused_before_judge = refused_by_rule
+            || taste_roll == Some(eros_engine_core::types::ActionResponse::Refuse);
+        let accepted_before_judge =
+            taste_roll == Some(eros_engine_core::types::ActionResponse::Accept);
+        let decided_before_judge = if refused_before_judge {
+            Some(eros_engine_core::types::ActionResponse::Refuse)
+        } else {
+            taste_roll
+        };
         let (mut plan, pde_run): (eros_engine_core::types::ActionPlan, Option<PdeDecisionRun>) =
             match resolved_pde.as_ref() {
                 Some(p) => {
-                    let ctx = build_pde_ctx(
+                    let ctx = build_pde_ctx_decided(
                         &pde_transcript,
                         &input,
                         image_executor_available,
@@ -5700,7 +5757,7 @@ pub(crate) fn run_stream_with(
                         body_state.as_deref(),
                         prior_needs.as_ref(),
                         event_judge.as_deref(),
-                        refused_before_judge,
+                        decided_before_judge,
                     );
                     // Read receipt (migration 0053): the judge is the first
                     // generative model to see this message, so this is the
@@ -5796,6 +5853,7 @@ pub(crate) fn run_stream_with(
         // An action refused before the judge is refused before anything reads
         // the response.
         apply_forced_refusal(&mut plan, refused_before_judge);
+        apply_forced_accept(&mut plan, accepted_before_judge);
 
         // A photo she let the user take, a strip she let happen, a dance or a
         // together action she accepted comes back as her picture after her
@@ -32105,5 +32163,302 @@ data: [DONE]\n\n"
             assert!(payload.contains(label), "{a:?}: {payload}");
             assert_eq!(clothing == "什么都没穿", naked, "{a:?}: {clothing}");
         }
+    }
+
+    // ── The dance roll and dance styles on the turn (spec
+    // 2026-11-28-dance-styles-design.md §6, §7) ──
+
+    #[test]
+    fn apply_forced_accept_turns_only_a_refusal() {
+        use eros_engine_core::types::ActionResponse::{Accept, Refuse};
+        let mut plan = pde::decide(&fixture_decision_input());
+        for (before, accepted, after) in [
+            (Some(Refuse), true, Some(Accept)),
+            (Some(Refuse), false, Some(Refuse)),
+            (Some(Accept), true, Some(Accept)),
+            (None, true, None),
+        ] {
+            plan.action_response = before;
+            apply_forced_accept(&mut plan, accepted);
+            assert_eq!(plan.action_response, after, "{before:?} {accepted}");
+        }
+    }
+
+    #[test]
+    fn the_judge_line_of_a_dance_decided_before_the_judge() {
+        use eros_engine_core::types::{ActionResponse, DanceStyle, Event, UserAction};
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        let mut line = |a: UserAction, decided: Option<ActionResponse>| {
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a);
+            }
+            build_pde_ctx_decided(&t, &input, false, None, None, None, None, decided)
+        };
+        let tango = UserAction::DanceTogether {
+            style: Some(DanceStyle::Tango),
+            name: None,
+        };
+        let yes = line(tango.clone(), Some(ActionResponse::Accept));
+        assert!(
+            yes.contains("[用户动作] 对方想和你一起跳探戈，这次你会答应\n"),
+            "{yes}"
+        );
+        let no = line(UserAction::ask_dancing(), Some(ActionResponse::Refuse));
+        assert!(
+            no.contains("[用户动作] 对方想看你跳支舞，这次你不会答应\n"),
+            "{no}"
+        );
+        let open = line(tango, None);
+        assert!(open.contains("[用户动作] 对方想和你一起跳探戈\n"), "{open}");
+    }
+
+    /// A bet refused before the judge does not read 收下 (spec
+    /// 2026-11-28-dance-styles-design.md §7).
+    #[test]
+    fn the_judge_line_of_a_bet_decided_before_the_judge() {
+        use eros_engine_core::types::{ActionResponse, Event, UserAction};
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        if let Event::UserMessage { action, .. } = &mut input.event {
+            *action = Some(UserAction::Bet);
+        }
+        let no = build_pde_ctx_decided(
+            &t,
+            &input,
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(ActionResponse::Refuse),
+        );
+        assert!(no.contains("，这次你不会答应\n"), "{no}");
+        assert!(!no.contains("收下"), "{no}");
+        let yes = build_pde_ctx_decided(
+            &t,
+            &input,
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(ActionResponse::Accept),
+        );
+        assert!(yes.contains("，这次你会答应\n"), "{yes}");
+    }
+
+    /// The roll is random: run the turn until both outcomes show, and check
+    /// that each outcome's line and response agree.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_dance_lover_takes_a_dance_the_judge_refused(pool: PgPool) {
+        let (mut forced, mut judged) = (0, 0);
+        for _ in 0..24 {
+            let (frames, mock, _) = run_together_turn_mock(
+                &pool,
+                eros_engine_core::types::UserAction::ask_dancing(),
+                Some("refuse"),
+                "reply_text",
+                true,
+                &[],
+                false,
+                Some(serde_json::json!({"dance": "love"})),
+            )
+            .await;
+            let judge = judge_request(&mock.received_requests().await.unwrap());
+            if judge.contains("对方想看你跳支舞，这次你会答应") {
+                forced += 1;
+                assert_eq!(action_response_of(&frames), "accept");
+            } else {
+                judged += 1;
+                assert!(judge.contains("[用户动作] 对方想看你跳支舞\\n"), "{judge}");
+                assert_eq!(action_response_of(&frames), "refuse");
+            }
+            if forced > 0 && judged > 0 {
+                return;
+            }
+        }
+        panic!("both outcomes within 24 turns: forced {forced}, judged {judged}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_dance_hater_turns_down_a_dance_the_judge_accepted(pool: PgPool) {
+        let (mut forced, mut judged) = (0, 0);
+        for _ in 0..24 {
+            let (frames, mock, umid) = run_together_turn_mock(
+                &pool,
+                eros_engine_core::types::UserAction::dance_together(),
+                Some("accept"),
+                "reply_text",
+                true,
+                &[],
+                false,
+                Some(serde_json::json!({"dance": "dislike"})),
+            )
+            .await;
+            let judge = judge_request(&mock.received_requests().await.unwrap());
+            let placed: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM engine.persona_events \
+                  WHERE message_id = $1 AND kind = 'dancing_together'",
+            )
+            .bind(umid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if judge.contains("对方想和你一起跳舞，这次你不会答应") {
+                forced += 1;
+                assert_eq!(action_response_of(&frames), "refuse");
+                assert_eq!(placed, 0, "a refusal places nothing");
+            } else {
+                judged += 1;
+                assert_eq!(action_response_of(&frames), "accept");
+                assert_eq!(placed, 1);
+            }
+            if forced > 0 && judged > 0 {
+                return;
+            }
+        }
+        panic!("both outcomes within 24 turns: forced {forced}, judged {judged}");
+    }
+
+    /// `naturism = dislike` turns down a naturism action the judge accepted
+    /// two times in three; `risky = love` takes a bet the judge refused two
+    /// times in three.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn naturism_and_risky_decide_before_the_judge(pool: PgPool) {
+        use eros_engine_core::types::UserAction;
+        for (action, judged, art, forced_line, forced) in [
+            (
+                UserAction::YogaNakedTogether,
+                "accept",
+                serde_json::json!({"naturism": "dislike"}),
+                "，这次你不会答应",
+                "refuse",
+            ),
+            (
+                UserAction::Bet,
+                "refuse",
+                serde_json::json!({"risky": "love"}),
+                "，这次你会答应",
+                "accept",
+            ),
+            (
+                UserAction::AdventureTogether,
+                "refuse",
+                serde_json::json!({"risky": "love"}),
+                "，这次你会答应",
+                "accept",
+            ),
+        ] {
+            let (mut seen_forced, mut seen_judged) = (false, false);
+            for _ in 0..24 {
+                let (frames, mock, _) = run_together_turn_mock(
+                    &pool,
+                    action.clone(),
+                    Some(judged),
+                    "reply_text",
+                    true,
+                    &[],
+                    false,
+                    Some(art.clone()),
+                )
+                .await;
+                let judge = judge_request(&mock.received_requests().await.unwrap());
+                if judge.contains(forced_line) {
+                    seen_forced = true;
+                    assert_eq!(action_response_of(&frames), forced, "{action:?}");
+                } else {
+                    seen_judged = true;
+                    assert_eq!(action_response_of(&frames), judged, "{action:?}");
+                }
+                if seen_forced && seen_judged {
+                    break;
+                }
+            }
+            assert!(
+                seen_forced && seen_judged,
+                "{action:?}: both outcomes within 24 turns"
+            );
+        }
+    }
+
+    /// No key, or the naked dance: the judge decides, the line has no ending.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn no_dance_roll_without_the_key_or_on_the_naked_dance(pool: PgPool) {
+        for (action, art) in [
+            (eros_engine_core::types::UserAction::dance_together(), None),
+            (
+                eros_engine_core::types::UserAction::dance_naked_together(),
+                Some(serde_json::json!({"dance": "love"})),
+            ),
+        ] {
+            for _ in 0..4 {
+                let (frames, mock, _) = run_together_turn_mock(
+                    &pool,
+                    action.clone(),
+                    Some("refuse"),
+                    "reply_text",
+                    true,
+                    &[],
+                    false,
+                    art.clone(),
+                )
+                .await;
+                let judge = judge_request(&mock.received_requests().await.unwrap());
+                assert!(!judge.contains("这次你会答应"), "{action:?}: {judge}");
+                assert_eq!(action_response_of(&frames), "refuse", "{action:?}");
+            }
+        }
+    }
+
+    /// A style is named on the judge's line, in the picture's state on the
+    /// turn that places the dance, and on the event the next turn reads.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_styled_dance_names_its_style(pool: PgPool) {
+        use eros_engine_core::types::{DanceStyle, UserAction};
+        let (frames, mock, umid) = run_together_turn_mock(
+            &pool,
+            UserAction::DanceTogether {
+                style: Some(DanceStyle::Tango),
+                name: None,
+            },
+            Some("accept"),
+            "reply_text_image",
+            true,
+            &[],
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        let reqs = mock.received_requests().await.unwrap();
+        assert!(
+            judge_request(&reqs).contains("[用户动作] 对方想和你一起跳探戈\\n"),
+            "the judge's line"
+        );
+        let composer = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("\"model\":\"composer\""))
+            .expect("the picture was composed");
+        assert!(composer.contains("和对方一起跳探戈"), "{composer}");
+        let instance: Uuid = sqlx::query_scalar(
+            "SELECT s.instance_id FROM engine.chat_messages m \
+               JOIN engine.chat_sessions s ON s.id = m.session_id WHERE m.id = $1",
+        )
+        .bind(umid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let current = eros_engine_store::events::EventRepo { pool: &pool }
+            .current(instance, None, chrono::Utc::now(), None)
+            .await
+            .unwrap();
+        let e = current.foreground.expect("the dance is under way");
+        assert_eq!(e.text.as_deref(), Some("探戈"));
+        assert_eq!(
+            crate::prompt::doing_label(e.kind, e.text.as_deref()),
+            "和对方一起跳探戈"
+        );
     }
 }

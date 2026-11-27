@@ -1126,23 +1126,23 @@ pub enum Place {
     Indoor,
 }
 
-/// `art_metadata.dance`: whether she loves dancing or dislikes it (spec
-/// 2026-11-28-dance-styles-design.md §7). Absent or unknown reads as
-/// `Neutral`. Read by the dance roll alone.
+/// How she takes something a card key names: `art_metadata.dance`,
+/// `naturism` and `risky` (spec 2026-11-28-dance-styles-design.md §7).
+/// Absent or unknown reads as `Neutral`. Read by the taste roll alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DanceTaste {
+pub enum Taste {
     Love,
     #[default]
     Neutral,
     Dislike,
 }
 
-impl DanceTaste {
+impl Taste {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "love" => Some(DanceTaste::Love),
-            "neutral" => Some(DanceTaste::Neutral),
-            "dislike" => Some(DanceTaste::Dislike),
+            "love" => Some(Taste::Love),
+            "neutral" => Some(Taste::Neutral),
+            "dislike" => Some(Taste::Dislike),
             _ => None,
         }
     }
@@ -1206,8 +1206,11 @@ pub struct PersonaTraits {
     pub habits: Habits,
     /// `art_metadata.outdoorsy`: scales the outdoor and indoor kinds.
     pub outdoorsy: Outdoorsy,
-    /// `art_metadata.dance`: read by the dance roll, not by the draw.
-    pub dance: DanceTaste,
+    /// `art_metadata.dance`, `naturism`, `risky`: read by the taste roll,
+    /// not by the draw.
+    pub dance: Taste,
+    pub naturism: Taste,
+    pub risky: Taste,
     /// `art_metadata.species` is `robot` or `android`: never draws
     /// `pregnancy_scare` or `using_toilet`, and never has a period (spec
     /// 2026-11-19-vehicles-actions-species-design.md §5; spec 2026-11-20-
@@ -5143,13 +5146,15 @@ mod tests {
 
     #[test]
     fn the_dance_taste_reads_its_three_values() {
-        assert_eq!(DanceTaste::parse("love"), Some(DanceTaste::Love));
-        assert_eq!(DanceTaste::parse("neutral"), Some(DanceTaste::Neutral));
-        assert_eq!(DanceTaste::parse("dislike"), Some(DanceTaste::Dislike));
+        assert_eq!(Taste::parse("love"), Some(Taste::Love));
+        assert_eq!(Taste::parse("neutral"), Some(Taste::Neutral));
+        assert_eq!(Taste::parse("dislike"), Some(Taste::Dislike));
         for other in ["LOVE", "like", "hate", ""] {
-            assert_eq!(DanceTaste::parse(other), None, "{other}");
+            assert_eq!(Taste::parse(other), None, "{other}");
         }
-        assert_eq!(DanceTaste::default(), DanceTaste::Neutral);
-        assert_eq!(PersonaTraits::default().dance, DanceTaste::Neutral);
+        assert_eq!(Taste::default(), Taste::Neutral);
+        assert_eq!(PersonaTraits::default().dance, Taste::Neutral);
+        assert_eq!(PersonaTraits::default().naturism, Taste::Neutral);
+        assert_eq!(PersonaTraits::default().risky, Taste::Neutral);
     }
 }

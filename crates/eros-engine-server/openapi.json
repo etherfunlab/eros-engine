@@ -6160,7 +6160,7 @@
               "string",
               "null"
             ],
-            "description": "The user's words of a `custom_together`, read from the message that\nasked; `null` once that message is gone, and for every other kind."
+            "description": "The user's words of a `custom_together`, or the words of the style a\ndance names (`dancing_together`, `naked_dancing_together`), read from\nthe message that asked; `null` once that message is gone, for a dance\nwithout a style, and for every other kind."
           }
         }
       },

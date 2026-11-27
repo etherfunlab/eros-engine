@@ -1991,7 +1991,13 @@ pub(crate) fn persona_traits(
             .and_then(Outdoorsy::parse)
             .unwrap_or_default(),
         dance: meta_str(persona, "dance")
-            .and_then(eros_engine_core::events::DanceTaste::parse)
+            .and_then(eros_engine_core::events::Taste::parse)
+            .unwrap_or_default(),
+        naturism: meta_str(persona, "naturism")
+            .and_then(eros_engine_core::events::Taste::parse)
+            .unwrap_or_default(),
+        risky: meta_str(persona, "risky")
+            .and_then(eros_engine_core::events::Taste::parse)
             .unwrap_or_default(),
         machine,
         period: female && !machine && card_period.unwrap_or(human),
@@ -6690,6 +6696,8 @@ mod tests {
                 },
                 outdoorsy: Default::default(),
                 dance: Default::default(),
+                naturism: Default::default(),
+                risky: Default::default(),
                 machine: false,
                 period: true,
             }
@@ -10007,20 +10015,31 @@ mod tests {
     }
 
     #[test]
-    fn persona_traits_read_dance() {
-        use eros_engine_core::events::DanceTaste;
+    fn persona_traits_read_the_three_tastes() {
+        use eros_engine_core::events::Taste;
         for (art, want) in [
-            (serde_json::json!({"dance": "love"}), DanceTaste::Love),
-            (serde_json::json!({"dance": "dislike"}), DanceTaste::Dislike),
-            (serde_json::json!({"dance": "neutral"}), DanceTaste::Neutral),
-            (serde_json::json!({"dance": "LOVE"}), DanceTaste::Neutral),
-            (serde_json::json!({"dance": true}), DanceTaste::Neutral),
-            (serde_json::json!({"dance": 1}), DanceTaste::Neutral),
-            (serde_json::json!({}), DanceTaste::Neutral),
+            (serde_json::json!({"dance": "love"}), Taste::Love),
+            (serde_json::json!({"dance": "dislike"}), Taste::Dislike),
+            (serde_json::json!({"dance": "neutral"}), Taste::Neutral),
+            (serde_json::json!({"dance": "LOVE"}), Taste::Neutral),
+            (serde_json::json!({"dance": true}), Taste::Neutral),
+            (serde_json::json!({"dance": 1}), Taste::Neutral),
+            (serde_json::json!({}), Taste::Neutral),
         ] {
             let mut p = fixture_persona();
             p.genome.art_metadata = art.clone();
             assert_eq!(persona_traits(&p).dance, want, "{art}");
         }
+        let mut p = fixture_persona();
+        p.genome.art_metadata =
+            serde_json::json!({"naturism": "love", "risky": "dislike", "dance": "neutral"});
+        let t = persona_traits(&p);
+        assert_eq!(
+            (t.dance, t.naturism, t.risky),
+            (Taste::Neutral, Taste::Love, Taste::Dislike)
+        );
+        p.genome.art_metadata = serde_json::json!({"naturism": false, "risky": "yes"});
+        let t = persona_traits(&p);
+        assert_eq!((t.naturism, t.risky), (Taste::Neutral, Taste::Neutral));
     }
 }
