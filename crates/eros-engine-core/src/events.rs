@@ -5270,6 +5270,7 @@ mod tests {
                 EventKind::SPECIAL.contains(&kind),
                 "{kind:?} is placed, never drawn"
             );
+            assert!(!EventKind::ALL.contains(&kind), "{kind:?} is never drawn");
             assert_eq!(kind.together_group(), model.together_group(), "{kind:?}");
             assert_eq!(kind.category(), model.category(), "{kind:?}");
             assert_eq!(kind.slot(), model.slot(), "{kind:?}");

@@ -22,10 +22,10 @@ action it mirrors.
 
 | action | event | words (action / event) | group | mirrors |
 |---|---|---|---|---|
-| `scuba_dive_together` | `scuba_diving_together` | 想和你一起潜水 / 和对方一起潜水 | general | `swim_together` |
+| `scuba_dive_together` | `scuba_diving_together` | 想和你一起水肺潜水 / 和对方一起水肺潜水 | general | `swim_together` |
 | `surf_together` | `surfing_together` | 想和你一起冲浪 / 和对方一起冲浪 | general | `swim_together` |
 | `ski_together` | `skiing_together` | 想和你一起滑雪 / 和对方一起滑雪 | general | `hike_together` |
-| `free_dive_together` | `free_diving_together` | 想和你一起裸潜 / 和对方一起裸潜 | naturism | `skinny_dip_together` |
+| `free_dive_together` | `free_diving_together` | 想和你一起裸体自由潜水 / 和对方一起裸体自由潜水 | naturism | `skinny_dip_together` |
 | `surf_naked_together` | `naked_surfing_together` | 想和你一起裸体冲浪 / 和对方一起裸体冲浪 | naturism | `skinny_dip_together` |
 | `ski_naked_together` | `naked_skiing_together` | 想和你一起裸体滑雪 / 和对方一起裸体滑雪 | naturism | `hike_naked_together` |
 
