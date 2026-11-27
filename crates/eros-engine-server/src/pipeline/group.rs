@@ -536,6 +536,7 @@ pub(crate) fn run_group_turn(
                     picture.state.as_deref(),
                     companion_ctx.as_ref(),
                     picture.clothing_override,
+                    None,
                 )
                 .await;
                 turn_failures.extend(img.failures.iter().cloned());
@@ -641,6 +642,7 @@ pub(crate) fn run_group_turn(
                         state_c.as_deref(),
                         ctx_c.as_ref(),
                         clothing_override,
+                        None,
                     )
                     .await
                 })))
@@ -794,6 +796,7 @@ pub(crate) fn run_group_turn(
                                 picture.state.as_deref(),
                                 companion_ctx.as_ref(),
                                 picture.clothing_override,
+                                None,
                             )
                             .await
                         }

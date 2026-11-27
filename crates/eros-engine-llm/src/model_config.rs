@@ -1230,6 +1230,8 @@ When a [此刻状态] section is present, the picture must show what it says: th
 \n\
 When a [对方] section is present and the partner appears in the picture, draw the partner as that gender.\n\
 \n\
+A [亲密] section, when present, says which side leads and what the partner wears. The character then wears what [此刻穿着] says and the partner what [亲密] says, over what [此刻状态] would imply, and the composition follows who leads.\n\
+\n\
 \"caption\" is one short line, in the language the conversation is in, saying what the picture shows — as the character would recall it later. It is read back into the conversation history, so keep it brief and natural; it is not an image-generation prompt and must not repeat the style boilerplate.\n\
 \n\
 Output only the JSON object. No commentary, options, or headings.";
@@ -3559,6 +3561,13 @@ fn voyage_model_generation(bare_id: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    /// Spec 2026-11-27-passion-group-design.md §7.2: the built-in composer
+    /// prompt names the `[亲密]` section.
+    #[test]
+    fn the_built_in_compose_prompt_reads_the_intimacy_section() {
+        assert!(DEFAULT_COMPOSE_PROMPT.contains("[亲密]"));
+    }
+
     use super::*;
 
     #[test]

@@ -3840,6 +3840,7 @@ pub(crate) fn compose_user_payload(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -3863,6 +3864,7 @@ pub(crate) fn compose_user_payload_with(
     current_state: Option<&str>,
     partner_gender: Option<&str>,
     companion: Option<&ImageCompanionContext>,
+    intimacy: Option<&str>,
 ) -> String {
     let state = current_state
         .map(str::trim)
@@ -3873,6 +3875,13 @@ pub(crate) fn compose_user_payload_with(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| format!("[对方]\n{s}\n\n"))
+        .unwrap_or_default();
+    // A 1:1 passion act's section, right after `[对方]` (spec 2026-11-27-
+    // passion-group-design.md §7.2).
+    let intimacy = intimacy
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("{s}\n\n"))
         .unwrap_or_default();
     let companion = companion
         .map(|c| {
@@ -3893,7 +3902,7 @@ pub(crate) fn compose_user_payload_with(
         })
         .unwrap_or_default();
     format!(
-        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n{companion}[身体状态]\n{body_state}\n\n{state}{partner}[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
+        "[人物外观]\n{appearance}\n\n[此刻穿着]\n{clothing}\n\n{companion}[身体状态]\n{body_state}\n\n{state}{partner}{intimacy}[最近场景]\n{recent_scene}\n\n[对方最新消息]\n{latest_user_msg}\n\n[风格]\n{style}\n\n[画幅]\n{aspect_ratio}"
     )
 }
 
@@ -3923,6 +3932,7 @@ pub(crate) fn compose_inputs_json(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -3942,6 +3952,7 @@ pub(crate) fn compose_inputs_json_with(
     current_state: Option<&str>,
     partner_gender: Option<&str>,
     companion: Option<&ImageCompanionContext>,
+    intimacy: Option<&str>,
 ) -> serde_json::Value {
     let mut v = serde_json::json!({
         "appearance": crate::prompt::meta_str(persona, "appearance")
@@ -3951,6 +3962,7 @@ pub(crate) fn compose_inputs_json_with(
         "body_state": body_state.map(str::trim).unwrap_or(""),
         "current_state": current_state.map(str::trim).unwrap_or(""),
         "partner_gender": partner_gender.map(str::trim).unwrap_or(""),
+        "intimacy": intimacy.map(str::trim).unwrap_or(""),
         "recent_scene": recent_scene.trim(),
         "latest_user_msg": latest_user_msg.trim(),
         "style": style,
@@ -4087,6 +4099,7 @@ pub(crate) fn render_compose_payload(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -4104,6 +4117,7 @@ pub(crate) fn render_compose_payload_with(
     current_state: Option<&str>,
     partner_gender: Option<&str>,
     companion: Option<&ImageCompanionContext>,
+    intimacy: Option<&str>,
 ) -> String {
     let appearance = crate::prompt::meta_str(persona, "appearance")
         .map(str::trim)
@@ -4139,6 +4153,7 @@ pub(crate) fn render_compose_payload_with(
         current_state,
         partner_gender,
         companion,
+        intimacy,
     )
 }
 
@@ -4449,6 +4464,46 @@ pub(crate) struct PictureState {
     pub clothing_override: Option<&'static str>,
 }
 
+/// The passion act a 1:1 picture composes from, when its foreground is
+/// `having_sex_together` (spec 2026-11-27-passion-group-design.md §7.2): the
+/// action in hand when this turn places it (`placed`), else the action on
+/// the user's message the row points at, else none (her own ask's row: the
+/// defaults). Returns the picture's [`crate::prompt::Intimacy`] and the act's
+/// name. Fail-open: a failed read is warned and reads as no act.
+pub(crate) async fn passion_scene(
+    pool: &sqlx::PgPool,
+    current: &eros_engine_store::events::CurrentEvents,
+    placed: Option<eros_engine_core::events::EventKind>,
+    action: Option<&eros_engine_core::types::UserAction>,
+    user_gender: Option<crate::routes::companion_stream::UserGender>,
+    persona: &eros_engine_core::persona::CompanionPersona,
+) -> Option<(crate::prompt::Intimacy, Option<String>)> {
+    use eros_engine_core::events::EventKind::HavingSexTogether;
+    use eros_engine_core::types::UserAction;
+    let (_, _, foreground) = picture_kinds(current, placed.map(|k| (k, None)));
+    if foreground.map(|(kind, _)| kind) != Some(HavingSexTogether) {
+        return None;
+    }
+    let act: Option<UserAction> = if placed == Some(HavingSexTogether) {
+        action.cloned()
+    } else {
+        match current.foreground.as_ref().and_then(|e| e.message_id) {
+            Some(id) => match (eros_engine_store::events::EventRepo { pool }).action_of(id).await {
+                Ok(v) => v.and_then(|v| serde_json::from_value(v).ok()),
+                Err(e) => {
+                    tracing::warn!(message_id = %id, "image-compose: passion act read failed: {e}");
+                    None
+                }
+            },
+            None => None,
+        }
+    }
+    .filter(|a| matches!(a, UserAction::SexTogether { .. }));
+    let name = act.as_ref().and_then(UserAction::together_text).map(str::to_string);
+    let intimacy = crate::prompt::intimacy(act.as_ref(), user_gender, crate::prompt::wearer(persona));
+    Some((intimacy, name))
+}
+
 /// [`crate::prompt::water_clothing`] for the persona `instance_id`, her card
 /// virginity narrowed by her sex history when that can change the line: a row
 /// of any `EventKind::SEX` kind, in any session, ends it, as the event draw
@@ -4535,6 +4590,7 @@ pub(crate) async fn build_delegated_image_prompt(
     current_state: Option<&str>,
     partner_gender: Option<&str>,
     clothing_override: Option<&str>,
+    intimacy: Option<&str>,
 ) -> DelegatedImagePrompt {
     build_delegated_image_prompt_for(
         state,
@@ -4551,6 +4607,7 @@ pub(crate) async fn build_delegated_image_prompt(
         None,
         compose_source(plan.action_type),
         clothing_override,
+        intimacy,
     )
     .await
 }
@@ -4572,6 +4629,7 @@ pub(crate) async fn build_delegated_image_prompt_with(
     current_state: Option<&str>,
     companion: Option<&ImageCompanionContext>,
     clothing_override: Option<&str>,
+    intimacy: Option<&str>,
 ) -> DelegatedImagePrompt {
     build_delegated_image_prompt_for(
         state,
@@ -4588,6 +4646,7 @@ pub(crate) async fn build_delegated_image_prompt_with(
         companion,
         compose_source(plan.action_type),
         clothing_override,
+        intimacy,
     )
     .await
 }
@@ -4630,6 +4689,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
     companion: Option<&ImageCompanionContext>,
     source: &'static str,
     clothing_override: Option<&str>,
+    intimacy: Option<&str>,
 ) -> DelegatedImagePrompt {
     let clothing = clothing_override.or(plan.clothing.as_deref());
     let inputs = resolve_image_turn_inputs(plan, req_image);
@@ -4657,6 +4717,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
                     current_state,
                     partner_gender,
                     companion,
+                    intimacy,
                 ),
                 "chat_image_prompt_compose",
             )
@@ -4757,6 +4818,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
                 current_state,
                 partner_gender,
                 companion,
+                intimacy,
             ),
             subject: (!final_subject.is_empty()).then_some(final_subject.as_str()),
             caption: caption.as_deref(),
@@ -6322,7 +6384,39 @@ pub(crate) fn run_stream_with(
                         .and_then(eros_engine_core::types::UserAction::together_text);
                     (kind, text)
                 });
-                let picture_state = picture_state_of(&current, doing);
+                let draws = matches!(
+                    plan.action_type,
+                    ActionType::ReplyImage | ActionType::ReplyTextImage
+                );
+                // A passion act on a 1:1 picture: its section, her clothing
+                // and, on a later turn, the stored act's name for the label
+                // (spec 2026-11-27-passion-group-design.md §7.2). Read only
+                // for a turn that draws.
+                let passion = if draws {
+                    passion_scene(
+                        &state.pool,
+                        &current,
+                        placed,
+                        user_msg.action.as_ref(),
+                        user_msg.user_gender,
+                        &input.persona,
+                    )
+                    .await
+                } else {
+                    None
+                };
+                let stored_act = passion
+                    .as_ref()
+                    .filter(|_| placed.is_none())
+                    .and_then(|(_, name)| name.as_deref())
+                    .map(|name| {
+                        (
+                            eros_engine_core::events::EventKind::HavingSexTogether,
+                            Some(name),
+                        )
+                    });
+                let picture_state = picture_state_of(&current, doing.or(stored_act));
+                let intimacy_section = passion.as_ref().map(|(i, _)| i.section.as_str());
                 // The user's gender, when what she is doing is something she
                 // shares with them (spec 2026-11-24 §7.2).
                 let partner_gender = partner_gender_of(&current, placed, user_msg.user_gender);
@@ -6333,10 +6427,9 @@ pub(crate) fn run_stream_with(
                 // 2026-11-27-swim-outfit-ladder-and-fish-together-design.md
                 // §4, §5). Read only for a turn that draws, as a group turn
                 // does: a text reply has no slot to fill.
-                let clothing_override = if matches!(
-                    plan.action_type,
-                    ActionType::ReplyImage | ActionType::ReplyTextImage
-                ) {
+                let clothing_override: Option<String> = if let Some((i, _)) = &passion {
+                    Some(i.her_clothing.clone())
+                } else if draws {
                     water_clothing_for(
                         &state.pool,
                         user_msg.instance_id,
@@ -6348,6 +6441,7 @@ pub(crate) fn run_stream_with(
                         ),
                     )
                     .await
+                    .map(str::to_string)
                 } else {
                     None
                 };
@@ -6379,7 +6473,8 @@ pub(crate) fn run_stream_with(
                         body_state.as_deref(),
                         picture_state.as_deref(),
                         partner_gender,
-                        clothing_override,
+                        clothing_override.as_deref(),
+                        intimacy_section,
                     )
                     .await;
                     let subject = img.subject;
@@ -6742,6 +6837,8 @@ pub(crate) fn run_stream_with(
                         let session_id_c = user_msg.session_id;
                         let body_state_c = body_state.clone();
                         let picture_state_c = picture_state.clone();
+                        let clothing_override_c = clothing_override.clone();
+                        let intimacy_c = intimacy_section.map(str::to_string);
                         AbortOnDrop(Some(tokio::spawn(async move {
                             build_delegated_image_prompt(
                                 &state_c,
@@ -6755,7 +6852,8 @@ pub(crate) fn run_stream_with(
                                 body_state_c.as_deref(),
                                 picture_state_c.as_deref(),
                                 partner_gender,
-                                clothing_override,
+                                clothing_override_c.as_deref(),
+                                intimacy_c.as_deref(),
                             )
                             .await
                         })))
@@ -6957,7 +7055,8 @@ pub(crate) fn run_stream_with(
                                     body_state.as_deref(),
                                     picture_state.as_deref(),
                                     partner_gender,
-                                    clothing_override,
+                                    clothing_override.as_deref(),
+                                    intimacy_section,
                                 )
                                 .await
                             }
@@ -6974,7 +7073,8 @@ pub(crate) fn run_stream_with(
                                     body_state.as_deref(),
                                     picture_state.as_deref(),
                                     partner_gender,
-                                    clothing_override,
+                                    clothing_override.as_deref(),
+                                    intimacy_section,
                                 )
                                 .await
                             }
@@ -10970,6 +11070,7 @@ data: [DONE]\n\n";
             Some("和对方一起慢跑"),
             Some("男性"),
             None,
+            None,
         )
         .await;
         assert_eq!(img.subject, "SUBJECT");
@@ -12385,6 +12486,110 @@ data: [DONE]\n\n";
             "{payload}"
         );
         assert_eq!(clothing, "什么都没穿");
+    }
+
+    /// Spec 2026-11-27-passion-group-design.md §7: an accepted named act
+    /// composes the picture from its leader and each side's clothing.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_named_act_draws_its_composition(pool: PgPool) {
+        use eros_engine_core::types::{RemainClothing, SideClothing, UserAction};
+        let (frames, payload, _, clothing, _) = water_picture_turn_with(
+            &pool,
+            UserAction::SexTogether {
+                name: Some("姿势甲".into()),
+                active: None,
+                remain_clothing: RemainClothing::Sides {
+                    active: Some(SideClothing::HalfNaked),
+                    passive: Some(SideClothing::Custom("只穿袜子".into())),
+                },
+                ignore_orientation: false,
+            },
+            "accept",
+            true,
+            Some(serde_json::json!({"gender": "female"})),
+            None,
+            &[],
+            |m| m.user_gender = Some(crate::routes::companion_stream::UserGender::Male),
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(
+            payload.contains("[此刻状态]\n和对方上床：「姿势甲」\n"),
+            "{payload}"
+        );
+        assert!(payload.contains("[此刻穿着]\n只穿袜子\n"), "{payload}");
+        assert!(
+            payload.contains("[亲密]\n主动的一方：对方\n对方穿着：半裸\n"),
+            "{payload}"
+        );
+        assert_eq!(clothing, "只穿袜子");
+        let intimacy: String =
+            sqlx::query_scalar("SELECT inputs->>'intimacy' FROM engine.chat_images_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(intimacy.starts_with("[亲密]"), "{intimacy}");
+    }
+
+    /// §5.3, §7.2: a later picture during the act reads it from the user's
+    /// message the row points at; a row with no message (her own ask) reads
+    /// the defaults.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_later_picture_reads_the_stored_act(pool: PgPool) {
+        use eros_engine_store::events::EventRepo;
+        let user_id = Uuid::new_v4();
+        let (_g, instance_id, session_id) = seed_persona_and_session(&pool, user_id).await;
+        let asked: Uuid = sqlx::query_scalar(
+            "INSERT INTO engine.chat_messages (session_id, role, content, metadata) \
+             VALUES ($1, 'user', '', $2) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(serde_json::json!({"action": {
+            "type": "sex_together", "name": "姿势甲", "active": "persona",
+            "remain_clothing": {"active": "half_naked"}, "response": "accept"
+        }}))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO engine.persona_events \
+               (instance_id, session_id, event_key, kind, started_at, ends_at, message_id) \
+             VALUES ($1, $2, 'k', 'having_sex_together', now() - interval '10 minutes', \
+                     now() + interval '50 minutes', $3)",
+        )
+        .bind(instance_id)
+        .bind(session_id)
+        .bind(asked)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut persona = fixture_decision_input().persona;
+        persona.genome.art_metadata = serde_json::json!({"gender": "female"});
+        let current = EventRepo { pool: &pool }
+            .current(instance_id, None, chrono::Utc::now(), None)
+            .await
+            .unwrap();
+        let (intimacy, name) = passion_scene(&pool, &current, None, None, None, &persona)
+            .await
+            .expect("a sex foreground");
+        assert_eq!(name.as_deref(), Some("姿势甲"));
+        assert_eq!(intimacy.her_clothing, "半裸");
+        assert!(intimacy.section.contains("主动的一方：角色"), "{}", intimacy.section);
+
+        sqlx::query("UPDATE engine.persona_events SET message_id = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let current = EventRepo { pool: &pool }
+            .current(instance_id, None, chrono::Utc::now(), None)
+            .await
+            .unwrap();
+        let (intimacy, name) = passion_scene(&pool, &current, None, None, None, &persona)
+            .await
+            .expect("a sex foreground");
+        assert_eq!(name, None);
+        assert_eq!(intimacy.her_clothing, "什么都没穿");
+        assert!(intimacy.section.contains("主动的一方：对方"), "{}", intimacy.section);
     }
 
     /// §5: no other kind is covered: an accepted jog's picture reads as the
@@ -24527,7 +24732,7 @@ data: [DONE]\n\n"
                 None,
                 None,
                 None
-            ),
+            , None),
             base
         );
         let ctx = ImageCompanionContext {
@@ -24547,6 +24752,7 @@ data: [DONE]\n\n"
             None,
             None,
             Some(&ctx),
+            None,
         );
         assert_eq!(
             with,
@@ -24577,7 +24783,7 @@ data: [DONE]\n\n"
                 None,
                 None,
                 None
-            ),
+            , None),
             base
         );
         assert_eq!(
@@ -24597,7 +24803,7 @@ data: [DONE]\n\n"
                 Some("  "),
                 None,
                 None
-            ),
+            , None),
             base
         );
     }
@@ -24613,6 +24819,7 @@ data: [DONE]\n\n"
             "3:4",
             "（无）",
             Some("洗澡中"),
+            None,
             None,
             None,
         );
@@ -24636,6 +24843,7 @@ data: [DONE]\n\n"
                 "（无）",
                 state,
                 partner,
+                None,
                 None,
             )
         };
@@ -24735,11 +24943,13 @@ data: [DONE]\n\n"
             Some("和对方一起慢跑"),
             Some("女性"),
             None,
+            None,
         );
         assert_eq!(with["partner_gender"], "女性");
         assert_eq!(with["current_state"], "和对方一起慢跑");
         let without = compose_inputs_json_with(
             &persona, None, "s", "m", "anime", None, None, None, None, None,
+            None,
         );
         assert_eq!(without["partner_gender"], "");
         let wrapper = compose_inputs_json(&persona, None, "s", "m", "anime", None, None);
@@ -24759,6 +24969,7 @@ data: [DONE]\n\n"
             None,
             Some("和对方一起慢跑"),
             Some("男性"),
+            None,
             None,
         );
         assert!(
@@ -24788,6 +24999,7 @@ data: [DONE]\n\n"
             Some("洗澡中"),
             None,
             Some(&ctx),
+            None,
         );
         assert_eq!(
             with,
@@ -24976,6 +25188,7 @@ data: [DONE]\n\n"
             Some("短途旅游；在坐火车"),
             None,
             None,
+            None,
         );
         assert!(
             out.contains(
@@ -25001,10 +25214,12 @@ data: [DONE]\n\n"
             Some("洗澡中"),
             None,
             None,
+            None,
         );
         assert_eq!(with["current_state"], "洗澡中");
         let without = compose_inputs_json_with(
             &persona, None, "s", "m", "anime", None, None, None, None, None,
+            None,
         );
         assert_eq!(without["current_state"], "");
         let wrapper = compose_inputs_json(&persona, None, "s", "m", "anime", None, None);

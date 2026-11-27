@@ -832,6 +832,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::ToiletTogether => "想和你一起去上厕所".into(),
         UserAction::SmokeTogether => "想和你一起去抽根烟".into(),
         UserAction::FallAsleepTogether => "想和你一起睡觉".into(),
+        UserAction::SexTogether { name: Some(n), .. } => format!("想和你上床：「{n}」"),
         UserAction::SexTogether { .. } => "想和你上床".into(),
         UserAction::WalkTogether => "想和你一起散步".into(),
         UserAction::SmokeWeedTogether => "想和你一起抽大麻".into(),
@@ -1222,6 +1223,10 @@ pub(crate) fn doing_label(kind: eros_engine_core::events::EventKind, text: Optio
     match (kind, text) {
         (eros_engine_core::events::EventKind::CustomTogether, Some(text)) => {
             format!("和对方一起：「{text}」")
+        }
+        // A named passion act (spec 2026-11-27-passion-group-design.md §7.1).
+        (eros_engine_core::events::EventKind::HavingSexTogether, Some(text)) => {
+            format!("和对方上床：「{text}」")
         }
         _ => event_label(kind).to_string(),
     }
@@ -1652,6 +1657,74 @@ pub(crate) fn wearer(persona: &CompanionPersona) -> Wearer {
         Some("female") => Wearer::Female,
         Some("male") => Wearer::Male,
         _ => Wearer::Other,
+    }
+}
+
+/// What a 1:1 picture of a passion act shows (spec 2026-11-27-passion-
+/// group-design.md §7.2): her `[此刻穿着]`, and the `[亲密]` section naming
+/// who leads and what the user wears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Intimacy {
+    pub her_clothing: String,
+    pub section: String,
+}
+
+/// Who leads a passion act (spec 2026-11-27 §5.5): `active` when given;
+/// otherwise a male user with a female persona leads, a female user with a
+/// male persona is led, and the user leads in any other case.
+pub(crate) fn leader(
+    active: Option<eros_engine_core::types::Party>,
+    user: Option<crate::routes::companion_stream::UserGender>,
+    persona: Wearer,
+) -> eros_engine_core::types::Party {
+    use crate::routes::companion_stream::UserGender;
+    use eros_engine_core::types::Party;
+    active.unwrap_or(match (user, persona) {
+        (Some(UserGender::Female), Wearer::Male) => Party::Persona,
+        _ => Party::User,
+    })
+}
+
+/// The picture of the passion act `act` (none for her own ask's row: the
+/// defaults), for a user of `user` gender and a persona of `persona`'s (spec
+/// 2026-11-27 §7.2).
+pub(crate) fn intimacy(
+    act: Option<&UserAction>,
+    user: Option<crate::routes::companion_stream::UserGender>,
+    persona: Wearer,
+) -> Intimacy {
+    use eros_engine_core::types::{Party, RemainClothing, SideClothing};
+    const NAKED: &str = "什么都没穿";
+    let (active, remain) = match act {
+        Some(UserAction::SexTogether {
+            active,
+            remain_clothing,
+            ..
+        }) => (*active, remain_clothing.clone()),
+        _ => (None, RemainClothing::default()),
+    };
+    let lead = leader(active, user, persona);
+    let side = |s: Option<&SideClothing>| match s {
+        None | Some(SideClothing::FullNaked) => NAKED.to_string(),
+        Some(SideClothing::HalfNaked) => "半裸".to_string(),
+        Some(SideClothing::Custom(t)) => t.clone(),
+    };
+    let (leading, led) = match &remain {
+        RemainClothing::Flag(false) => (NAKED.to_string(), NAKED.to_string()),
+        RemainClothing::Flag(true) => ("穿着衣服".to_string(), "穿着衣服".to_string()),
+        RemainClothing::Sides { active, passive } => (side(active.as_ref()), side(passive.as_ref())),
+    };
+    let (her, theirs) = if lead == Party::Persona {
+        (leading, led)
+    } else {
+        (led, leading)
+    };
+    Intimacy {
+        her_clothing: her,
+        section: format!(
+            "[亲密]\n主动的一方：{}\n对方穿着：{theirs}",
+            if lead == Party::Persona { "角色" } else { "对方" }
+        ),
     }
 }
 
@@ -5999,6 +6072,88 @@ mod tests {
         assert!(!wear(true, Female, true, 0.5, true)
             .virginity_matters(Some(eros_engine_core::events::EventKind::SaunaTogether)));
         assert!(!wear(true, Female, true, 0.5, true).virginity_matters(None));
+    }
+
+    /// Spec 2026-11-27-passion-group-design.md §5.5.
+    #[test]
+    fn leader_follows_the_rule() {
+        use crate::routes::companion_stream::UserGender::{Female as UF, Male as UM};
+        use eros_engine_core::types::Party::{Persona, User};
+        use Wearer::{Female, Male, Other};
+        assert_eq!(leader(None, Some(UM), Female), User);
+        assert_eq!(leader(None, Some(UF), Male), Persona);
+        for (user, persona) in [
+            (Some(UM), Male),
+            (Some(UM), Other),
+            (Some(UF), Female),
+            (Some(UF), Other),
+            (None, Female),
+            (None, Male),
+            (None, Other),
+        ] {
+            assert_eq!(leader(None, user, persona), User, "{user:?} {persona:?}");
+        }
+        assert_eq!(leader(Some(Persona), Some(UM), Female), Persona);
+        assert_eq!(leader(Some(User), Some(UF), Male), User);
+    }
+
+    /// Spec 2026-11-27-passion-group-design.md §7.2.
+    #[test]
+    fn intimacy_reads_each_clothing_shape() {
+        use crate::routes::companion_stream::UserGender::Male as UM;
+        use eros_engine_core::types::{Party, RemainClothing, SideClothing, UserAction};
+        let act = |active: Option<Party>, rc: RemainClothing| UserAction::SexTogether {
+            name: None,
+            active,
+            remain_clothing: rc,
+            ignore_orientation: false,
+        };
+        // Defaults: male user, female persona → the user leads, both naked.
+        let i = intimacy(Some(&UserAction::sex_together()), Some(UM), Wearer::Female);
+        assert_eq!(i.her_clothing, "什么都没穿");
+        assert_eq!(i.section, "[亲密]\n主动的一方：对方\n对方穿着：什么都没穿");
+        // Her own ask's row: no action, the same defaults.
+        assert_eq!(intimacy(None, Some(UM), Wearer::Female), i);
+        // `true`: both dressed.
+        let i = intimacy(Some(&act(None, RemainClothing::Flag(true))), Some(UM), Wearer::Female);
+        assert_eq!(i.her_clothing, "穿着衣服");
+        assert!(i.section.ends_with("对方穿着：穿着衣服"), "{}", i.section);
+        // Per side, the persona leading: she wears the active side.
+        let sides = RemainClothing::Sides {
+            active: Some(SideClothing::HalfNaked),
+            passive: Some(SideClothing::Custom("只穿袜子".into())),
+        };
+        let i = intimacy(Some(&act(Some(Party::Persona), sides.clone())), Some(UM), Wearer::Female);
+        assert_eq!(i.her_clothing, "半裸");
+        assert_eq!(i.section, "[亲密]\n主动的一方：角色\n对方穿着：只穿袜子");
+        // The user leading: she wears the passive side; a missing side is naked.
+        let i = intimacy(Some(&act(Some(Party::User), sides)), Some(UM), Wearer::Female);
+        assert_eq!(i.her_clothing, "只穿袜子");
+        assert_eq!(i.section, "[亲密]\n主动的一方：对方\n对方穿着：半裸");
+        let one = RemainClothing::Sides {
+            active: None,
+            passive: Some(SideClothing::HalfNaked),
+        };
+        let i = intimacy(Some(&act(Some(Party::User), one)), None, Wearer::Other);
+        assert_eq!(i.her_clothing, "半裸");
+        assert!(i.section.ends_with("对方穿着：什么都没穿"), "{}", i.section);
+    }
+
+    /// Spec 2026-11-27-passion-group-design.md §7.1.
+    #[test]
+    fn a_named_act_reads_in_the_marker_and_the_label() {
+        use eros_engine_core::events::EventKind::HavingSexTogether;
+        use eros_engine_core::types::UserAction;
+        let named = UserAction::SexTogether {
+            name: Some("姿势甲".into()),
+            active: None,
+            remain_clothing: Default::default(),
+            ignore_orientation: false,
+        };
+        assert_eq!(action_phrase(&UserAction::sex_together()), "想和你上床");
+        assert_eq!(action_phrase(&named), "想和你上床：「姿势甲」");
+        assert_eq!(doing_label(HavingSexTogether, None), "和对方上床");
+        assert_eq!(doing_label(HavingSexTogether, Some("姿势甲")), "和对方上床：「姿势甲」");
     }
 
     /// Spec 2026-11-27-swim-outfit-ladder-and-fish-together-design.md §4.
