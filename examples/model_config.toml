@@ -175,8 +175,8 @@ model_name_display_override = true
 # - a reply to french_kiss, tease, hug_from_behind, touch, strip,
 #   shower_together, bath_together, streak_together, skinny_dip_together,
 #   ride_horse_naked_together, yoga_naked_together, hike_naked_together,
-#   hot_spring_naked_together, sex_together, propose, break_up, threaten or
-#   tip, accepted or refused, and
+#   hot_spring_naked_together, dance_naked_together, massage_naked_together,
+#   sex_together, propose, break_up, threaten or tip, accepted or refused, and
 #   the start message of sixteen life-event kinds, are ALWAYS emotional,
 #   whatever the value (see docs/model-config.md, "tones").
 # An emotional reply is written without the chat history, the user profile or
@@ -188,10 +188,12 @@ model_name_display_override = true
 # is full_time and who has no incident under way. A focused reply keeps the
 # history and the relationship, and is brief: at most one sentence and 40
 # characters.
-# With `erotic` above 0, three moments are `erotic` with that probability, for
+# With `erotic` above 0, four moments are `erotic` with that probability, for
 # a romantically compatible pair outside a cold war: her reply to an accepted
-# sex_together, her reply to an accepted sleep_together or bathe_together
-# ask, and the start message of sudden_desire. A persona whose
+# sex_together, her reply to an accepted french_kiss, tease, lick, touch or
+# ask_massage (the gestures with the passion attribute), her reply to an
+# accepted sleep_together or bathe_together ask, and the start message of
+# sudden_desire. A persona whose
 # art_metadata.sex_addict is true also draws it 1 time in 8 on an everyday
 # 1:1 text turn from chemistry tier 3, whatever the value. A persona whose
 # art_metadata.is_virgin is true is never erotic below chemistry tier 4. An
@@ -381,9 +383,10 @@ model_name_display_override = true
 # should show it, and let it win over [此刻穿着] where the two disagree. The
 # section is absent when nothing is live. While the state is one of these, the
 # engine writes [此刻穿着] itself: a naturism kind (a shower, a bath, a streak,
-# a skinny dip, the naked ride, yoga, hike or hot spring), 什么都没穿; a swim
-# or a hot spring, a swimsuit from a fixed ladder by the persona's gender,
-# romance compatibility, virginity and chemistry tier (什么都没穿 from 0.95);
+# a skinny dip, the naked ride, yoga, hike, hot spring, dance or massage),
+# 什么都没穿; a swim or a hot spring, a swimsuit from a fixed ladder by the
+# persona's gender, romance compatibility, virginity and chemistry tier
+# (什么都没穿 from 0.95);
 # a hot spring for a persona whose gender is neither female nor male, and a
 # sauna, a towel (身上只松松地裹着一条浴巾 for a romance-compatible pair,
 # 身上只裹着一条浴巾 otherwise); sex, 什么都没穿 unless a 1:1 picture's act
