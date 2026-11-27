@@ -7,6 +7,7 @@
   `drowsy`). Two new `model_config.toml` keys (`tones.mean`,
   `tones.drowsy`), each off when absent. Four new `art_metadata` keys
   (`diet`, `sugar`, `salty`, `spicy`), each without effect when absent.
+  Character card `spec_version` `"1.2"`, accepted beside `"1"` and `"1.1"`.
 - **Owner:** enriquephl (sole dev)
 - **Builds on:**
   `2026-11-08-five-actions-two-items-gluttony-card-1-1-design.md` §3–§5
@@ -172,12 +173,22 @@ applies, or both. *(Engine's call.)*
 The list of the three items lives in one function in `eros-engine-core`,
 beside `Habits::uses`.
 
-### 5.3 The card's documentation
+### 5.3 Character card 1.2
 
-No new card version. `docs/eros-character-v1.1.md` gains the three tastes
-in its habit row and `diet` in a row of its own, as `hygienic`, `employed`
-and the later keys were added to 1.1 without a bump. `art_metadata` is an
-open object, so nothing in the validator changes. *(Engine's call.)*
+`spec_version` `"1.2"` is accepted beside `"1"` and `"1.1"`; all three
+parse to the same `Card`, and the engine reads the same keys from each.
+Nothing about the document's shape changes: `art_metadata` is an open
+object, so an older card may carry the four keys too and the engine reads
+them. 1.2 is the version whose documentation lists them. *(Owner's
+ruling.)*
+
+Docs: a new `docs/eros-character-v1.2.md` holds the full field tables as
+`eros-character-v1.1.md` does, with the three tastes in the habit row, a
+row for `diet`, and a *Versions* section that says 1.2 adds the four keys
+and that `"1"` and `"1.1"` are still accepted. `eros-character-v1.1.md`
+gains one sentence in its *Versions* section pointing at 1.2 and is
+otherwise untouched. `byoc.md`, `byoc.zh.md`, the API reference and the
+deploying guide link to 1.2 as the current format.
 
 ## 6. The `mean` tone
 
@@ -342,6 +353,8 @@ A client that lists give items can add the two. A client that reads
 - `eros-engine-store`: the "just woke" read against the cases of §7.1,
   with fixed, microsecond-aligned timestamps.
 - `eros-engine-server`, speech: the sentence for each of the two tones.
+- `eros-engine-server`, cards: a `"1.2"` card parses; a `"1.3"` one is
+  refused.
 - `eros-engine-server`, turn: a date's turn during a cold war is `mean`.
 
 ## 11. Order of work
@@ -349,8 +362,8 @@ A client that lists give items can add the two. A client that reads
 1. Code PR into `dev`: items, keys, the two tones, the example configs'
    comments.
 2. Docs PR into `dev`: `api-reference`, `life-events-needs`,
-   `model-config`, `eros-character-v1.1`, and their `.zh` twins where they
-   exist; and a migrating guide,
+   `model-config`, the new `eros-character-v1.2`, and their `.zh` twins
+   where they exist; and a migrating guide,
    `docs/migrating/v2-9-1-taste-habits-and-two-tones.md`, as v2.9.0 has
    one for `erotic`. It covers what the wire-level "additive" does not:
    crate users who match on `Tone` or `GivenItem` or build `Tones` or
@@ -376,6 +389,7 @@ Owner's rulings:
 - Both tones keep three lines each, `mean` by bond tier, `drowsy` by
   chemistry tier; the six lines are the owner's picks.
 - The tone's name is `drowsy`.
+- The four keys come with character card 1.2.
 
 Engine's calls, open to reversal: everything marked *(engine's call)*
 above, and the cravings' wording 很想吃点甜的 / 咸的 / 辣的 (shown to the
