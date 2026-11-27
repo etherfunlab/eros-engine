@@ -403,8 +403,8 @@ authors the persona, sit beside `gender`, `birthday` and `timezone`:
 | `health` | `"weak"`, `"normal"` (default), `"strong"` | the `body` category weighs 2 times, 1 time, half as much; her period lasts 5, 3, 1 days ([her cycle](#her-cycle)) |
 | `prefer_trip` | `true`, `false` (default) | the `trip` category weighs 3 times as much |
 | `homesick` | `true`, `false`, absent (default) | within `trip`: `true` weighs `hometown_visit` 3 times and `short_trip` / `long_trip` a third; `false` weighs `hometown_visit` a third; `business_trip` is work and untouched either way |
-| `is_virgin` | `true`, `false` (default) | while she is a virgin, `having_sex` weighs a fifth within `mid` and `just_have_sex` a fifth within `short` |
-| `sex_addict` | `true`, `false`, absent (default) | within `short`: `true` weighs `sudden_desire`, `strip`, `streaking` and `just_have_sex` 3 times, `false` a third; their gates hold either way. Only `true` lets her draw `having_sex` and `masturbating` |
+| `is_virgin` | `true`, `false` (default) | while she is a virgin, `having_sex` weighs a fifth within `mid` and `just_have_sex` a fifth within `short`. With `true` on the card she is never answered in the `erotic` tone below chemistry tier 4 ([when she wants you](#when-she-wants-you)) |
+| `sex_addict` | `true`, `false`, absent (default) | within `short`: `true` weighs `sudden_desire`, `strip`, `streaking` and `just_have_sex` 3 times, `false` a third; their gates hold either way. Only `true` lets her draw `having_sex` and `masturbating`. `true` also gives her everyday turns a 1 in 8 chance of the `erotic` tone ([when she wants you](#when-she-wants-you)) |
 | `hygienic` | `true`, `false`, absent (default) | within `short`: `true` weighs `showering`, `bathing`, `want_hot_spring` and `want_sauna` 3 times, `false` a third; it also sets the chemistry tier [a bath together](#a-bath-together) needs |
 | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` weigh a third, 1 time, 3 times within their categories; a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time`. `full_time` also makes her career-minded: with `tones.focused` above 0, a turn that may draw a tone, off work and with no incident under way, is `focused` 1 time in 8 ([at work](#at-work)) |
 | `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | within each category, `outdoor` weighs the outdoor kinds 3 times and the indoor kinds a third, `indoor` the reverse; neutral kinds are untouched ([below](#outdoors-or-in)); any other value reads as `neutral` |
@@ -421,7 +421,9 @@ Her virginity as the draw sees it is derived: the card says `is_virgin` and the 
 no `having_sex`, `just_have_sex` or `having_sex_together` event, ever. The first row of any of
 them ends it, with no write anywhere: the next draw reads the row. A `sex_together` she accepts
 inside a date places no row and leaves it as it was. The key reaches no prompt; what she is like is written into her
-persona by its author, as every other persona fact. `sex_addict` reaches no prompt either.
+persona by its author, as every other persona fact. `sex_addict` reaches no prompt either. The
+`erotic` tone reads the card's `is_virgin` itself, not this derived reading ([when she wants
+you](#when-she-wants-you)).
 
 `hygienic`, `employed` and `outdoorsy` reach no prompt and are not habits: they do not move `indulgence`.
 `hygienic` is its own factor, so it multiplies with a needs factor on the same kind. `employed`
@@ -583,7 +585,8 @@ are told in the `emotional` tone: `quarrel`, `scolded_by_superior`, `scolded_sup
 and the cue alone: no history window, no memory recall, no user profile and no affinity
 conclusions; `[shared_memories]` holds the relationship's three latest episodes, and `[now]`
 keeps the events under way. The message's row carries `metadata.tone = "emotional"`. Every
-other kind, and every kind while the tone is off, is told as above.
+other kind, and every kind while the tone is off, is told as above. `sudden_desire`'s message
+is `erotic` instead when [that tone](#when-she-wants-you) wins its roll.
 
 Then:
 
@@ -692,6 +695,34 @@ rolled: its `[this_turn]` holds this one line and nothing else:
 ```
 
 The reply's rows carry `metadata.tone = "focused"`. The draw is in
+[model-config.md](model-config.md#tones--chat-tones-chat-task-only).
+
+### When she wants you
+
+While the deployment has [`tones.erotic`](model-config.md#tones--chat-tones-chat-task-only)
+above 0, some messages are written in the `erotic` tone: the `emotional` tone, plus who the user
+is to her (`[relationship]`) and one `[this_turn]` line saying she wants them, set by the pair's
+chemistry tier.
+
+| the message | chance it is `erotic` |
+|---|---|
+| her reply to a [`sex_together`](#the-passion-group) she accepts | the value of `tones.erotic` |
+| her reply when the user accepts her [`sleep_together`](#the-romantic-choices) or [`bathe_together`](#a-bath-together) ask | the value of `tones.erotic` |
+| the message `sudden_desire` sends when it starts | the value of `tones.erotic` |
+| a 1:1 text turn without a user action, `sex_addict` is `true` ([persona settings](#persona-settings)), chemistry tier 3 or above, and no incident under way or one of `sudden_desire`, `strip`, `streaking`, `just_have_sex`, `masturbating` or a naturism- or passion-group kind | 1 in 8, whatever the key's value |
+| any other | none |
+
+Three conditions stand in front of every row: the message's `affinity_scope` has a chemistry axis,
+no cold war is on, and a persona whose `is_virgin` is `true` is at chemistry tier 4 or above. With
+one failing, the message is what it is without the key. Only the one message of each of the first
+three rows is `erotic`; the turns that follow, while the event lasts, draw as any turn does.
+
+The floor for a virgin persona reads the card's `is_virgin` alone, whatever has happened since. The
+draw above reads the same key as a fact that ends with her first time; the tone reads it as
+character: having slept with the user does not change who she is.
+
+`erotic` comes before `emotional`, and `emotional` before `focused`. The message's rows carry
+`metadata.tone = "erotic"`. The lines and the rest of the draw are in
 [model-config.md](model-config.md#tones--chat-tones-chat-task-only).
 
 ### Offline kinds
@@ -2076,7 +2107,8 @@ choice's session with the two wordings in
 - `crates/eros-engine-core/src/scope.rs`: `romance_compatible`, the criterion the romantic
   choices read.
 - `crates/eros-engine-core/src/tone.rs`: `at_work` and `focused_probability`, the chance of a
-  `focused` turn.
+  `focused` turn; `EroticGate`, `fixed_erotic_probability` and `everyday_erotic_probability`,
+  the conditions and the chance of an `erotic` message.
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`: the needs read and write (the
   accepted give's move goes through `after_give`), the `[需求]` and `[近期事件]` lines
   (`build_pde_ctx`), the offline branch ahead of the judge, the give roll's refusal

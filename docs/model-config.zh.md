@@ -101,7 +101,7 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `tasks.<name>.allow_traits` | `Array<String>` | 否 | 此任务的 prompt-trait allow-list（三态：缺失 = 不设门控；`[]` = 丢弃所有 trait；`["a","b"]` = 白名单）。找不到匹配的 tier 块时使用。 |
 | `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback`、`allow_traits` 和/或 `retry_depth`。不覆盖 `temperature`、`max_tokens`、`top_p`、`frequency_penalty`、`presence_penalty` 或 `repetition_penalty`——这六个都只在任务级生效。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | 否 | 用户输入改写 filter 的全局 trigger。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。`false`/缺失 = 关闭，`true` = 每轮执行，`0.8` = 约 80% 的轮次执行（超出 `[0.0, 1.0]` 的数字会被拒绝）。参见“`input_filter`”。 |
-| `tasks.chat_companion.tones` | table | 否 | 聊天语气：`{ emotional = <f64>, focused = <f64> }`，各为 `[0.0, 1.0]` 内的概率。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。哪个键缺失或为 `0`，哪种语气就关闭；超出范围的值、或 `emotional` 和 `focused` 以外的语气名会拒绝启动。参见“`tones`”。 |
+| `tasks.chat_companion.tones` | table | 否 | 聊天语气：`{ emotional = <f64>, focused = <f64>, erotic = <f64> }`，各为 `[0.0, 1.0]` 内的概率。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。哪个键缺失或为 `0`，哪种语气就关闭；超出范围的值、或 `emotional`、`focused`、`erotic` 以外的语气名会拒绝启动。参见“`tones`”。 |
 | `tasks.<name>.description` | `String` | 否 | 文档字段，代码忽略。 |
 
 **`defaults.ignore_providers` 和 `defaults.provider_sort` 已移除。** 残留
@@ -521,17 +521,18 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 ### `tones` — 聊天语气（仅限 chat 任务）
 
 `[tasks.chat_companion]` 上的 `tones` 打开 engine 的聊天语气。它只在任务级设置，没有 per-tier
-覆盖。它有两个键，`emotional` 和 `focused`；每个键缺失或为 `0` 即关闭，两个键各管各的，不依赖对方。
-两个都关（默认）时，每个 prompt、请求和落库的行都和没有这张表时一样。
-超出 `[0.0, 1.0]` 的值、或 `emotional` 和 `focused` 以外的语气名，会拒绝启动。
+覆盖。它有三个键，`emotional`、`focused` 和 `erotic`；每个键缺失或为 `0` 即关闭，三个键各管各的，互不依赖。
+三个都关（默认）时，每个 prompt、请求和落库的行都和没有这张表时一样。
+超出 `[0.0, 1.0]` 的值、或这三个以外的语气名，会拒绝启动。
 
 ```toml
 [tasks.chat_companion]
-tones = { emotional = 0.05, focused = 1.0 }
+tones = { emotional = 0.05, focused = 1.0, erotic = 1.0 }
 ```
 
 判官决定回复和用户这句话的关系（`reply_mode`），从不决定语气。语气由 engine 在这一轮定稿的计划上决定，
-只有带文字的回复才有语气：
+只有带文字的回复才有语气。同时满足多种语气时，`erotic` 先于 `emotional`，`emotional` 先于 `focused`：
+先掷赢的那一个定下这条消息的语气，后面的不再掷。
 
 - **不带用户动作的 1:1 文字回合**，以概率 `min(1, emotional × moody × needs × compatible)` 用 `emotional`：
 
@@ -555,8 +556,30 @@ tones = { emotional = 0.05, focused = 1.0 }
 - **带十八种用户动作之一的 1:1 回合**（`french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`，天然组和激情组的一起做的动作
   `shower_together`、`bath_together`、`streak_together`、`skinny_dip_together`、`ride_horse_naked_together`、`yoga_naked_together`、`hike_naked_together`、`hot_spring_naked_together` 和 `sex_together`，以及 `propose`、`break_up`、`threaten`、`tip`）在 `emotional` 大于 0 时一律用 `emotional`，接受、拒绝都一样。其余带动作的回合从不用 `emotional`，带动作的回合也从不用 `focused`。
 - **生活事件开始时发的那条消息**，在 `emotional` 大于 0 时有十六种事件用 `emotional`（[life-events-needs.zh.md](life-events-needs.zh.md#她怎么讲出来)）。
+- **三个时刻**以概率 `erotic` 用 `erotic`，各掷一次：
 
-群聊回合、`/open` 和其他主动消息、编辑与改图回合、语音通话从不带语气。
+  | 时刻 | 哪条消息 | 没掷中时 |
+  |---|---|---|
+  | 用户的 `sex_together` 被她接受 | 她在这一轮的回复 | 照上面用 `emotional`，否则是默认回复 |
+  | 她提的 `sleep_together` 或 `bathe_together` 被用户接受 | 她对这个答复的回复 | 默认回复 |
+  | `sudden_desire` | 事件开始时发的那条消息 | 照上面用 `emotional`，否则是默认消息 |
+
+  每个时刻只有这一条消息：之后的回合照常掷。被她拒绝的 `sex_together`、她开口邀请的那条、用户拒绝后她的回复、
+  以及 `fall_asleep_together` 都不在其中。`erotic = 1.0` 让这些时刻全都用 `erotic`。
+- **不带用户动作的 1:1 文字回合**，在角色的 `art_metadata.sex_addict` 为 `true`、这一对的 chemistry 在档 3
+  及以上、并且没有插曲在进行（或进行中的是 `sudden_desire`、`strip`、`streaking`、`just_have_sex`、`masturbating`，
+  或天然组、激情组的事件）时，有八分之一的机会用 `erotic`，`erotic` 大于 0 时不管取多少。这一掷排在 `emotional`
+  抽签之前。这个键只负责打开那个 1/8，不缩放它。
+
+不论是固定时刻还是掷出来的，每一条 `erotic` 消息还要同时满足下面几条；有一条不满足就不掷 `erotic`，
+消息和没有这个键时一样：
+
+- 这条消息的 `affinity_scope` 含暧昧感轴（她对答复的回复，读的是这次作答请求带的 scope）；
+- 不在冷战中；
+- `art_metadata.is_virgin` 为 `true` 的角色，chemistry 要在档 4 及以上。这一条只读卡上的键，她后来有没有过
+  第一次都不变：生活事件的抽取把 `is_virgin` 当作事实，第一次之后就结束；语气把它当作个性。
+
+群聊回合、`/open`、上面两种以外的其他主动消息、编辑与改图回合、语音通话从不带语气。
 
 **`emotional` 回复**只凭人设和用户刚说的话、做的事来写，模型面前几乎没有别的东西：
 
@@ -570,6 +593,22 @@ tones = { emotional = 0.05, focused = 1.0 }
   `[world_memories]` 和 `[world_stories]` 只出 digest：这一轮不调 embedding。
 - `[shared_memories]` 只放这段关系最近的三个 episode；这一轮的 `memory_scope` 关掉关系层时一个都没有。
 
+**`erotic` 回复**是 `emotional` 回复再加两样东西。上面说的都对它成立：没有历史、没有画像、保留和去掉的块相同、
+三个 episode、`[reply_length]` 在最低一档。
+
+- `[relationship]` 照默认 prompt 的写法渲染，取这条消息的亲密度和 scope：用户是她的什么人。
+- `[this_turn]` 只放一行，由这一对的 chemistry 档位决定：
+
+  | chemistry 档位 | 这一行 |
+  |---|---|
+  | 档 3 及以下 | `- 你此刻对对方有欲望：话里带着撩拨和暗示，慢一点，贴近一点` |
+  | 档 4 | `- 你现在很想要对方：语气放软、放慢，带着勾人的意味` |
+  | 档 5 | `- 你的心思和身体都在对方身上：说话带着诱惑，不必遮掩` |
+
+  日常的那一掷从档 3 起，未经人事的角色从档 4 起；固定时刻本身没有档位门槛，所以档 3 以下的一对读第一行。
+
+她对被接受的邀请的回复也这样构造：system prompt 加上答复的提示作为唯一一条 user 消息。
+
 **`focused` 回复**像手上有工作的人那样写：请求和 system prompt 都是默认的那一套，区别只有这些：
 
 - system prompt 去掉 `[feelings]` 和 `[emotional_context]`。`[reply_length]` 固定在最低一档
@@ -582,8 +621,8 @@ tones = { emotional = 0.05, focused = 1.0 }
 
 post-process（记忆、insights、亲密度）照常跑；模型、采样、输出 filter 和各帧都和 chat 任务一样。
 
-**记录。** 两次抽签至少掷过一次的回合，它的每一行 assistant 消息都带 `metadata.tone`：最终的语气，
-`"emotional"`、`"focused"` 或 `"default"`。`emotional` 大于 0 时，名单内动作回合的行、名单内事件消息的行也带 `"emotional"`；用户行的 `metadata.action`
+**记录。** 只要为一条消息掷过一次，它的每一行 assistant 消息都带 `metadata.tone`：最终的语气，
+`"erotic"`、`"emotional"`、`"focused"` 或 `"default"`。她对被接受的邀请的回复没掷中 `erotic` 时带 `"default"`。`emotional` 大于 0 时，名单内动作回合的行、名单内事件消息的行也带 `"emotional"`；用户行的 `metadata.action`
 和消息的 `metadata.proactive` 能把它们和抽签的回合区分开。只开 `focused` 时，名单内动作回合不抽签，它的行不带 `tone`。语气没碰到的回合没有 `tone` 这个键。
 语气不存别处：判官的决策行上没有，任何帧里也没有。
 
