@@ -756,6 +756,46 @@ impl EventRepo<'_> {
         Ok(row.and_then(record))
     }
 
+    /// Whether she just woke beside the user in `session_id` at `at` (spec
+    /// 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+    /// §7.1): the newest event this session placed among
+    /// `EventKind::WAKES_FROM` has ended by `at`, no more than
+    /// `tone::WOKE_WITHIN_HOURS` before it, and the session holds no
+    /// assistant row with text written after it ended. A row stamped after
+    /// `at` is not yet said. An event cut short counts as one that ended.
+    pub async fn just_woke(
+        &self,
+        session_id: Uuid,
+        instance_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let kinds: Vec<&str> = EventKind::WAKES_FROM.iter().map(|k| k.as_str()).collect();
+        sqlx::query_scalar(
+            "WITH woke AS ( \
+                 SELECT ends_at FROM engine.persona_events \
+                  WHERE instance_id = $2 AND session_id = $1 AND kind = ANY($4) \
+                    AND started_at <= $3 \
+                  ORDER BY started_at DESC, id DESC \
+                  LIMIT 1 \
+             ) \
+             SELECT EXISTS ( \
+                 SELECT 1 FROM woke \
+                  WHERE woke.ends_at <= $3 \
+                    AND woke.ends_at >= $3 - make_interval(hours => $5) \
+                    AND NOT EXISTS (SELECT 1 FROM engine.chat_messages m \
+                                     WHERE m.session_id = $1 AND m.role = 'assistant' \
+                                       AND btrim(m.content) <> '' \
+                                       AND m.sent_at > woke.ends_at AND m.sent_at <= $3))",
+        )
+        .bind(session_id)
+        .bind(instance_id)
+        .bind(at)
+        .bind(&kinds)
+        .bind(eros_engine_core::tone::WOKE_WITHIN_HOURS as i32)
+        .fetch_one(self.pool)
+        .await
+    }
+
     /// The separation this session agreed to (spec 2026-10-19-life-events-
     /// shopping-gatherings-and-ask-for-space-design.md §3.5, "The return is
     /// acknowledged either way"): the newest `taking_space` row an accepted
@@ -3161,5 +3201,202 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[&b].kind, Sick);
+    }
+
+    // ---- "Just woke" (spec 2026-11-28-dessert-soup-taste-habits-mean-and-
+    // drowsy-tones-design.md §7.1) ----
+
+    const WOKE_AT: &str = "2026-11-28T12:00:00Z";
+
+    async fn woke(pool: &PgPool, s: Uuid, i: Uuid) -> bool {
+        EventRepo { pool }
+            .just_woke(s, i, t(WOKE_AT))
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn she_just_woke_until_her_first_line(pool: PgPool) {
+        for kind in [AsleepTogether, HavingSexTogether] {
+            let (_, i, s) = instance_and_session(&pool).await;
+            let e = ev(
+                i,
+                s,
+                "k",
+                kind,
+                "2026-11-28T08:00:00Z",
+                "2026-11-28T11:00:00Z",
+            );
+            seed(&pool, e, None).await;
+            assert!(woke(&pool, s, i).await, "{kind:?}");
+            row(&pool, s, "assistant", "2026-11-28T11:30:00Z", false).await;
+            assert!(!woke(&pool, s, i).await, "{kind:?}: her line used it up");
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_blank_line_a_user_row_or_a_line_before_the_end_does_not_count(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let e = ev(
+            i,
+            s,
+            "k",
+            AsleepTogether,
+            "2026-11-28T08:00:00Z",
+            "2026-11-28T11:00:00Z",
+        );
+        seed(&pool, e, None).await;
+        row_with(&pool, s, "assistant", "  ", "2026-11-28T11:10:00Z", false).await;
+        row_with(&pool, s, "user", "醒了吗", "2026-11-28T11:20:00Z", false).await;
+        row(&pool, s, "assistant", "2026-11-28T10:59:59Z", false).await;
+        row(&pool, s, "assistant", "2026-11-28T11:00:00Z", false).await;
+        assert!(woke(&pool, s, i).await);
+    }
+
+    /// The read has an upper bound: a row stamped after the turn's own moment
+    /// is not yet said.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_row_after_the_turn_s_moment_does_not_count(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let e = ev(
+            i,
+            s,
+            "k",
+            AsleepTogether,
+            "2026-11-28T08:00:00Z",
+            "2026-11-28T11:00:00Z",
+        );
+        seed(&pool, e, None).await;
+        row(&pool, s, "assistant", "2026-11-28T12:00:01Z", false).await;
+        assert!(woke(&pool, s, i).await);
+        row(&pool, s, "assistant", "2026-11-28T12:00:00Z", false).await;
+        assert!(
+            !woke(&pool, s, i).await,
+            "a row at the moment itself is said"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn still_asleep_is_not_awake(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let e = ev(
+            i,
+            s,
+            "k",
+            AsleepTogether,
+            "2026-11-28T11:00:00Z",
+            "2026-11-28T13:00:00Z",
+        );
+        seed(&pool, e, None).await;
+        assert!(!woke(&pool, s, i).await);
+        let (_, i, s) = instance_and_session(&pool).await;
+        let e = ev(
+            i,
+            s,
+            "k",
+            AsleepTogether,
+            "2026-11-28T12:30:00Z",
+            "2026-11-28T13:00:00Z",
+        );
+        seed(&pool, e, None).await;
+        assert!(!woke(&pool, s, i).await, "one that has not started yet");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn twelve_hours_is_the_bound(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let e = ev(
+            i,
+            s,
+            "k",
+            AsleepTogether,
+            "2026-11-27T22:00:00Z",
+            "2026-11-28T00:00:00Z",
+        );
+        seed(&pool, e, None).await;
+        assert!(woke(&pool, s, i).await, "exactly twelve hours");
+        let (_, i, s) = instance_and_session(&pool).await;
+        let e = ev(
+            i,
+            s,
+            "k",
+            AsleepTogether,
+            "2026-11-27T22:00:00Z",
+            "2026-11-27T23:59:59Z",
+        );
+        seed(&pool, e, None).await;
+        assert!(!woke(&pool, s, i).await, "a second more");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_newest_one_decides(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let e = ev(
+            i,
+            s,
+            "a",
+            AsleepTogether,
+            "2026-11-28T08:00:00Z",
+            "2026-11-28T10:00:00Z",
+        );
+        seed(&pool, e, None).await;
+        let e = ev(
+            i,
+            s,
+            "b",
+            HavingSexTogether,
+            "2026-11-28T11:30:00Z",
+            "2026-11-28T12:30:00Z",
+        );
+        seed(&pool, e, None).await;
+        assert!(!woke(&pool, s, i).await, "the newer one is still under way");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn another_kind_or_another_session_is_not_hers(pool: PgPool) {
+        let (owner, i, s) = instance_and_session(&pool).await;
+        let e = ev(
+            i,
+            s,
+            "a",
+            Asleep,
+            "2026-11-28T08:00:00Z",
+            "2026-11-28T11:00:00Z",
+        );
+        seed(&pool, e, None).await;
+        assert!(!woke(&pool, s, i).await, "asleep alone");
+        let sibling = another_session(&pool, owner, i).await;
+        let e = ev(
+            i,
+            sibling,
+            "b",
+            AsleepTogether,
+            "2026-11-28T08:00:00Z",
+            "2026-11-28T11:00:00Z",
+        );
+        seed(&pool, e, None).await;
+        assert!(!woke(&pool, s, i).await, "the sibling session's");
+        assert!(woke(&pool, sibling, i).await);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn one_cut_short_counts(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let e = ev(
+            i,
+            s,
+            "k",
+            AsleepTogether,
+            "2026-11-28T11:00:00Z",
+            "2026-11-28T15:00:00Z",
+        );
+        seed(&pool, e, None).await;
+        sqlx::query("UPDATE engine.persona_events SET ends_at = $2 WHERE session_id = $1")
+            .bind(s)
+            .bind(t("2026-11-28T11:50:00Z"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(woke(&pool, s, i).await);
     }
 }
