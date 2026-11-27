@@ -457,6 +457,13 @@ impl EventKind {
         EventKind::HavingSexTogether,
     ];
 
+    /// The kinds she wakes from beside the user: once one has ended, her
+    /// first reply may be `drowsy` (spec
+    /// 2026-11-28-dessert-soup-taste-habits-mean-and-drowsy-tones-design.md
+    /// §7.1).
+    pub const WAKES_FROM: [EventKind; 2] =
+        [EventKind::AsleepTogether, EventKind::HavingSexTogether];
+
     /// The stored and wire value.
     pub fn as_str(self) -> &'static str {
         match self {
