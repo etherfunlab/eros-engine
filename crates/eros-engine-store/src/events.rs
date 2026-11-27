@@ -524,12 +524,16 @@ impl EventRepo<'_> {
         .await?
         .flatten();
         // The stored object also holds the decided `response`, which is not
-        // part of the action.
+        // part of the action. An action that places another kind is not the
+        // one that placed this row (the message was edited since): its words
+        // are not this event's.
+        let kind = e.kind;
         e.text = action
             .and_then(|mut a| {
                 a.as_object_mut()?.remove("response");
                 serde_json::from_value::<eros_engine_core::types::UserAction>(a).ok()
             })
+            .filter(|a| a.together_kind() == Some(kind))
             .and_then(|a| a.together_text().map(|t| t.into_owned()));
         Ok(())
     }
@@ -1480,6 +1484,14 @@ mod tests {
             (
                 4,
                 json!({"type": "dance_together", "style": "waltz", "response": "accept"}),
+                DancingTogether,
+                None,
+            ),
+            // The message's action is no longer the one that placed the row
+            // (an edited message): its words are not this event's.
+            (
+                5,
+                json!({"type": "custom_together", "text": "去海边", "response": "accept"}),
                 DancingTogether,
                 None,
             ),

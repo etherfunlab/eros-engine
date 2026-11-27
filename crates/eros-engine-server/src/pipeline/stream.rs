@@ -32253,7 +32253,7 @@ data: [DONE]\n\n"
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_dance_lover_takes_a_dance_the_judge_refused(pool: PgPool) {
         let (mut forced, mut judged) = (0, 0);
-        for _ in 0..24 {
+        for _ in 0..64 {
             let (frames, mock, _) = run_together_turn_mock(
                 &pool,
                 eros_engine_core::types::UserAction::ask_dancing(),
@@ -32278,13 +32278,13 @@ data: [DONE]\n\n"
                 return;
             }
         }
-        panic!("both outcomes within 24 turns: forced {forced}, judged {judged}");
+        panic!("both outcomes within 64 turns: forced {forced}, judged {judged}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn a_dance_hater_turns_down_a_dance_the_judge_accepted(pool: PgPool) {
         let (mut forced, mut judged) = (0, 0);
-        for _ in 0..24 {
+        for _ in 0..64 {
             let (frames, mock, umid) = run_together_turn_mock(
                 &pool,
                 eros_engine_core::types::UserAction::dance_together(),
@@ -32318,7 +32318,7 @@ data: [DONE]\n\n"
                 return;
             }
         }
-        panic!("both outcomes within 24 turns: forced {forced}, judged {judged}");
+        panic!("both outcomes within 64 turns: forced {forced}, judged {judged}");
     }
 
     /// `naturism = dislike` turns down a naturism action the judge accepted
@@ -32351,7 +32351,7 @@ data: [DONE]\n\n"
             ),
         ] {
             let (mut seen_forced, mut seen_judged) = (false, false);
-            for _ in 0..24 {
+            for _ in 0..64 {
                 let (frames, mock, _) = run_together_turn_mock(
                     &pool,
                     action.clone(),
@@ -32377,7 +32377,7 @@ data: [DONE]\n\n"
             }
             assert!(
                 seen_forced && seen_judged,
-                "{action:?}: both outcomes within 24 turns"
+                "{action:?}: both outcomes within 64 turns"
             );
         }
     }
@@ -32392,7 +32392,7 @@ data: [DONE]\n\n"
                 Some(serde_json::json!({"dance": "love"})),
             ),
         ] {
-            for _ in 0..4 {
+            for _ in 0..12 {
                 let (frames, mock, _) = run_together_turn_mock(
                     &pool,
                     action.clone(),
