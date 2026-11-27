@@ -483,7 +483,9 @@ curl -N -X POST -H "Authorization: Bearer $JWT" -H "Content-Type: application/js
 
 **让你拍照。** 请求带 `image`、部署配置了 `[tasks.chat_image_prompt_compose]` 时，被接受的 `photo` 以 `reply_text_image` 回复：先是她的话，再是一条以她的脸部参考为基础、按当前场景组出来的 `image_request`。有没有 LLM 判官都一样。被接受的 `strip` 也这样回复，被接受的 `ask_dancing`（用户想看她跳支舞，图是她在跳舞）和任何被接受的一起做的动作也一样。被拒的 `photo`、`strip`、`ask_dancing` 或一起做的动作，或没有这项出图能力的，只回文字，即使判官提议了出图。`image.force = true` 仍让这一轮是 `reply_image`，被拒时图按拒绝的结果来画。
 
-**情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、天然组或激情组的一起做的动作（`shower_together`、`bath_together`、`streak_together`、`skinny_dip_together`、`ride_horse_naked_together`、`yoga_naked_together`、`hike_naked_together`、`hot_spring_naked_together`、`sex_together`）、`propose`、`break_up`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。不带动作的回合可能抽一次语气（见[语气](model-config.zh.md#tones--聊天语气仅限-chat-任务)）；只有抽过签时，它的 assistant 行才带 `metadata.tone`（`"emotional"`、`"focused"` 或 `"default"`）。
+**情绪化回复。** 部署打开 [`tones.emotional`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，带 `french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、天然组或激情组的一起做的动作（`shower_together`、`bath_together`、`streak_together`、`skinny_dip_together`、`ride_horse_naked_together`、`yoga_naked_together`、`hike_naked_together`、`hot_spring_naked_together`、`sex_together`）、`propose`、`break_up`、`threaten` 或 `tip` 的回合用 `emotional` 语气回复，接受、拒绝都一样：回复只凭人设、这个动作和她的决定来写，不看聊天历史、用户画像和亲密度结论。接受还是拒绝仍照上面的方式决定。回复的行带 `metadata.tone = "emotional"`。不带动作的回合可能抽一次语气（见[语气](model-config.zh.md#tones--聊天语气仅限-chat-任务)）；只有抽过签时，它的 assistant 行才带 `metadata.tone`（`"erotic"`、`"emotional"`、`"focused"` 或 `"default"`）。
+
+**erotic 回复。** 部署打开 [`tones.erotic`](model-config.zh.md#tones--聊天语气仅限-chat-任务)（大于 0）时，她接受 `sex_together` 的那条回复可能改用 `erotic` 语气：在 `emotional` 回复之上，再告诉她用户是她的什么人。用户接受她提的 `sleep_together` 或 `bathe_together` 时她的那条回复、`sudden_desire` 开始时发的那条消息、以及 `sex_addict` 为 `true` 的角色的日常回合也可能如此。这一对要在那条消息的 `affinity_scope` 上是性向相容的，所以回答她的邀请时，请求应带上和聊天回合相同的 scope。这类消息的行带 `metadata.tone = "erotic"`。
 
 **约会。** `date` 是约她出去。先过 engine 的门槛：`short` 没有门槛，`mid` 要求 bond 达到第 2 档，她离线或正在另一场约会里时一律不通过；
 门槛不通过就是拒绝，不管判官怎么答。被拒时这一回合是没有代价的普通回合。被接受时，这一回合的 `final` 帧带 `activity`：
@@ -1073,8 +1075,8 @@ engine 抽一种事件，或者什么都不抽，然后角色用一条主动消�
   | `period` | `true` / `false` / 不写 | 她有没有月经（见上）：不写时，人类女性有，其他物种的女性没有；机器和不是女性的角色一律没有 |
   | `prefer_trip` | `true` / `false`（默认） | trip 类被抽到的概率是原来的三倍；仍然每周最多一次 |
   | `homesick` | `true` / `false` / 不写 | 出行往哪去：`true` 偏向 `hometown_visit`、压低游玩的两种；`false` 压低 `hometown_visit`；`business_trip` 不动 |
-  | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex`、`just_have_sex` 或 `having_sex_together` 事件之前，`having_sex` 与 `just_have_sex` 的概率是五分之一；之后这个键不再起作用 |
-  | `sex_addict` | `true` / `false` / 不写 | `sudden_desire`、`strip`、`streaking` 与 `just_have_sex` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；门槛照旧。只有 `true` 才会抽到 `having_sex` 和 `masturbating` |
+  | `is_virgin` | `true` / `false`（默认） | 第一次 `having_sex`、`just_have_sex` 或 `having_sex_together` 事件之前，`having_sex` 与 `just_have_sex` 的概率是五分之一；之后这个键对它们不再起作用。为 `true` 时，chemistry 在档 4 以下她也不会用 `erotic` 语气，这一条不随第一次而失效 |
+  | `sex_addict` | `true` / `false` / 不写 | `sudden_desire`、`strip`、`streaking` 与 `just_have_sex` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；门槛照旧。只有 `true` 才会抽到 `having_sex` 和 `masturbating`。`tones.erotic` 打开时，`true` 还让她的日常回合从 chemistry 档 3 起有八分之一的机会用 `erotic` 语气 |
   | `hygienic` | `true` / `false` / 不写 | `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 在 `short` 内被抽到的概率是原来的三倍 / 三分之一；也决定她什么时候提出一起洗澡（见[下文](#post-v2compsessionsession_idlife-choiceschoice_id)） |
   | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内被抽到的概率分别是原来的三分之一 / 一倍 / 三倍，`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读。`full_time` 还表示有事业心：[`tones.focused`](model-config.zh.md#tones--聊天语气仅限-chat-任务) 大于 0 时，可以抽语气、不在上班、也没有插曲在进行的回合，有八分之一用 `focused` 语气回复（见[上班时](life-events-needs.zh.md#上班时)） |
   | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | `outdoor`：户外种类在各自类别内被抽到的概率是原来的 3 倍，室内种类是三分之一；`indoor` 反过来。可能让她离线的种类算中性，不受影响；每种的场所见 [life-events-needs.zh.md](life-events-needs.zh.md#户外还是室内)；其他值按 `neutral` 读 |

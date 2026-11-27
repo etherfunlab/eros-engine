@@ -302,8 +302,8 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 | `health` | `"weak"`、`"normal"`（默认）、`"strong"` | `body` 类别权重分别为 2 倍、1 倍、一半；她的月经分别持续 5、3、1 天（见[她的周期](#她的周期)） |
 | `prefer_trip` | `true`、`false`（默认） | `trip` 类别权重为 3 倍 |
 | `homesick` | `true`、`false`、不写（默认） | `trip` 内部：`true` 时 `hometown_visit` 3 倍、`short_trip` / `long_trip` 三分之一；`false` 时 `hometown_visit` 三分之一；`business_trip` 是工作，两种情况都不动 |
-| `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内、`just_have_sex` 在 `short` 内权重为五分之一 |
-| `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire`、`strip`、`streaking` 与 `just_have_sex` 3 倍，`false` 时三分之一；它们的门槛两种情况都照旧。只有 `true` 才会抽到 `having_sex` 和 `masturbating` |
+| `is_virgin` | `true`、`false`（默认） | 她还是处女期间，`having_sex` 在 `mid` 内、`just_have_sex` 在 `short` 内权重为五分之一。卡上为 `true` 时，chemistry 在档 4 以下她的回复不会用 `erotic` 语气（见[她想要你的时候](#她想要你的时候)） |
+| `sex_addict` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `sudden_desire`、`strip`、`streaking` 与 `just_have_sex` 3 倍，`false` 时三分之一；它们的门槛两种情况都照旧。只有 `true` 才会抽到 `having_sex` 和 `masturbating`。`true` 还让她日常的回合有八分之一的机会用 `erotic` 语气（见[她想要你的时候](#她想要你的时候)） |
 | `hygienic` | `true`、`false`、不写（默认） | `short` 内部：`true` 时 `showering`、`bathing`、`want_hot_spring` 与 `want_sauna` 3 倍，`false` 时三分之一；它也决定[一起洗澡](#一起洗澡)要 chemistry 到第几档 |
 | `employed` | `"free"`、`"part_time"`（默认）、`"full_time"` | 她的一天有多少是工作：`temp_work`、`scolded_by_superior`、`scolded_superior` 与 `business_trip` 在各自类别内分别为三分之一、1 倍、3 倍；`free` 的角色不会抽到 `want_to_quit_job`；其他值按 `part_time` 读。`full_time` 还表示她有事业心：`tones.focused` 大于 0 时，可以抽语气、不在上班、也没有插曲在进行的回合，有八分之一用 `focused` 语气（见[上班时](#上班时)） |
 | `outdoorsy` | `"outdoor"`、`"neutral"`（默认）、`"indoor"` | 每个类别内部：`outdoor` 时户外种类 3 倍、室内种类三分之一，`indoor` 反过来；中性种类不动（见[下文](#户外还是室内)）；其他值按 `neutral` 读 |
@@ -317,7 +317,7 @@ engine 用到需求的地方只有一处：事件抽取的权重（见下）。�
 
 抽取看到的「是否处女」是推导出来的：卡上写了 `is_virgin`，并且这个实例从来没有过 `having_sex`、`just_have_sex` 或 `having_sex_together` 事件。
 其中任何一种的第一条行写下之后就不再是了，不需要任何写入：下一次抽取读到那一行就行。她在约会里答应的 `sex_together` 不写行，所以不改变这一点。这个键不进任何
-prompt；她是什么样的人由写角色的人写进人设，和其他人设事实一样。`sex_addict` 同样不进任何 prompt。
+prompt；她是什么样的人由写角色的人写进人设，和其他人设事实一样。`sex_addict` 同样不进任何 prompt。`erotic` 语气读的是卡上的 `is_virgin` 本身，不是这个推导出来的结果（见[她想要你的时候](#她想要你的时候)）。
 
 `hygienic`、`employed` 和 `outdoorsy` 也不进任何 prompt，而且不算习惯：它们不影响 `indulgence`。`hygienic` 是单独的一个系数，
 和同一种类上的需求系数相乘。`employed` 不动 `busy` 和 `in_battle`，也不改任何冷却或时长。
@@ -438,7 +438,7 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 十六种事件用 `emotional` 语气讲出来：`quarrel`、`scolded_by_superior`、`scolded_superior`、`got_hit`、`hit_someone`、`police_encounter`、`ex_wants_back`、`irritable`、`want_to_quit_job`、`unwell`、`sick`、`period`、`sudden_desire`、`drinking`、`smoking_weed`、`just_have_sex`。这时请求只有情绪化的 system prompt 和提示：没有历史窗口、
 没有记忆召回、没有用户画像，也没有亲密度结论；`[shared_memories]` 放这段关系最近的三个 episode，`[now]`
 保留正在进行的事件。这条消息的行带 `metadata.tone = "emotional"`。其余事件，以及语气关闭时的所有事件，
-照上面的方式讲。
+照上面的方式讲。`sudden_desire` 的那条消息，在[那种语气](#她想要你的时候)掷中时改用 `erotic`。
 
 然后：
 
@@ -518,6 +518,30 @@ prompt；她是什么样的人由写角色的人写进人设，和其他人设�
 ```
 
 回复的行带 `metadata.tone = "focused"`。怎么掷见 [model-config.zh.md](model-config.zh.md#tones--聊天语气仅限-chat-任务)。
+
+### 她想要你的时候
+
+部署的 [`tones.erotic`](model-config.zh.md#tones--聊天语气仅限-chat-任务) 大于 0 时，有些消息用 `erotic` 语气写：
+在 `emotional` 语气之上，加上用户是她的什么人（`[relationship]`），以及 `[this_turn]` 里一行说她想要对方的话，
+这一行由这一对的 chemistry 档位决定。
+
+| 哪条消息 | 用 `erotic` 的机会 |
+|---|---|
+| 她接受 [`sex_together`](#激情组) 时的那条回复 | `tones.erotic` 的值 |
+| 用户接受她提的 `sleep_together` 或 `bathe_together` 时，她的那条回复 | `tones.erotic` 的值 |
+| `sudden_desire` 开始时发的那条消息 | `tones.erotic` 的值 |
+| 不带用户动作的 1:1 文字回合，`sex_addict` 为 `true`（[角色设置](#角色设置)），chemistry 在档 3 及以上，没有插曲在进行，或进行中的是 `sudden_desire`、`strip`、`streaking`、`just_have_sex`、`masturbating`，或天然组、激情组的事件 | 八分之一，不管这个键取多少 |
+| 其他 | 没有 |
+
+每一行前面都有三个条件：这条消息的 `affinity_scope` 含暧昧感轴，不在冷战中，`is_virgin` 为 `true` 的角色
+chemistry 在档 4 及以上。有一条不满足，消息就和没有这个键时一样。前三行里各只有那一条消息用 `erotic`；
+事件持续期间之后的回合照常掷。
+
+未经人事的角色的这条线只读卡上的 `is_virgin`，后来发生过什么都不改。上面的事件抽取把同一个键当作事实，
+第一次之后就结束；语气把它当作个性：和用户上过床，不改变她是什么样的人。
+
+`erotic` 先于 `emotional`，`emotional` 先于 `focused`。消息的行带 `metadata.tone = "erotic"`。那三行话和其余的掷法见
+[model-config.zh.md](model-config.zh.md#tones--聊天语气仅限-chat-任务)。
 
 ### 离线类
 
@@ -1529,7 +1553,7 @@ engine 不接收性别或性取向，也不判断谁会被谁吸引。
 - `crates/eros-engine-server/src/pipeline/life_choice.rs`：冷战、各种触发与她的请求、不理会的转换、冷战的增长缩放。
 - `crates/eros-engine-core/src/relationship.rs`：关系状态、`settle`、`leading_line`、冷战的连续规则与 `sleep_ask_is_sex`。
 - `crates/eros-engine-core/src/scope.rs`：`romance_compatible`，浪漫选择读的那条判据。
-- `crates/eros-engine-core/src/tone.rs`：`at_work` 与 `focused_probability`，一轮落在 `focused` 语气的机会。
+- `crates/eros-engine-core/src/tone.rs`：`at_work` 与 `focused_probability`，一轮落在 `focused` 语气的机会；`EroticGate`、`fixed_erotic_probability` 与 `everyday_erotic_probability`，一条消息用 `erotic` 语气的条件和机会。
 - `crates/eros-engine-server/src/pipeline/stream.rs::run_stream`：需求的读取与写入（被接受的 give 的挪动走 `after_give`）、`[需求]` 与 `[近期事件]` 两行
   （`build_pde_ctx`）、判官之前的 offline 分支、掷出拒收后的改判（`apply_give_refusal`）、`body_state_frame`。
 - `crates/eros-engine-server/src/prompt.rs`：`needs_line`、`events_judge_text`、`events_reply_text`、

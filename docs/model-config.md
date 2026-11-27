@@ -103,7 +103,7 @@ Field details:
 | `tasks.<name>.allow_traits` | `Array<String>` | no | Prompt-trait allow-list for this task (three-state: absent = no gating; `[]` = drop all traits; `["a","b"]` = whitelist). Used when no matching tier block is found. |
 | `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, `allow_traits`, and/or `retry_depth`. Does not override `temperature`, `max_tokens`, `top_p`, `frequency_penalty`, `presence_penalty`, or `repetition_penalty` — all six are task-level only. **`<name>` may only be `chat_companion` or `chat_output_filter`** — every other task resolves without a tier, and a tier block under one refuses to boot (see above). |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | no | Global trigger for the user-input rewrite filter. Task-level only on `chat_companion` (no per-tier override). `false`/absent = off, `true` = every turn, `0.8` = ~80% of turns (a number outside `[0.0, 1.0]` is rejected). See "`input_filter`". |
-| `tasks.chat_companion.tones` | table | no | Chat tones: `{ emotional = <f64>, focused = <f64> }`, each a probability in `[0.0, 1.0]`. Task-level only on `chat_companion` (no per-tier override). Each key absent or `0` = that tone off; a value out of range or a tone name other than `emotional` and `focused` refuses to boot. See "`tones`". |
+| `tasks.chat_companion.tones` | table | no | Chat tones: `{ emotional = <f64>, focused = <f64>, erotic = <f64> }`, each a probability in `[0.0, 1.0]`. Task-level only on `chat_companion` (no per-tier override). Each key absent or `0` = that tone off; a value out of range or a tone name other than `emotional`, `focused` and `erotic` refuses to boot. See "`tones`". |
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
 
 **`defaults.ignore_providers` and `defaults.provider_sort` are removed.** A
@@ -603,20 +603,22 @@ blocks are limited to `chat_companion` and `chat_output_filter`.
 ### `tones` — chat tones (chat task only)
 
 `tones` on `[tasks.chat_companion]` turns on the engine's chat tones. It is
-task-level only, with no per-tier override. It has two keys, `emotional` and
-`focused`; each is off when absent or `0`, and each works without the other.
-With both off (the default) every prompt, request and stored row is what it is
-without the table. A value outside `[0.0, 1.0]`, or a tone name other than
-`emotional` and `focused`, refuses to boot.
+task-level only, with no per-tier override. It has three keys, `emotional`,
+`focused` and `erotic`; each is off when absent or `0`, and each works without
+the others. With all three off (the default) every prompt, request and stored
+row is what it is without the table. A value outside `[0.0, 1.0]`, or a tone
+name other than those three, refuses to boot.
 
 ```toml
 [tasks.chat_companion]
-tones = { emotional = 0.05, focused = 1.0 }
+tones = { emotional = 0.05, focused = 1.0, erotic = 1.0 }
 ```
 
 The judge picks how a reply relates to the user's message (`reply_mode`); it
 never picks the tone. The engine decides the tone on the turn's final plan, and
-only a reply that bears text has one:
+only a reply that bears text has one. When more than one tone could apply,
+`erotic` wins over `emotional`, and `emotional` over `focused`: the first roll
+to win names the message, and no later roll is made.
 
 - **A 1:1 text turn without a user action** is `emotional` with probability
   `min(1, emotional × moody × needs × compatible)`:
@@ -650,9 +652,40 @@ only a reply that bears text has one:
   action turn is never `emotional`, and no action turn is ever `focused`.
 - **The message a life event sends when it starts** is `emotional` for sixteen
   kinds while `emotional` is above 0 ([life-events-needs.md](life-events-needs.md#how-she-tells-it)).
+- **Three moments** are `erotic` with probability `erotic`, one roll each:
 
-Group turns, `/open` and the other proactive messages, edit and image-edit turns
-and voice calls never take a tone.
+  | the moment | the message | when the roll is lost |
+  |---|---|---|
+  | the user's `sex_together`, accepted | her reply on that turn | `emotional` as above, else the default reply |
+  | her `sleep_together` or `bathe_together` ask, accepted by the user | her reply to the answer | the default reply |
+  | `sudden_desire` | the message the event sends when it starts | `emotional` as above, else the default message |
+
+  One message each: the turns that follow draw as any turn does. A refused
+  `sex_together`, her ask itself, her reply to a decline and
+  `fall_asleep_together` are not among them. `erotic = 1.0` makes every such
+  moment `erotic`.
+- **A 1:1 text turn without a user action** is `erotic` 1 time in 8, for any
+  value of `erotic` above 0, when the persona's `art_metadata.sex_addict` is
+  `true`, the pair's chemistry tier is 3 or above, and no incident is under
+  way, or the one under way is `sudden_desire`, `strip`, `streaking`,
+  `just_have_sex`, `masturbating`, or a naturism- or passion-group kind. This
+  roll comes before the `emotional` draw. The key switches the 1/8 on and does
+  not scale it.
+
+Every `erotic` message, at a moment or drawn, also needs all of these; when one
+fails no `erotic` roll is made and the message is what it would be without the
+key:
+
+- the message's `affinity_scope` has a chemistry axis (her reply to an answer
+  reads the scope the answer request carries);
+- no cold war is on;
+- a persona whose `art_metadata.is_virgin` is `true` is at chemistry tier 4 or
+  above. This reads the card alone and does not lapse once she has had sex: the
+  life-event draw reads `is_virgin` as a fact that ends with her first time, the
+  tone reads it as character.
+
+Group turns, `/open`, every proactive message other than the two named above,
+edit and image-edit turns and voice calls never take a tone.
 
 **An `emotional` reply** is written from the persona and what the user just said
 or did, with little else in front of the model:
@@ -674,6 +707,26 @@ or did, with little else in front of the model:
   nothing else; none when the turn's `memory_scope` turns the relationship
   layer off.
 
+**An `erotic` reply** is an `emotional` reply with two additions. Everything
+above holds for it: no history, no profile, the same blocks kept and left out,
+the three episodes, the lowest `[reply_length]`.
+
+- `[relationship]` is rendered as the default prompt renders it, from the
+  message's affinity and scope: who the user is to her.
+- `[this_turn]` holds one line, set by the pair's chemistry tier:
+
+  | chemistry tier | the line |
+  |---|---|
+  | 3 and below | `- 你此刻对对方有欲望：话里带着撩拨和暗示，慢一点，贴近一点` |
+  | 4 | `- 你现在很想要对方：语气放软、放慢，带着勾人的意味` |
+  | 5 | `- 你的心思和身体都在对方身上：说话带着诱惑，不必遮掩` |
+
+  The everyday draw starts at tier 3 and a virgin persona at tier 4; a moment
+  has no floor of its own, so a pair below tier 3 reads the first line.
+
+Her reply to an accepted ask is built the same way: the system prompt and the
+answer's cue as the one user message.
+
 **A `focused` reply** is written like someone with work in hand: the default
 request and system prompt, with these differences:
 
@@ -692,8 +745,9 @@ request and system prompt, with these differences:
 Post-processing (memory, insights, affinity) runs as on any turn, and the model,
 sampling, output filter and frames are those of the chat task.
 
-**The record.** Every assistant row of a turn that made either draw carries
-`metadata.tone`: the final tone, `"emotional"`, `"focused"` or `"default"`. While
+**The record.** Every assistant row of a message for which a roll was made carries
+`metadata.tone`: the final tone, `"erotic"`, `"emotional"`, `"focused"` or `"default"`.
+Her reply to an accepted ask that lost its `erotic` roll carries `"default"`. While
 `emotional` is above 0, the rows of a listed action turn and of a listed
 event message carry `"emotional"` too; the user row's `metadata.action` and the
 message's `metadata.proactive` tell those apart from a drawn turn. With

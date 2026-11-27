@@ -569,7 +569,16 @@ her response, without the chat history, the user profile or the affinity conclus
 response itself is decided as above. The reply's rows carry `metadata.tone = "emotional"`. A
 turn without an action may draw a tone instead
 ([tones](model-config.md#tones--chat-tones-chat-task-only)); its assistant rows carry
-`metadata.tone` (`"emotional"`, `"focused"` or `"default"`) only when a draw was made.
+`metadata.tone` (`"erotic"`, `"emotional"`, `"focused"` or `"default"`) only when a draw was made.
+
+**Erotic replies.** While the deployment has
+[`tones.erotic`](model-config.md#tones--chat-tones-chat-task-only) above 0, her reply to a
+`sex_together` she accepts may be written in the `erotic` tone instead: an `emotional` reply that is
+also told who the user is to her. So may her reply when the user accepts her `sleep_together` or
+`bathe_together` ask, the message `sudden_desire` sends when it starts, and an everyday turn of a
+persona whose `sex_addict` is `true`. The pair has to be romantically compatible on that message's
+`affinity_scope`, so the answer to her ask should carry the scope the chat turns carry. Such a
+message's rows carry `metadata.tone = "erotic"`.
 
 **A date.** `date` asks her out. An engine gate runs first: none for `short`,
 bond at tier 2 for `mid`, and never while she is offline or on another date; a
@@ -1385,8 +1394,8 @@ The draw:
   | `period` | `true` / `false` / absent | whether she has a period (above): absent, a female human has one and a female of another species none; a machine or a persona that is not female never has one |
   | `prefer_trip` | `true` / `false` (default) | trips come up three times as often; still once a week at most |
   | `homesick` | `true` / `false` / absent | where a trip goes: `true` favours `hometown_visit` and thins the leisure trips, `false` thins `hometown_visit`; `business_trip` untouched |
-  | `is_virgin` | `true` / `false` (default) | `having_sex` and `just_have_sex` are a fifth as likely until her first `having_sex`, `just_have_sex` or `having_sex_together` event, after which the key no longer applies |
-  | `sex_addict` | `true` / `false` / absent | `sudden_desire`, `strip`, `streaking` and `just_have_sex` come up three times / a third as often within `short`; their gates hold. Only `true` draws `having_sex` and `masturbating` |
+  | `is_virgin` | `true` / `false` (default) | `having_sex` and `just_have_sex` are a fifth as likely until her first `having_sex`, `just_have_sex` or `having_sex_together` event, after which the key no longer applies to them. `true` also keeps her out of the `erotic` tone below chemistry tier 4, and that does not lapse |
+  | `sex_addict` | `true` / `false` / absent | `sudden_desire`, `strip`, `streaking` and `just_have_sex` come up three times / a third as often within `short`; their gates hold. Only `true` draws `having_sex` and `masturbating`. With `tones.erotic` on, `true` also gives her everyday turns a 1 in 8 chance of the `erotic` tone from chemistry tier 3 |
   | `hygienic` | `true` / `false` / absent | `showering`, `bathing`, `want_hot_spring` and `want_sauna` come up three times / a third as often within `short`; it also sets when she asks for a bath together ([below](#post-v2compsessionsession_idlife-choiceschoice_id)) |
   | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` come up a third as often / as they are / three times as often within their categories, and a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time`. `full_time` is also career-minded: with [`tones.focused`](model-config.md#tones--chat-tones-chat-task-only) above 0, a turn that may draw a tone, off work and with no incident under way, is answered in the `focused` tone 1 time in 8 ([at work](life-events-needs.md#at-work)) |
   | `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | `outdoor`: the outdoor kinds come up three times as often and the indoor kinds a third as often within their categories; `indoor` the reverse. Kinds that can take her offline are neutral and untouched; the place of each kind is listed in [life-events-needs.md](life-events-needs.md#outdoors-or-in); any other value reads as `neutral` |
