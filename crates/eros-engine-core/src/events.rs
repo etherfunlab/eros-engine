@@ -222,12 +222,21 @@ pub enum EventKind {
     /// She and the user swim together: written when she accepts the user's
     /// `swim_together`.
     SwimmingTogether,
+    /// She and the user scuba-dive together: written when she accepts the
+    /// user's `scuba_dive_together`.
+    ScubaDivingTogether,
+    /// She and the user surf together: written when she accepts the user's
+    /// `surf_together`.
+    SurfingTogether,
     /// She and the user cycle together: written when she accepts the user's
     /// `cycle_together`; only in a `modern` world.
     CyclingTogether,
     /// She and the user hike together: written when she accepts the user's
     /// `hike_together`.
     HikingTogether,
+    /// She and the user ski together: written when she accepts the user's
+    /// `ski_together`.
+    SkiingTogether,
     /// She and the user dance together: written when she accepts the user's
     /// `dance_together` (spec 2026-11-26-more-together-actions-bath-outfit-
     /// chemistry-drop-and-custom-together-design.md §4).
@@ -244,6 +253,12 @@ pub enum EventKind {
     /// She and the user skinny-dip together: written when she accepts the
     /// user's `skinny_dip_together`.
     SkinnyDippingTogether,
+    /// She and the user free-dive naked together: written when she accepts
+    /// the user's `free_dive_together`.
+    FreeDivingTogether,
+    /// She and the user surf naked together: written when she accepts the
+    /// user's `surf_naked_together`.
+    NakedSurfingTogether,
     /// She and the user commit a crime together: written when she accepts
     /// the user's `commit_crime_together`; it names no crime.
     CommittingCrimeTogether,
@@ -260,6 +275,9 @@ pub enum EventKind {
     /// 2026-11-27-together-action-groups-design.md §6).
     NakedYogaTogether,
     NakedHikingTogether,
+    /// She and the user ski naked together: written when she accepts the
+    /// user's `ski_naked_together`.
+    NakedSkiingTogether,
     NakedHotSpringTogether,
     /// She and the user dance naked together: written when she accepts the
     /// user's `dance_naked_together` (spec 2026-11-28-dance-massage-and-
@@ -370,7 +388,7 @@ impl EventKind {
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 40] = [
+    pub const SPECIAL: [EventKind; 46] = [
         EventKind::TakingSpace,
         EventKind::FellOut,
         EventKind::TravelingTogether,
@@ -394,18 +412,24 @@ impl EventKind {
         EventKind::FightingTogether,
         EventKind::WorkingOutTogether,
         EventKind::SwimmingTogether,
+        EventKind::ScubaDivingTogether,
+        EventKind::SurfingTogether,
         EventKind::CyclingTogether,
         EventKind::HikingTogether,
+        EventKind::SkiingTogether,
         EventKind::DancingTogether,
         EventKind::AdventuringTogether,
         EventKind::PlayingWithFireTogether,
         EventKind::SingingTogether,
         EventKind::SkinnyDippingTogether,
+        EventKind::FreeDivingTogether,
+        EventKind::NakedSurfingTogether,
         EventKind::CommittingCrimeTogether,
         EventKind::FishingTogether,
         EventKind::NakedHorseRidingTogether,
         EventKind::NakedYogaTogether,
         EventKind::NakedHikingTogether,
+        EventKind::NakedSkiingTogether,
         EventKind::NakedHotSpringTogether,
         EventKind::NakedDancingTogether,
         EventKind::MassagingTogether,
@@ -419,15 +443,18 @@ impl EventKind {
     /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md §6;
     /// spec 2026-11-27-together-action-groups-design.md §5.1). A test pins it
     /// to `together_group`.
-    pub const ENDS_ON_CHEMISTRY_DROP: [EventKind; 11] = [
+    pub const ENDS_ON_CHEMISTRY_DROP: [EventKind; 14] = [
         EventKind::ShoweringTogether,
         EventKind::BathingTogether,
         EventKind::HavingSexTogether,
         EventKind::StreakingTogether,
         EventKind::SkinnyDippingTogether,
+        EventKind::FreeDivingTogether,
+        EventKind::NakedSurfingTogether,
         EventKind::NakedHorseRidingTogether,
         EventKind::NakedYogaTogether,
         EventKind::NakedHikingTogether,
+        EventKind::NakedSkiingTogether,
         EventKind::NakedHotSpringTogether,
         EventKind::NakedDancingTogether,
         EventKind::NakedMassagingTogether,
@@ -437,14 +464,18 @@ impl EventKind {
     /// `sleep_together` asks (spec 2026-11-26 §7): the wet kinds and
     /// `having_sex_together` (spec 2026-11-27-together-action-groups-
     /// design.md §5.2). A test pins it to `is_wet`.
-    pub const HOLDS_BACK_INTIMATE_ASKS: [EventKind; 8] = [
+    pub const HOLDS_BACK_INTIMATE_ASKS: [EventKind; 12] = [
         EventKind::BathingTogether,
         EventKind::ShoweringTogether,
         EventKind::HotSpringTogether,
         EventKind::SaunaTogether,
         EventKind::HavingSexTogether,
         EventKind::SwimmingTogether,
+        EventKind::ScubaDivingTogether,
+        EventKind::SurfingTogether,
         EventKind::SkinnyDippingTogether,
+        EventKind::FreeDivingTogether,
+        EventKind::NakedSurfingTogether,
         EventKind::NakedHotSpringTogether,
     ];
 
@@ -560,18 +591,24 @@ impl EventKind {
             EventKind::FightingTogether => "fighting_together",
             EventKind::WorkingOutTogether => "working_out_together",
             EventKind::SwimmingTogether => "swimming_together",
+            EventKind::ScubaDivingTogether => "scuba_diving_together",
+            EventKind::SurfingTogether => "surfing_together",
             EventKind::CyclingTogether => "cycling_together",
             EventKind::HikingTogether => "hiking_together",
+            EventKind::SkiingTogether => "skiing_together",
             EventKind::DancingTogether => "dancing_together",
             EventKind::AdventuringTogether => "adventuring_together",
             EventKind::PlayingWithFireTogether => "playing_with_fire_together",
             EventKind::SingingTogether => "singing_together",
             EventKind::SkinnyDippingTogether => "skinny_dipping_together",
+            EventKind::FreeDivingTogether => "free_diving_together",
+            EventKind::NakedSurfingTogether => "naked_surfing_together",
             EventKind::CommittingCrimeTogether => "committing_crime_together",
             EventKind::FishingTogether => "fishing_together",
             EventKind::NakedHorseRidingTogether => "naked_horse_riding_together",
             EventKind::NakedYogaTogether => "naked_yoga_together",
             EventKind::NakedHikingTogether => "naked_hiking_together",
+            EventKind::NakedSkiingTogether => "naked_skiing_together",
             EventKind::NakedHotSpringTogether => "naked_hot_spring_together",
             EventKind::NakedDancingTogether => "naked_dancing_together",
             EventKind::MassagingTogether => "massaging_together",
@@ -643,11 +680,15 @@ impl EventKind {
             | HotSpringTogether
             | WorkingOutTogether
             | SwimmingTogether
+            | ScubaDivingTogether
+            | SurfingTogether
             | CyclingTogether
             | DancingTogether
             | PlayingWithFireTogether
             | SingingTogether
             | SkinnyDippingTogether
+            | FreeDivingTogether
+            | NakedSurfingTogether
             | CommittingCrimeTogether
             | NakedHorseRidingTogether
             | NakedYogaTogether
@@ -656,12 +697,13 @@ impl EventKind {
             | MassagingTogether
             | NakedMassagingTogether
             | CustomTogether => EventCategory::Short,
-            AsleepTogether | FightingTogether | HikingTogether | AdventuringTogether
-            | FishingTogether | NakedHikingTogether | TempWork | ExMessage | GotHit | Breakup
-            | WorkingOut | Reading | Gaming | AwayFromPhone | Unwell | Irritable | Busy
-            | InBattle | Asleep | OutShopping | BrosGathering | SisGathering | OnTheRoad
-            | WatchingShow | HavingSex | WantToGoOut | WantToGoHome | TakingSpace | FellOut
-            | OnABoat | OnACruise | OnABus | OnATrain | OnAPlane | Driving => EventCategory::Mid,
+            AsleepTogether | FightingTogether | HikingTogether | SkiingTogether
+            | AdventuringTogether | FishingTogether | NakedHikingTogether | NakedSkiingTogether
+            | TempWork | ExMessage | GotHit | Breakup | WorkingOut | Reading | Gaming
+            | AwayFromPhone | Unwell | Irritable | Busy | InBattle | Asleep | OutShopping
+            | BrosGathering | SisGathering | OnTheRoad | WatchingShow | HavingSex | WantToGoOut
+            | WantToGoHome | TakingSpace | FellOut | OnABoat | OnACruise | OnABus | OnATrain
+            | OnAPlane | Driving => EventCategory::Mid,
             Sick | Period | Hospitalized | PostSurgery => EventCategory::Body,
             BusinessTrip | ShortTrip | LongTrip | HometownVisit | TravelingTogether => {
                 EventCategory::Trip
@@ -745,9 +787,12 @@ impl EventKind {
             | BathingTogether
             | StreakingTogether
             | SkinnyDippingTogether
+            | FreeDivingTogether
+            | NakedSurfingTogether
             | NakedHorseRidingTogether
             | NakedYogaTogether
             | NakedHikingTogether
+            | NakedSkiingTogether
             | NakedHotSpringTogether
             | NakedDancingTogether
             | NakedMassagingTogether => Some(TogetherGroup::Nude),
@@ -758,9 +803,11 @@ impl EventKind {
             WalkingTogether | JoggingTogether | YogaTogether | StargazingTogether
             | HorseRidingTogether | DrinkingTogether | SmokingTogether | SmokingWeedTogether
             | UsingToiletTogether | AsleepTogether | WorkingOutTogether | SwimmingTogether
-            | CyclingTogether | HikingTogether | FishingTogether | DancingTogether
-            | SingingTogether | HotSpringTogether | SaunaTogether | MassagingTogether
-            | CustomTogether => Some(TogetherGroup::General),
+            | ScubaDivingTogether | SurfingTogether | CyclingTogether | HikingTogether
+            | SkiingTogether | FishingTogether | DancingTogether | SingingTogether
+            | HotSpringTogether | SaunaTogether | MassagingTogether | CustomTogether => {
+                Some(TogetherGroup::General)
+            }
             _ => None,
         }
     }
@@ -772,11 +819,15 @@ impl EventKind {
         matches!(
             self,
             SwimmingTogether
+                | ScubaDivingTogether
+                | SurfingTogether
                 | HotSpringTogether
                 | SaunaTogether
                 | ShoweringTogether
                 | BathingTogether
                 | SkinnyDippingTogether
+                | FreeDivingTogether
+                | NakedSurfingTogether
                 | NakedHotSpringTogether
         )
     }
@@ -788,7 +839,10 @@ impl EventKind {
         match self {
             StreakingTogether => Some(JoggingTogether),
             NakedHikingTogether => Some(HikingTogether),
+            NakedSkiingTogether => Some(SkiingTogether),
             SkinnyDippingTogether => Some(SwimmingTogether),
+            FreeDivingTogether => Some(ScubaDivingTogether),
+            NakedSurfingTogether => Some(SurfingTogether),
             NakedHotSpringTogether => Some(HotSpringTogether),
             NakedYogaTogether => Some(YogaTogether),
             NakedHorseRidingTogether => Some(HorseRidingTogether),
@@ -1008,18 +1062,24 @@ fn rule(kind: EventKind) -> Rule {
         FightingTogether => (0.0, 0, Lasts::Hours(1, 2)),
         WorkingOutTogether => (0.0, 0, Lasts::Hours(1, 1)),
         SwimmingTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        ScubaDivingTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        SurfingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         CyclingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         HikingTogether => (0.0, 0, Lasts::Hours(2, 3)),
+        SkiingTogether => (0.0, 0, Lasts::Hours(2, 3)),
         DancingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         AdventuringTogether => (0.0, 0, Lasts::Hours(2, 3)),
         PlayingWithFireTogether => (0.0, 0, Lasts::Hours(1, 1)),
         SingingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         SkinnyDippingTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        FreeDivingTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        NakedSurfingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         CommittingCrimeTogether => (0.0, 0, Lasts::Hours(1, 1)),
         FishingTogether => (0.0, 0, Lasts::Hours(2, 3)),
         NakedHorseRidingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         NakedYogaTogether => (0.0, 0, Lasts::Hours(1, 1)),
         NakedHikingTogether => (0.0, 0, Lasts::Hours(2, 3)),
+        NakedSkiingTogether => (0.0, 0, Lasts::Hours(2, 3)),
         NakedHotSpringTogether => (0.0, 0, Lasts::Hours(1, 1)),
         NakedDancingTogether => (0.0, 0, Lasts::Hours(1, 1)),
         MassagingTogether => (0.0, 0, Lasts::Minutes(30)),
@@ -2872,7 +2932,7 @@ mod tests {
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
         assert_eq!(EventKind::ALL.len(), 70);
-        assert_eq!(EventKind::SPECIAL.len(), 40);
+        assert_eq!(EventKind::SPECIAL.len(), 46);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -4038,9 +4098,12 @@ mod tests {
                 HavingSexTogether,
                 StreakingTogether,
                 SkinnyDippingTogether,
+                FreeDivingTogether,
+                NakedSurfingTogether,
                 NakedHorseRidingTogether,
                 NakedYogaTogether,
                 NakedHikingTogether,
+                NakedSkiingTogether,
                 NakedHotSpringTogether,
                 NakedDancingTogether,
                 NakedMassagingTogether
@@ -4055,7 +4118,11 @@ mod tests {
                 SaunaTogether,
                 HavingSexTogether,
                 SwimmingTogether,
+                ScubaDivingTogether,
+                SurfingTogether,
                 SkinnyDippingTogether,
+                FreeDivingTogether,
+                NakedSurfingTogether,
                 NakedHotSpringTogether
             ]
         );
@@ -4098,7 +4165,11 @@ mod tests {
                 SaunaTogether,
                 HotSpringTogether,
                 SwimmingTogether,
+                ScubaDivingTogether,
+                SurfingTogether,
                 SkinnyDippingTogether,
+                FreeDivingTogether,
+                NakedSurfingTogether,
                 NakedHotSpringTogether
             ]
         );
@@ -4111,6 +4182,9 @@ mod tests {
             (NakedHorseRidingTogether, HorseRidingTogether),
             (NakedDancingTogether, DancingTogether),
             (NakedMassagingTogether, MassagingTogether),
+            (FreeDivingTogether, ScubaDivingTogether),
+            (NakedSurfingTogether, SurfingTogether),
+            (NakedSkiingTogether, SkiingTogether),
         ];
         for k in every() {
             let want = pairs.iter().find(|(n, _)| *n == k).map(|(_, c)| *c);
@@ -5156,5 +5230,92 @@ mod tests {
         assert_eq!(PersonaTraits::default().dance, Taste::Neutral);
         assert_eq!(PersonaTraits::default().naturism, Taste::Neutral);
         assert_eq!(PersonaTraits::default().risky, Taste::Neutral);
+    }
+
+    /// Six together kinds that mirror existing ones (spec
+    /// 2026-11-28-dives-ski-and-surf-together-design.md): each has every
+    /// property of its model but its name and, for a nude kind, its clothed
+    /// counterpart.
+    #[test]
+    fn the_dives_the_ski_and_the_surf_mirror_their_models() {
+        use EventKind::*;
+        let persona = PersonaTraits::default();
+        for (kind, wire, model) in [
+            (
+                ScubaDivingTogether,
+                "scuba_diving_together",
+                SwimmingTogether,
+            ),
+            (SurfingTogether, "surfing_together", SwimmingTogether),
+            (SkiingTogether, "skiing_together", HikingTogether),
+            (
+                FreeDivingTogether,
+                "free_diving_together",
+                SkinnyDippingTogether,
+            ),
+            (
+                NakedSurfingTogether,
+                "naked_surfing_together",
+                SkinnyDippingTogether,
+            ),
+            (
+                NakedSkiingTogether,
+                "naked_skiing_together",
+                NakedHikingTogether,
+            ),
+        ] {
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(EventKind::parse(wire), Some(kind));
+            assert!(
+                EventKind::SPECIAL.contains(&kind),
+                "{kind:?} is placed, never drawn"
+            );
+            assert!(!EventKind::ALL.contains(&kind), "{kind:?} is never drawn");
+            assert_eq!(kind.together_group(), model.together_group(), "{kind:?}");
+            assert_eq!(kind.category(), model.category(), "{kind:?}");
+            assert_eq!(kind.slot(), model.slot(), "{kind:?}");
+            assert_eq!(kind.place(), model.place(), "{kind:?}");
+            assert_eq!(kind.is_wet(), model.is_wet(), "{kind:?}");
+            assert_eq!(kind.is_shared(), model.is_shared(), "{kind:?}");
+            assert_eq!(
+                kind.is_offline(&persona),
+                model.is_offline(&persona),
+                "{kind:?}"
+            );
+            assert_eq!(
+                kind.speaks_emotionally(),
+                model.speaks_emotionally(),
+                "{kind:?}"
+            );
+            for roll in [0.0, 1.0] {
+                assert_eq!(lasts(kind, roll), lasts(model, roll), "{kind:?}");
+            }
+            assert_eq!(
+                EventKind::ENDS_ON_CHEMISTRY_DROP.contains(&kind),
+                EventKind::ENDS_ON_CHEMISTRY_DROP.contains(&model),
+                "{kind:?}"
+            );
+            assert_eq!(
+                EventKind::HOLDS_BACK_INTIMATE_ASKS.contains(&kind),
+                EventKind::HOLDS_BACK_INTIMATE_ASKS.contains(&model),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            FreeDivingTogether.clothed_counterpart(),
+            Some(ScubaDivingTogether)
+        );
+        assert_eq!(
+            NakedSurfingTogether.clothed_counterpart(),
+            Some(SurfingTogether)
+        );
+        assert_eq!(
+            NakedSkiingTogether.clothed_counterpart(),
+            Some(SkiingTogether)
+        );
+        for clothed in [ScubaDivingTogether, SurfingTogether, SkiingTogether] {
+            assert_eq!(clothed.clothed_counterpart(), None);
+            assert_eq!(clothed.together_group(), Some(TogetherGroup::General));
+        }
     }
 }

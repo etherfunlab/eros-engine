@@ -156,6 +156,10 @@ pub enum UserAction {
     /// The user undresses her; only a romance-compatible pair can have it
     /// accepted (spec 2026-11-08-strip-and-world-setting-design.md §2).
     Strip,
+    /// The user asks her to undress herself: `strip`'s passive form, with
+    /// every rule of `strip`; accepted, how far she goes is set by the pair's
+    /// chemistry tier (spec 2026-11-28-ask-strip-design.md).
+    AskStrip,
     /// The user asks to shower, take a bath or take a sauna with her (spec
     /// 2026-11-20-together-actions-state-in-picture-and-genome-routes-
     /// design.md §5). Accepted, she is in the event `together_kind` names,
@@ -226,8 +230,17 @@ pub enum UserAction {
     /// outfit-ladder-and-fish-together-design.md §7).
     WorkoutTogether,
     SwimTogether,
+    /// Spec 2026-11-28-dives-ski-and-surf-together-design.md: behaves as
+    /// `swim_together` does.
+    ScubaDiveTogether,
+    /// Spec 2026-11-28-dives-ski-and-surf-together-design.md: behaves as
+    /// `swim_together` does.
+    SurfTogether,
     CycleTogether,
     HikeTogether,
+    /// Spec 2026-11-28-dives-ski-and-surf-together-design.md: behaves as
+    /// `hike_together` does.
+    SkiTogether,
     /// The user asks her to dance, go adventuring, play with fire, sing,
     /// skinny-dip or commit a crime with them (spec 2026-11-26-more-together-
     /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md §4).
@@ -249,6 +262,12 @@ pub enum UserAction {
     PlayWithFireTogether,
     SingTogether,
     SkinnyDipTogether,
+    /// Spec 2026-11-28-dives-ski-and-surf-together-design.md: behaves as
+    /// `skinny_dip_together` does.
+    FreeDiveTogether,
+    /// Spec 2026-11-28-dives-ski-and-surf-together-design.md: behaves as
+    /// `skinny_dip_together` does.
+    SurfNakedTogether,
     CommitCrimeTogether,
     /// The user asks her to go fishing with them (spec 2026-11-27-swim-
     /// outfit-ladder-and-fish-together-design.md §6.1): behaves as
@@ -265,6 +284,9 @@ pub enum UserAction {
     /// `hot_spring_together`.
     YogaNakedTogether,
     HikeNakedTogether,
+    /// Spec 2026-11-28-dives-ski-and-surf-together-design.md: behaves as
+    /// `hike_naked_together` does.
+    SkiNakedTogether,
     HotSpringNakedTogether,
     /// Spec 2026-11-28-dance-massage-and-passion-actions-design.md §4.2, §5.
     /// It may say which dance, as `ask_dancing` does.
@@ -393,9 +415,10 @@ impl DateDuration {
 /// The together actions she may turn down only for not caring for the
 /// outdoors: a refusal drops bond (spec 2026-11-27-swim-outfit-ladder-and-
 /// fish-together-design.md §7).
-const OUTDOOR_ACTIONS: [UserAction; 5] = [
+const OUTDOOR_ACTIONS: [UserAction; 6] = [
     UserAction::JogTogether,
     UserAction::HikeTogether,
+    UserAction::SkiTogether,
     UserAction::FishTogether,
     UserAction::CycleTogether,
     UserAction::RideHorseTogether,
@@ -430,6 +453,7 @@ impl UserAction {
                 | UserAction::HugFromBehind
                 | UserAction::Touch
                 | UserAction::Strip
+                | UserAction::AskStrip
                 | UserAction::Propose
                 | UserAction::BreakUp
                 | UserAction::Threaten
@@ -493,18 +517,24 @@ impl UserAction {
             UserAction::DrinkTogether => Some(EventKind::DrinkingTogether),
             UserAction::WorkoutTogether => Some(EventKind::WorkingOutTogether),
             UserAction::SwimTogether => Some(EventKind::SwimmingTogether),
+            UserAction::ScubaDiveTogether => Some(EventKind::ScubaDivingTogether),
+            UserAction::SurfTogether => Some(EventKind::SurfingTogether),
             UserAction::CycleTogether => Some(EventKind::CyclingTogether),
             UserAction::HikeTogether => Some(EventKind::HikingTogether),
+            UserAction::SkiTogether => Some(EventKind::SkiingTogether),
             UserAction::DanceTogether { .. } => Some(EventKind::DancingTogether),
             UserAction::AdventureTogether => Some(EventKind::AdventuringTogether),
             UserAction::PlayWithFireTogether => Some(EventKind::PlayingWithFireTogether),
             UserAction::SingTogether => Some(EventKind::SingingTogether),
             UserAction::SkinnyDipTogether => Some(EventKind::SkinnyDippingTogether),
+            UserAction::FreeDiveTogether => Some(EventKind::FreeDivingTogether),
+            UserAction::SurfNakedTogether => Some(EventKind::NakedSurfingTogether),
             UserAction::CommitCrimeTogether => Some(EventKind::CommittingCrimeTogether),
             UserAction::FishTogether => Some(EventKind::FishingTogether),
             UserAction::RideHorseNakedTogether => Some(EventKind::NakedHorseRidingTogether),
             UserAction::YogaNakedTogether => Some(EventKind::NakedYogaTogether),
             UserAction::HikeNakedTogether => Some(EventKind::NakedHikingTogether),
+            UserAction::SkiNakedTogether => Some(EventKind::NakedSkiingTogether),
             UserAction::HotSpringNakedTogether => Some(EventKind::NakedHotSpringTogether),
             UserAction::DanceNakedTogether { .. } => Some(EventKind::NakedDancingTogether),
             UserAction::MassageTogether => Some(EventKind::MassagingTogether),
@@ -1431,16 +1461,18 @@ mod tests {
     #[test]
     fn refusal_lines_by_group_and_counterpart() {
         use AffinityLine::{Bond, Chemistry};
-        const OUTDOOR: [UserAction; 5] = [
+        const OUTDOOR: [UserAction; 6] = [
             UserAction::JogTogether,
             UserAction::HikeTogether,
+            UserAction::SkiTogether,
             UserAction::FishTogether,
             UserAction::CycleTogether,
             UserAction::RideHorseTogether,
         ];
-        const BOTH: [UserAction; 3] = [
+        const BOTH: [UserAction; 4] = [
             UserAction::StreakTogether,
             UserAction::HikeNakedTogether,
+            UserAction::SkiNakedTogether,
             UserAction::RideHorseNakedTogether,
         ];
         for a in all_actions()
@@ -1628,6 +1660,7 @@ mod tests {
             Threaten,
             Trick,
             Strip,
+            AskStrip,
             ShowerTogether,
             BathTogether,
             SaunaTogether,
@@ -1661,6 +1694,12 @@ mod tests {
             RideHorseNakedTogether,
             YogaNakedTogether,
             HikeNakedTogether,
+            ScubaDiveTogether,
+            FreeDiveTogether,
+            SkiTogether,
+            SkiNakedTogether,
+            SurfTogether,
+            SurfNakedTogether,
             HotSpringNakedTogether,
             UserAction::dance_naked_together(),
             MassageTogether,
@@ -1706,7 +1745,10 @@ mod tests {
         );
     }
 
-    const NUDE_ACTIONS: [UserAction; 10] = [
+    const NUDE_ACTIONS: [UserAction; 13] = [
+        UserAction::FreeDiveTogether,
+        UserAction::SurfNakedTogether,
+        UserAction::SkiNakedTogether,
         UserAction::dance_naked_together(),
         UserAction::MassageNakedTogether,
         UserAction::ShowerTogether,
@@ -2508,5 +2550,84 @@ mod tests {
             .as_deref(),
             Some("去海边")
         );
+    }
+
+    /// Spec 2026-11-28-dives-ski-and-surf-together-design.md: six together
+    /// actions, each with the properties of the one it mirrors.
+    #[test]
+    fn the_dives_the_ski_and_the_surf_are_together_actions() {
+        use crate::events::EventKind::*;
+        for (a, wire, kind, model) in [
+            (
+                UserAction::ScubaDiveTogether,
+                "scuba_dive_together",
+                ScubaDivingTogether,
+                UserAction::SwimTogether,
+            ),
+            (
+                UserAction::SurfTogether,
+                "surf_together",
+                SurfingTogether,
+                UserAction::SwimTogether,
+            ),
+            (
+                UserAction::SkiTogether,
+                "ski_together",
+                SkiingTogether,
+                UserAction::HikeTogether,
+            ),
+            (
+                UserAction::FreeDiveTogether,
+                "free_dive_together",
+                FreeDivingTogether,
+                UserAction::SkinnyDipTogether,
+            ),
+            (
+                UserAction::SurfNakedTogether,
+                "surf_naked_together",
+                NakedSurfingTogether,
+                UserAction::SkinnyDipTogether,
+            ),
+            (
+                UserAction::SkiNakedTogether,
+                "ski_naked_together",
+                NakedSkiingTogether,
+                UserAction::HikeNakedTogether,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&a).unwrap(),
+                serde_json::json!({"type": wire})
+            );
+            assert_eq!(a.together_kind(), Some(kind), "{a:?}");
+            assert_eq!(a.together_group(), model.together_group(), "{a:?}");
+            assert_eq!(a.refusal_lines(), model.refusal_lines(), "{a:?}");
+            assert_eq!(a.speaks_emotionally(), model.speaks_emotionally(), "{a:?}");
+            assert_eq!(a.is_passion(), model.is_passion(), "{a:?}");
+            assert_eq!(a.consumed(), None, "{a:?}");
+        }
+    }
+
+    /// Spec 2026-11-28-ask-strip-design.md §4: `ask_strip` is `strip` in
+    /// every property.
+    #[test]
+    fn ask_strip_shares_the_properties_of_strip() {
+        let (ask, strip) = (UserAction::AskStrip, UserAction::Strip);
+        assert_eq!(
+            serde_json::to_value(&ask).unwrap(),
+            serde_json::json!({"type": "ask_strip"})
+        );
+        assert_eq!(
+            serde_json::from_value::<UserAction>(serde_json::json!({"type": "ask_strip"})).unwrap(),
+            ask
+        );
+        assert_eq!(ask.together_kind(), None);
+        assert_eq!(ask.together_group(), None);
+        assert_eq!(ask.refusal_lines(), strip.refusal_lines());
+        assert_eq!(ask.speaks_emotionally(), strip.speaks_emotionally());
+        assert!(ask.speaks_emotionally());
+        assert_eq!(ask.is_passion(), strip.is_passion());
+        assert!(!ask.is_passion());
+        assert_eq!(ask.consumed(), None);
     }
 }

@@ -866,6 +866,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::Threaten => "威胁你".into(),
         UserAction::Trick => "想捉弄你".into(),
         UserAction::Strip => "伸手想脱你的衣服".into(),
+        UserAction::AskStrip => "想让你把衣服脱了".into(),
         UserAction::ShowerTogether => "想和你一起淋浴".into(),
         UserAction::BathTogether => "想和你一起泡澡".into(),
         UserAction::SaunaTogether => "想和你一起蒸桑拿".into(),
@@ -888,8 +889,11 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::FightTogether => "想和你一起去战斗".into(),
         UserAction::WorkoutTogether => "想和你一起健身".into(),
         UserAction::SwimTogether => "想和你一起游泳".into(),
+        UserAction::ScubaDiveTogether => "想和你一起水肺潜水".into(),
+        UserAction::SurfTogether => "想和你一起冲浪".into(),
         UserAction::CycleTogether => "想和你一起骑单车".into(),
         UserAction::HikeTogether => "想和你一起爬山".into(),
+        UserAction::SkiTogether => "想和你一起滑雪".into(),
         UserAction::DanceTogether { .. } => match a.dance_words() {
             Some(words) => format!("想和你一起跳{words}"),
             None => "想和你一起跳舞".into(),
@@ -898,11 +902,14 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::PlayWithFireTogether => "想和你一起玩火".into(),
         UserAction::SingTogether => "想和你一起唱歌".into(),
         UserAction::SkinnyDipTogether => "想和你一起裸泳".into(),
+        UserAction::FreeDiveTogether => "想和你一起裸体自由潜水".into(),
+        UserAction::SurfNakedTogether => "想和你一起裸体冲浪".into(),
         UserAction::CommitCrimeTogether => "想和你一起去犯罪".into(),
         UserAction::FishTogether => "想和你一起钓鱼".into(),
         UserAction::RideHorseNakedTogether => "想和你一起裸体骑马".into(),
         UserAction::YogaNakedTogether => "想和你一起裸体做瑜伽".into(),
         UserAction::HikeNakedTogether => "想和你一起裸体爬山".into(),
+        UserAction::SkiNakedTogether => "想和你一起裸体滑雪".into(),
         UserAction::HotSpringNakedTogether => "想和你一起裸体泡温泉".into(),
         UserAction::DanceNakedTogether { .. } => match a.dance_words() {
             Some(words) => format!("想和你一起裸着跳{words}"),
@@ -1255,18 +1262,24 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         FightingTogether => "和对方并肩作战",
         WorkingOutTogether => "和对方一起健身",
         SwimmingTogether => "和对方一起游泳",
+        ScubaDivingTogether => "和对方一起水肺潜水",
+        SurfingTogether => "和对方一起冲浪",
         CyclingTogether => "和对方一起骑单车",
         HikingTogether => "和对方一起爬山",
+        SkiingTogether => "和对方一起滑雪",
         DancingTogether => "和对方一起跳舞",
         AdventuringTogether => "和对方一起冒险",
         PlayingWithFireTogether => "和对方一起玩火",
         SingingTogether => "和对方一起唱歌",
         SkinnyDippingTogether => "和对方一起裸泳",
+        FreeDivingTogether => "和对方一起裸体自由潜水",
+        NakedSurfingTogether => "和对方一起裸体冲浪",
         CommittingCrimeTogether => "和对方一起犯罪",
         FishingTogether => "和对方一起钓鱼",
         NakedHorseRidingTogether => "和对方一起裸体骑马",
         NakedYogaTogether => "和对方一起裸体做瑜伽",
         NakedHikingTogether => "和对方一起裸体爬山",
+        NakedSkiingTogether => "和对方一起裸体滑雪",
         NakedHotSpringTogether => "和对方一起裸体泡温泉",
         NakedDancingTogether => "和对方一起裸舞",
         MassagingTogether => "让对方给自己按摩",
@@ -1700,6 +1713,42 @@ pub(crate) fn composer_user_text(
     }
 }
 
+/// How far she undresses on an accepted `ask_strip`, by the pair's chemistry
+/// tier (spec 2026-11-28-ask-strip-design.md §5): the rung's words without
+/// 自己. A persona who is not female has nothing to cover at tier 3.
+pub(crate) fn strip_rung(chem_tier: u8, wearer: Wearer) -> &'static str {
+    match (chem_tier, wearer) {
+        (0..=1, _) => "脱了外套",
+        (2, _) => "脱到只剩内衣",
+        (3, Wearer::Female) => "脱到只剩内裤，上身用手遮着",
+        (3, _) => "脱到只剩内裤",
+        (4, _) => "全脱了，用手遮着",
+        _ => "全脱了，不遮不掩",
+    }
+}
+
+/// Her clothing on a turn whose `ask_strip` she accepted (spec
+/// 2026-11-28-ask-strip-design.md §5): 自己 and the rung. At tier 1 a named
+/// outfit is still on and is named; from tier 2 it is off.
+pub(crate) fn self_stripped_clothing(
+    chem_tier: u8,
+    wearer: Wearer,
+    outfit: Option<&str>,
+) -> String {
+    let rung = strip_rung(chem_tier, wearer);
+    match outfit {
+        Some(o) if chem_tier <= 1 => format!("自己{rung}，里面还穿着「{o}」"),
+        _ => format!("自己{rung}"),
+    }
+}
+
+/// What `accept` and `refuse` mean on an `ask_strip` at this chemistry tier
+/// (spec 2026-11-28-ask-strip-design.md §6): the judge reads how far a yes
+/// goes for this pair.
+pub(crate) fn ask_strip_outcomes(chem_tier: u8, wearer: Wearer) -> (&'static str, &'static str) {
+    (strip_rung(chem_tier, wearer), "不脱")
+}
+
 /// Her clothing on a turn whose `strip` she accepted (spec 2026-11-08-strip-
 /// and-world-setting-design.md §2.2): 「衣服被对方脱掉了」, or
 /// 「「{outfit}」被对方脱掉了」 over a named outfit.
@@ -1842,6 +1891,8 @@ impl WaterWear {
             foreground,
             Some(
                 eros_engine_core::events::EventKind::SwimmingTogether
+                    | eros_engine_core::events::EventKind::ScubaDivingTogether
+                    | eros_engine_core::events::EventKind::SurfingTogether
                     | eros_engine_core::events::EventKind::HotSpringTogether
             )
         ) && self.wearer == Wearer::Female
@@ -1864,7 +1915,10 @@ pub(crate) fn water_clothing(
     wear: &WaterWear,
 ) -> Option<&'static str> {
     use eros_engine_core::events::{
-        EventKind::{HotSpringTogether, SaunaTogether, SwimmingTogether},
+        EventKind::{
+            HotSpringTogether, SaunaTogether, ScubaDivingTogether, SurfingTogether,
+            SwimmingTogether,
+        },
         TogetherGroup,
     };
     let towel = || {
@@ -1880,6 +1934,8 @@ pub(crate) fn water_clothing(
         // §7): nothing on unless a 1:1 picture's action says otherwise.
         eros_engine_core::events::EventKind::HavingSexTogether => Some("什么都没穿"),
         SwimmingTogether => swimsuit(wear),
+        ScubaDivingTogether => swimsuit(wear),
+        SurfingTogether => swimsuit(wear),
         HotSpringTogether => swimsuit(wear).or_else(towel),
         SaunaTogether => towel(),
         _ => None,
@@ -10041,5 +10097,134 @@ mod tests {
         p.genome.art_metadata = serde_json::json!({"naturism": false, "risky": "yes"});
         let t = persona_traits(&p);
         assert_eq!((t.naturism, t.risky), (Taste::Neutral, Taste::Neutral));
+    }
+
+    /// Spec 2026-11-28-dives-ski-and-surf-together-design.md.
+    #[test]
+    fn the_dives_the_ski_and_the_surf_have_their_words_and_their_wear() {
+        use eros_engine_core::events::EventKind::*;
+        for (a, phrase, kind, label) in [
+            (
+                UserAction::ScubaDiveTogether,
+                "想和你一起水肺潜水",
+                ScubaDivingTogether,
+                "和对方一起水肺潜水",
+            ),
+            (
+                UserAction::SurfTogether,
+                "想和你一起冲浪",
+                SurfingTogether,
+                "和对方一起冲浪",
+            ),
+            (
+                UserAction::SkiTogether,
+                "想和你一起滑雪",
+                SkiingTogether,
+                "和对方一起滑雪",
+            ),
+            (
+                UserAction::FreeDiveTogether,
+                "想和你一起裸体自由潜水",
+                FreeDivingTogether,
+                "和对方一起裸体自由潜水",
+            ),
+            (
+                UserAction::SurfNakedTogether,
+                "想和你一起裸体冲浪",
+                NakedSurfingTogether,
+                "和对方一起裸体冲浪",
+            ),
+            (
+                UserAction::SkiNakedTogether,
+                "想和你一起裸体滑雪",
+                NakedSkiingTogether,
+                "和对方一起裸体滑雪",
+            ),
+        ] {
+            assert_eq!(action_phrase(&a), phrase);
+            assert_eq!(action_subject(&a), format!("对方{phrase}"));
+            assert_eq!(event_label(kind), label);
+            assert_eq!(doing_label(kind, None), label);
+        }
+        // A scuba dive and a surf wear what a swim wears, on every rung.
+        for chemistry in [0.05, 0.2, 0.5, 0.7, 0.92, 0.97] {
+            for (compatible, virgin) in [(true, false), (true, true), (false, false)] {
+                let wear = WaterWear {
+                    romance_compatible: compatible,
+                    wearer: Wearer::Female,
+                    virgin,
+                    chemistry,
+                    coin: false,
+                };
+                for k in [ScubaDivingTogether, SurfingTogether] {
+                    assert_eq!(
+                        water_clothing(Some(k), &wear),
+                        water_clothing(Some(SwimmingTogether), &wear),
+                        "{k:?} {chemistry} {compatible} {virgin}"
+                    );
+                    assert_eq!(
+                        wear.virginity_matters(Some(k)),
+                        wear.virginity_matters(Some(SwimmingTogether)),
+                        "{k:?}"
+                    );
+                }
+                for k in [
+                    FreeDivingTogether,
+                    NakedSurfingTogether,
+                    NakedSkiingTogether,
+                ] {
+                    assert_eq!(water_clothing(Some(k), &wear), Some("什么都没穿"), "{k:?}");
+                }
+                assert_eq!(water_clothing(Some(SkiingTogether), &wear), None);
+            }
+        }
+    }
+
+    /// Spec 2026-11-28-ask-strip-design.md §5, §6.
+    #[test]
+    fn ask_strip_has_its_phrase_and_five_rungs() {
+        assert_eq!(action_phrase(&UserAction::AskStrip), "想让你把衣服脱了");
+        assert_eq!(
+            action_subject(&UserAction::AskStrip),
+            "对方想让你把衣服脱了"
+        );
+        let rungs = [
+            "脱了外套",
+            "脱到只剩内衣",
+            "脱到只剩内裤，上身用手遮着",
+            "全脱了，用手遮着",
+            "全脱了，不遮不掩",
+        ];
+        for (i, want) in rungs.iter().enumerate() {
+            let tier = i as u8 + 1;
+            assert_eq!(strip_rung(tier, Wearer::Female), *want, "tier {tier}");
+            assert_eq!(
+                self_stripped_clothing(tier, Wearer::Female, None),
+                format!("自己{want}"),
+                "tier {tier}"
+            );
+        }
+        assert_eq!(strip_rung(0, Wearer::Female), rungs[0], "below the scale");
+        assert_eq!(strip_rung(9, Wearer::Female), rungs[4], "above the scale");
+        // A persona who is not female has nothing to cover at tier 3.
+        for w in [Wearer::Male, Wearer::Other] {
+            assert_eq!(strip_rung(3, w), "脱到只剩内裤");
+            for tier in [1, 2, 4, 5] {
+                assert_eq!(strip_rung(tier, w), strip_rung(tier, Wearer::Female));
+            }
+        }
+        // A named outfit is still on at tier 1, and off from tier 2.
+        assert_eq!(
+            self_stripped_clothing(1, Wearer::Female, Some("白衬衫")),
+            "自己脱了外套，里面还穿着「白衬衫」"
+        );
+        assert_eq!(
+            self_stripped_clothing(2, Wearer::Female, Some("白衬衫")),
+            "自己脱到只剩内衣"
+        );
+        assert_eq!(
+            ask_strip_outcomes(2, Wearer::Female),
+            ("脱到只剩内衣", "不脱")
+        );
     }
 }

@@ -168,6 +168,7 @@ pub enum UserActionKind {
     Threaten,
     Trick,
     Strip,
+    AskStrip,
     ShowerTogether,
     BathTogether,
     SaunaTogether,
@@ -189,18 +190,24 @@ pub enum UserActionKind {
     FightTogether,
     WorkoutTogether,
     SwimTogether,
+    ScubaDiveTogether,
+    SurfTogether,
     CycleTogether,
     HikeTogether,
+    SkiTogether,
     DanceTogether,
     AdventureTogether,
     PlayWithFireTogether,
     SingTogether,
     SkinnyDipTogether,
+    FreeDiveTogether,
+    SurfNakedTogether,
     CommitCrimeTogether,
     FishTogether,
     RideHorseNakedTogether,
     YogaNakedTogether,
     HikeNakedTogether,
+    SkiNakedTogether,
     HotSpringNakedTogether,
     DanceNakedTogether,
     MassageTogether,
@@ -648,6 +655,7 @@ impl UserActionDto {
             UserActionKind::Threaten => UserAction::Threaten,
             UserActionKind::Trick => UserAction::Trick,
             UserActionKind::Strip => UserAction::Strip,
+            UserActionKind::AskStrip => UserAction::AskStrip,
             UserActionKind::ShowerTogether => UserAction::ShowerTogether,
             UserActionKind::BathTogether => UserAction::BathTogether,
             UserActionKind::SaunaTogether => UserAction::SaunaTogether,
@@ -722,8 +730,11 @@ impl UserActionDto {
             UserActionKind::FightTogether => UserAction::FightTogether,
             UserActionKind::WorkoutTogether => UserAction::WorkoutTogether,
             UserActionKind::SwimTogether => UserAction::SwimTogether,
+            UserActionKind::ScubaDiveTogether => UserAction::ScubaDiveTogether,
+            UserActionKind::SurfTogether => UserAction::SurfTogether,
             UserActionKind::CycleTogether => UserAction::CycleTogether,
             UserActionKind::HikeTogether => UserAction::HikeTogether,
+            UserActionKind::SkiTogether => UserAction::SkiTogether,
             UserActionKind::DanceTogether => {
                 let (style, name) = dance(self)?;
                 UserAction::DanceTogether { style, name }
@@ -732,11 +743,14 @@ impl UserActionDto {
             UserActionKind::PlayWithFireTogether => UserAction::PlayWithFireTogether,
             UserActionKind::SingTogether => UserAction::SingTogether,
             UserActionKind::SkinnyDipTogether => UserAction::SkinnyDipTogether,
+            UserActionKind::FreeDiveTogether => UserAction::FreeDiveTogether,
+            UserActionKind::SurfNakedTogether => UserAction::SurfNakedTogether,
             UserActionKind::CommitCrimeTogether => UserAction::CommitCrimeTogether,
             UserActionKind::FishTogether => UserAction::FishTogether,
             UserActionKind::RideHorseNakedTogether => UserAction::RideHorseNakedTogether,
             UserActionKind::YogaNakedTogether => UserAction::YogaNakedTogether,
             UserActionKind::HikeNakedTogether => UserAction::HikeNakedTogether,
+            UserActionKind::SkiNakedTogether => UserAction::SkiNakedTogether,
             UserActionKind::HotSpringNakedTogether => UserAction::HotSpringNakedTogether,
             UserActionKind::DanceNakedTogether => {
                 let (style, name) = dance(self)?;
@@ -6352,5 +6366,43 @@ mod validate_payload_tests {
             serde_json::json!({"type": "dance_together", "response": "accept"}),
             "no style, no key"
         );
+    }
+
+    /// Spec 2026-11-28-dives-ski-and-surf-together-design.md.
+    #[test]
+    fn the_dives_the_ski_and_the_surf_map_one_to_one() {
+        use eros_engine_core::types::UserAction;
+        for (wire, want) in [
+            ("scuba_dive_together", UserAction::ScubaDiveTogether),
+            ("free_dive_together", UserAction::FreeDiveTogether),
+            ("ski_together", UserAction::SkiTogether),
+            ("ski_naked_together", UserAction::SkiNakedTogether),
+            ("surf_together", UserAction::SurfTogether),
+            ("surf_naked_together", UserAction::SurfNakedTogether),
+        ] {
+            let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
+                .unwrap_or_else(|e| panic!("{wire}: {e}"));
+            assert_eq!(dto.to_core().unwrap(), want, "{wire}");
+            assert_eq!(
+                serde_json::to_value(&want).unwrap(),
+                serde_json::json!({"type": wire}),
+                "the stored action is the request's"
+            );
+        }
+    }
+
+    /// Spec 2026-11-28-ask-strip-design.md.
+    #[test]
+    fn ask_strip_maps_one_to_one_and_takes_no_field() {
+        let dto: UserActionDto =
+            serde_json::from_value(serde_json::json!({"type": "ask_strip"})).unwrap();
+        assert_eq!(
+            dto.to_core().unwrap(),
+            eros_engine_core::types::UserAction::AskStrip
+        );
+        let styled: UserActionDto =
+            serde_json::from_value(serde_json::json!({"type": "ask_strip", "style": "tango"}))
+                .unwrap();
+        assert!(styled.to_core().is_err());
     }
 }

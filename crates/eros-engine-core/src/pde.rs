@@ -117,7 +117,8 @@ pub fn taste_roll(
 }
 
 /// Whether this turn's gesture is ruled out before the judge for romance:
-/// a `strip` (spec 2026-11-08-strip-and-world-setting-design.md §2.1) or a
+/// a `strip` (spec 2026-11-08-strip-and-world-setting-design.md §2.1), an
+/// `ask_strip` (spec 2026-11-28-ask-strip-design.md §4) or a
 /// gesture with the passion attribute (spec 2026-11-28-dance-massage-and-
 /// passion-actions-design.md §6.1) from a pair whose scopes are not
 /// romance-compatible. Not a roll, and no bypass: such a pair always refuses.
@@ -127,7 +128,7 @@ pub fn romance_ruled_out(event: &Event) -> bool {
             action: Some(a),
             affinity_scope,
             ..
-        } if matches!(a, UserAction::Strip) || a.is_passion() => {
+        } if matches!(a, UserAction::Strip | UserAction::AskStrip) || a.is_passion() => {
             !crate::scope::romance_compatible(*affinity_scope)
         }
         _ => false,
@@ -1905,5 +1906,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Spec 2026-11-28-ask-strip-design.md §4: refused before the judge
+    /// exactly when `strip` is.
+    #[test]
+    fn ask_strip_needs_a_compatible_pair_as_strip_does() {
+        use crate::scope::AffinityScope;
+        for scope in [AffinityScope::default(), AffinityScope::full()] {
+            let event = |a: UserAction| {
+                let mut e = action_msg(a);
+                if let Event::UserMessage { affinity_scope, .. } = &mut e {
+                    *affinity_scope = scope;
+                }
+                e
+            };
+            assert_eq!(
+                romance_ruled_out(&event(UserAction::AskStrip)),
+                romance_ruled_out(&event(UserAction::Strip)),
+                "{scope:?}"
+            );
+        }
+        let mut incompatible = action_msg(UserAction::AskStrip);
+        if let Event::UserMessage { affinity_scope, .. } = &mut incompatible {
+            *affinity_scope = AffinityScope::default();
+        }
+        assert_eq!(
+            romance_ruled_out(&incompatible),
+            !crate::scope::romance_compatible(AffinityScope::default())
+        );
+        // No taste key reads it.
+        let lover = crate::events::PersonaTraits {
+            dance: crate::events::Taste::Love,
+            naturism: crate::events::Taste::Love,
+            risky: crate::events::Taste::Love,
+            ..Default::default()
+        };
+        assert_eq!(
+            taste_roll(&action_msg(UserAction::AskStrip), &lover, 0.0),
+            None
+        );
     }
 }
