@@ -364,7 +364,7 @@ A client that lists give items can add the two. A client that reads
 2. Docs PR into `dev`: `api-reference`, `life-events-needs`,
    `model-config`, the new `eros-character-v1.2`, and their `.zh` twins
    where they exist; and a migrating guide,
-   `docs/migrating/v2-9-1-taste-habits-and-two-tones.md`, as v2.9.0 has
+   `docs/migrating/v2-9-1-items-keys-tones-and-actions.md`, as v2.9.0 has
    one for `erotic`. It covers what the wire-level "additive" does not:
    crate users who match on `Tone` or `GivenItem` or build `Tones` or
    `Habits` by hand, clients that read `metadata.tone`, and rollback (the

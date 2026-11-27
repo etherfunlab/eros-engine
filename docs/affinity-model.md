@@ -264,9 +264,9 @@ roll can refuse whatever the judge says
 - **Refused:** each line the action touches drops one tier, landing at the same relative
   position inside the lower tier; a tier-1 line goes to `0`. `give`, `gift`, a thrill together
   action (`adventure_together`, `commit_crime_together`, `play_with_fire_together`,
-  `fight_together`) and the outdoor `jog_together`, `hike_together`, `fish_together`,
+  `fight_together`) and the outdoor `jog_together`, `hike_together`, `ski_together`, `fish_together`,
   `cycle_together` and `ride_horse_together` touch Bond; their naturism counterparts
-  `streak_together`, `hike_naked_together` and `ride_horse_naked_together`, and a
+  `streak_together`, `hike_naked_together`, `ski_naked_together` and `ride_horse_naked_together`, and a
   `sex_together` that names its act, touch both lines; every other physical action touches
   Chemistry ([what a refusal costs](life-events-needs.md#what-a-refusal-costs)). Both axes of a
   line are scaled by the same factor, so their ratio is kept. The drop is computed from
@@ -292,15 +292,15 @@ roll can refuse whatever the judge says
   the naturism ones included, have no such rule. A `smoke_together`, `smoke_weed_together` or
   `drink_together` the roll refuses drops Chemistry too, not Bond.
 - **Her period:** during her period a `sex_together`, or a together action that happens in water
-  (`swim_together`, `hot_spring_together`, `sauna_together`, `shower_together`,
-  `bath_together`, `skinny_dip_together`, `hot_spring_naked_together`), that the rules above did
+  (`swim_together`, `scuba_dive_together`, `surf_together`, `hot_spring_together`, `sauna_together`, `shower_together`,
+  `bath_together`, `skinny_dip_together`, `free_dive_together`, `surf_naked_together`, `hot_spring_naked_together`), that the rules above did
   not refuse is refused before the judge two times in three by a roll
   ([her cycle](life-events-needs.md#her-cycle)), and drops no line; the other third is judged as
   usual.
 - **An intimate event under way:** a fall of the Chemistry tier from something the user did after
   it started, a refused action's drop included, ends a naturism or passion event at once
-  (`showering_together`, `bathing_together`, `streaking_together`, `skinny_dipping_together`,
-  `naked_horse_riding_together`, `naked_yoga_together`, `naked_hiking_together`,
+  (`showering_together`, `bathing_together`, `streaking_together`, `skinny_dipping_together`, `free_diving_together`, `naked_surfing_together`,
+  `naked_horse_riding_together`, `naked_yoga_together`, `naked_hiking_together`, `naked_skiing_together`,
   `naked_hot_spring_together`, `naked_dancing_together`, `naked_massaging_together`,
   `having_sex_together`;
   [life-events-needs.md](life-events-needs.md#when-chemistry-falls-the-intimate-event-ends)).

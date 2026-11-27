@@ -71,6 +71,7 @@ value of the wrong shape reads as absent.
 | `moody` | boolean | Whether her moods run high: `true` makes an emotional reply three times as likely, `false` a third as likely. Read only by the chat tone draw ([model-config.md](model-config.md#tones--chat-tones-chat-task-only)); it reaches no prompt. |
 | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`, `sugar`, `salty`, `spicy` | boolean | Whether she smokes, drinks, uses weed, drinks coffee, loves good food, has a sweet tooth, a taste for salt, a taste for spice: how fast her craving for what she's hooked on builds, what it names, and how she takes a `give` of the thing each key is for (`cigarette`, `alcohol`, `herb`, `coffee`, `cuisine`, `dessert`; `salty` and `spicy` are the key of no item), or the user's ask to smoke, smoke weed or drink with her. `smoking`, `alcoholic` and `drug` set to `true` also let life events draw her smoking, drinking and smoking weed. See [life-events-needs.md](life-events-needs.md#persona-settings). |
 | `diet` | boolean | Whether she is on a diet: `true` makes her turn down a `give` of `food`, `cuisine` or `dessert` two times in three, whatever her other keys say. Soup and drinks pass. It is not a habit: it does not move her craving. See [life-events-needs.md](life-events-needs.md#persona-settings). |
+| `dance`, `naturism`, `risky` | string | Each `love`, `neutral` or `dislike`; absent or any other value reads as `neutral`. How she takes a kind of action: `dance` a dance (`ask_dancing`, `dance_together`), `naturism` a naturism together action, `risky` a thrill together action or a `bet`. `love` makes her accept two times in three before the judge is asked, `dislike` refuse two times in three. They reach no prompt. See [life-events-needs.md](life-events-needs.md#what-she-loves-and-dislikes). |
 | `health` | string | `weak`, `normal` or `strong`. Read by life events. |
 | `period` | boolean | Whether she has a period. Absent: a female human has one, a female of any other species none. `true` or `false` decides for a female who is not a machine; a machine, and a persona whose `gender` is not `female`, never has one. Read by life events, by the user's sex and water actions during her period, and by her asks ([her cycle](life-events-needs.md#her-cycle)). |
 | `prefer_trip` | boolean | Read by life events. |
@@ -90,8 +91,9 @@ tone. BYOC does not serve life events yet.
 
 ## Versions
 
-- **1.2** adds the `sugar`, `salty` and `spicy` habit keys and the `diet` key.
-  Nothing else about the document changes.
+- **1.2** adds the `sugar`, `salty` and `spicy` habit keys, the `diet` key, and
+  the `dance`, `naturism` and `risky` keys. Nothing else about the document
+  changes.
 - **1.1** added the `gluttony` habit key and the `setting`, `hygienic`,
   `employed`, `outdoorsy` and `moody` keys. It is documented in
   [eros-character-v1.1.md](eros-character-v1.1.md).
