@@ -3198,7 +3198,7 @@ fn build_pde_ctx(
                     | eros_engine_core::types::UserAction::Propose
                     | eros_engine_core::types::UserAction::BreakUp,
                 ) => "，这次你不会答应",
-                (true, a) if a.together_kind().is_some() => "，这次你不会答应",
+                (true, a) if a.together_kind().is_some() || a.is_passion() => "，这次你不会答应",
                 (true, _) => "，这次你不会收下",
             }
         ),
@@ -5597,7 +5597,9 @@ pub(crate) fn run_stream_with(
         // A strip an incompatible pair cannot have (spec 2026-11-08-strip-and-
         // world-setting-design.md §2.1): decided here too, so the judge writes
         // for the outcome.
-        let strip_refused = pde::strip_ruled_out(&input.event);
+        // A passion gesture is gated the same way (spec 2026-11-28-dance-
+        // massage-and-passion-actions-design.md §6.1).
+        let strip_refused = pde::romance_ruled_out(&input.event);
         // So is a together action the persona cannot have: a machine's toilet
         // (spec 2026-11-23-twelve-together-actions-and-propose-design.md
         // §4.1), and a sex_together from a pair that is not romance-compatible
@@ -5925,6 +5927,7 @@ pub(crate) fn run_stream_with(
             == Some(eros_engine_core::types::ActionResponse::Accept)
             && user_msg.action.as_ref().is_some_and(|a| {
                 a.together_group() == Some(eros_engine_core::events::TogetherGroup::Sex)
+                    || a.is_passion()
             });
         let erotic_p = if !plan.action_type.bears_text() {
             None
@@ -28798,7 +28801,10 @@ data: [DONE]\n\n"
         for (response, sentence) in [("accept", "你接受了"), ("refuse", "你没有接受")] {
             // A base this small never wins the draw: only the list can make
             // the turn emotional.
-            let (mock, session_id) = run_tone_turn(
+            // A compatible pair: `touch` carries the passion attribute, and
+            // an incompatible pair's is refused before the judge (spec
+            // 2026-11-28-dance-massage-and-passion-actions-design.md §6.1).
+            let (mock, session_id) = run_tone_turn_at(
                 &pool,
                 "tones = { emotional = 1e-12 }",
                 Some(serde_json::json!({
@@ -28806,6 +28812,10 @@ data: [DONE]\n\n"
                 })),
                 Some(eros_engine_core::types::UserAction::Touch),
                 false,
+                ToneScene {
+                    scope: Some(eros_engine_core::scope::AffinityScope::full()),
+                    ..ToneScene::default()
+                },
             )
             .await;
             let messages = tone_chat_messages(&mock).await;
@@ -31422,5 +31432,191 @@ data: [DONE]\n\n"
         assert_eq!(d(false, Some(0.5), Some(0.5), lose), Some(Tone::Default));
         assert_eq!(d(false, None, Some(0.5), win), Some(Tone::Focused));
         assert_eq!(d(false, None, Some(0.5), lose), Some(Tone::Default));
+    }
+
+    // ── The passion attribute, dancing and massage (spec
+    // 2026-11-28-dance-massage-and-passion-actions-design.md) ──
+
+    const PASSION_GESTURES: [(eros_engine_core::types::UserAction, &str); 5] = [
+        (
+            eros_engine_core::types::UserAction::FrenchKiss,
+            "凑过来想和你舌吻",
+        ),
+        (eros_engine_core::types::UserAction::Tease, "伸手想挑逗你"),
+        (eros_engine_core::types::UserAction::Lick, "想舔你"),
+        (eros_engine_core::types::UserAction::Touch, "伸手想摸你"),
+        (
+            eros_engine_core::types::UserAction::AskMassage,
+            "想让你帮忙按摩",
+        ),
+    ];
+
+    /// §6.1: an incompatible pair's passion gesture is refused whatever the
+    /// rule engine would have said, and drops chemistry.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_incompatible_pairs_passion_gesture_is_refused_before_the_judge(pool: PgPool) {
+        for (a, _) in PASSION_GESTURES {
+            let (frames, _, umid) =
+                run_together_turn(&pool, a.clone(), None, false, &[], false).await;
+            assert_eq!(action_response_of(&frames), "refuse", "{a:?}");
+            let (context, _) = turn_affinity_row(&pool, umid).await;
+            assert_eq!(context["tier_drop"], "chemistry", "{a:?}: {context}");
+        }
+    }
+
+    /// A compatible pair's passion gesture, and an incompatible pair's
+    /// gesture without the attribute, reach the rule engine as before.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_gate_leaves_the_rest_alone(pool: PgPool) {
+        use eros_engine_core::types::UserAction;
+        for (a, compatible) in [
+            (UserAction::Touch, true),
+            (UserAction::AskMassage, true),
+            (UserAction::Kiss, false),
+            (UserAction::HugFromBehind, false),
+            (UserAction::MassageTogether, false),
+        ] {
+            let (frames, _, _) =
+                run_together_turn(&pool, a.clone(), None, compatible, &[], false).await;
+            assert_eq!(action_response_of(&frames), "accept", "{a:?}");
+        }
+    }
+
+    #[test]
+    fn build_pde_ctx_states_a_passion_refusal_as_not_agreeing() {
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        for (a, marker) in PASSION_GESTURES {
+            if let Event::UserMessage { action, .. } = &mut input.event {
+                *action = Some(a.clone());
+            }
+            let ctx = build_pde_ctx(&t, &input, false, None, None, None, None, true);
+            assert!(
+                ctx.contains(&format!("[用户动作] 对方{marker}，这次你不会答应\n")),
+                "{a:?}: {ctx}"
+            );
+        }
+        if let Event::UserMessage { action, .. } = &mut input.event {
+            *action = Some(eros_engine_core::types::UserAction::Strip);
+        }
+        let strip = build_pde_ctx(&t, &input, false, None, None, None, None, true);
+        assert!(strip.contains("，这次你不会让对方这样做\n"), "{strip}");
+    }
+
+    /// §6.2: an accepted passion gesture is a fixed moment of the `erotic`
+    /// tone; refused, it is what it was.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_passion_gesture_is_erotic(pool: PgPool) {
+        use eros_engine_core::types::UserAction;
+        for a in [UserAction::Touch, UserAction::AskMassage] {
+            let (mock, session_id) = run_tone_turn_at(
+                &pool,
+                "tones = { emotional = 1.0, erotic = 1.0 }",
+                Some(action_verdict("accept")),
+                Some(a.clone()),
+                false,
+                lovers(),
+            )
+            .await;
+            let messages = tone_chat_messages(&mock).await;
+            assert_eq!(messages.len(), 2, "{a:?}: {messages:?}");
+            let system = messages[0]["content"].as_str().unwrap();
+            assert!(system.contains(EROTIC_LINES[1]), "{a:?}: {system}");
+            assert_eq!(
+                tone_reply_metadata(&pool, session_id).await["tone"],
+                "erotic",
+                "{a:?}"
+            );
+        }
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { emotional = 1.0, erotic = 1.0 }",
+            Some(action_verdict("refuse")),
+            Some(UserAction::Touch),
+            false,
+            lovers(),
+        )
+        .await;
+        let system = tone_chat_messages(&mock).await[0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!system.contains(EROTIC_LINES[1]), "{system}");
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "emotional"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn lick_and_ask_massage_have_no_tone_of_their_own(pool: PgPool) {
+        use eros_engine_core::types::UserAction;
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "",
+            Some(action_verdict("accept")),
+            Some(UserAction::Lick),
+            false,
+            lovers(),
+        )
+        .await;
+        assert!(tone_chat_messages(&mock).await.len() > 2, "history is sent");
+        let meta = tone_reply_metadata(&pool, session_id).await;
+        assert!(meta.get("tone").is_none(), "{meta}");
+
+        let (mock, session_id) = run_tone_turn_at(
+            &pool,
+            "tones = { erotic = 1e-12 }",
+            Some(action_verdict("accept")),
+            Some(UserAction::AskMassage),
+            false,
+            lovers(),
+        )
+        .await;
+        assert!(tone_chat_messages(&mock).await.len() > 2, "history is sent");
+        assert_eq!(
+            tone_reply_metadata(&pool, session_id).await["tone"],
+            "default"
+        );
+    }
+
+    /// §4.2, §5: the three together actions place their kinds and come
+    /// with a picture; she wears nothing in the two naked ones.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn dance_and_massage_together_place_and_picture(pool: PgPool) {
+        use eros_engine_core::types::UserAction;
+        for (a, kind, label, naked) in [
+            (
+                UserAction::DanceNakedTogether,
+                "naked_dancing_together",
+                "和对方一起裸舞",
+                true,
+            ),
+            (
+                UserAction::MassageTogether,
+                "massaging_together",
+                "让对方给自己按摩",
+                false,
+            ),
+            (
+                UserAction::MassageNakedTogether,
+                "naked_massaging_together",
+                "和对方脱了衣服互相按摩",
+                true,
+            ),
+        ] {
+            sqlx::query("DELETE FROM engine.chat_images_events")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let (frames, payload, _, clothing, answer) =
+                water_picture_turn(&pool, a.clone(), "accept", true, |_| {}).await;
+            assert_eq!(action_response_of(&frames), "accept", "{a:?}");
+            assert_eq!(answer, "accept");
+            assert_eq!(image_requests(&frames), 1, "{a:?}");
+            assert_eq!(events_of_kind(&pool, kind).await.len(), 1, "{a:?}");
+            assert!(payload.contains(label), "{a:?}: {payload}");
+            assert_eq!(clothing == "什么都没穿", naked, "{a:?}: {clothing}");
+        }
     }
 }

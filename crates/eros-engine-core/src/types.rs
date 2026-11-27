@@ -130,8 +130,10 @@ pub enum UserAction {
     Pat,
     Wink,
     Blink,
-    /// The user asks her to dance with them.
-    AskForDance,
+    /// The user asks her to give them a massage: a gesture with the passion
+    /// attribute (spec 2026-11-28-dance-massage-and-passion-actions-design.md
+    /// §5, §6).
+    AskMassage,
     /// The user asks her to dance for them; accepted, the turn shows her
     /// picture (spec 2026-11-19-vehicles-actions-species-design.md §4).
     AskDancing,
@@ -225,6 +227,9 @@ pub enum UserAction {
     /// `skinny_dip_together` is a nude action, answered in the `emotional`
     /// tone; a refused dance, song or skinny dip drops chemistry (spec
     /// 2026-11-27-together-action-groups-design.md §5).
+    /// A stored `ask_for_dance`, removed as an action type, reads as this
+    /// (spec 2026-11-28 §4.1).
+    #[serde(alias = "ask_for_dance")]
     DanceTogether,
     AdventureTogether,
     PlayWithFireTogether,
@@ -247,6 +252,10 @@ pub enum UserAction {
     YogaNakedTogether,
     HikeNakedTogether,
     HotSpringNakedTogether,
+    /// Spec 2026-11-28-dance-massage-and-passion-actions-design.md §4.2, §5.
+    DanceNakedTogether,
+    MassageTogether,
+    MassageNakedTogether,
     /// The user asks her to do something with them, in their own words (spec
     /// 2026-11-26 §8): behaves as `jog_together` does, placing
     /// `custom_together`. A general action: not emotional, and a refusal
@@ -410,6 +419,22 @@ impl UserAction {
 
     /// The group of the kind this together action places (spec 2026-11-27
     /// §4.1); `None` for every other action.
+    /// Whether this gesture carries the passion attribute (spec
+    /// 2026-11-28-dance-massage-and-passion-actions-design.md §6): it is
+    /// refused before the judge for a pair that is not romance-compatible,
+    /// and her accepted reply is a fixed moment of the `erotic` tone. A
+    /// together action has a group instead, and carries no attribute.
+    pub fn is_passion(&self) -> bool {
+        matches!(
+            self,
+            UserAction::FrenchKiss
+                | UserAction::Tease
+                | UserAction::Lick
+                | UserAction::Touch
+                | UserAction::AskMassage
+        )
+    }
+
     pub fn together_group(&self) -> Option<TogetherGroup> {
         self.together_kind().and_then(EventKind::together_group)
     }
@@ -461,6 +486,9 @@ impl UserAction {
             UserAction::YogaNakedTogether => Some(EventKind::NakedYogaTogether),
             UserAction::HikeNakedTogether => Some(EventKind::NakedHikingTogether),
             UserAction::HotSpringNakedTogether => Some(EventKind::NakedHotSpringTogether),
+            UserAction::DanceNakedTogether => Some(EventKind::NakedDancingTogether),
+            UserAction::MassageTogether => Some(EventKind::MassagingTogether),
+            UserAction::MassageNakedTogether => Some(EventKind::NakedMassagingTogether),
             UserAction::CustomTogether { .. } => Some(EventKind::CustomTogether),
             _ => None,
         }
@@ -808,7 +836,7 @@ mod tests {
             UserAction::Pat,
             UserAction::Wink,
             UserAction::Blink,
-            UserAction::AskForDance,
+            UserAction::AskMassage,
             UserAction::AskDancing,
             UserAction::Photo,
             UserAction::Bluff,
@@ -1386,7 +1414,7 @@ mod tests {
             Pat,
             Wink,
             Blink,
-            AskForDance,
+            AskMassage,
             AskDancing,
             Photo,
             Bluff,
@@ -1427,6 +1455,9 @@ mod tests {
             YogaNakedTogether,
             HikeNakedTogether,
             HotSpringNakedTogether,
+            DanceNakedTogether,
+            MassageTogether,
+            MassageNakedTogether,
             CustomTogether { text: "x".into() },
             Challenge,
             Bet,
@@ -1468,7 +1499,9 @@ mod tests {
         );
     }
 
-    const NUDE_ACTIONS: [UserAction; 8] = [
+    const NUDE_ACTIONS: [UserAction; 10] = [
+        UserAction::DanceNakedTogether,
+        UserAction::MassageNakedTogether,
         UserAction::ShowerTogether,
         UserAction::BathTogether,
         UserAction::StreakTogether,
@@ -1815,7 +1848,7 @@ mod tests {
             (UserAction::Pat, "pat"),
             (UserAction::Wink, "wink"),
             (UserAction::Blink, "blink"),
-            (UserAction::AskForDance, "ask_for_dance"),
+            (UserAction::AskMassage, "ask_massage"),
             (UserAction::AskDancing, "ask_dancing"),
             (UserAction::Photo, "photo"),
             (UserAction::Bluff, "bluff"),
@@ -1849,7 +1882,7 @@ mod tests {
             UserAction::Pat,
             UserAction::Wink,
             UserAction::Blink,
-            UserAction::AskForDance,
+            UserAction::AskMassage,
             UserAction::AskDancing,
             UserAction::Photo,
             UserAction::Strip,
@@ -2011,5 +2044,91 @@ mod tests {
             Event::UserMessage { action, .. } => assert!(action.is_none()),
             _ => panic!("expected UserMessage"),
         }
+    }
+
+    // ── Dancing and massage together, and the passion attribute (spec
+    // 2026-11-28-dance-massage-and-passion-actions-design.md) ──
+
+    #[test]
+    fn is_passion_is_exactly_the_five() {
+        let passion: Vec<UserAction> = all_actions()
+            .into_iter()
+            .filter(|a| a.is_passion())
+            .collect();
+        assert_eq!(
+            passion,
+            [
+                UserAction::Touch,
+                UserAction::Lick,
+                UserAction::FrenchKiss,
+                UserAction::Tease,
+                UserAction::AskMassage,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stored_ask_for_dance_reads_as_dance_together() {
+        let read: UserAction =
+            serde_json::from_value(serde_json::json!({"type": "ask_for_dance"})).unwrap();
+        assert_eq!(read, UserAction::DanceTogether);
+        assert_eq!(
+            serde_json::to_value(&read).unwrap(),
+            serde_json::json!({"type": "dance_together"})
+        );
+    }
+
+    #[test]
+    fn ask_massage_is_a_gesture() {
+        let a = UserAction::AskMassage;
+        assert_eq!(a.together_kind(), None);
+        assert_eq!(a.refusal_lines(), [AffinityLine::Chemistry]);
+        assert!(!a.speaks_emotionally());
+        assert!(a.is_passion());
+    }
+
+    #[test]
+    fn the_three_together_actions() {
+        use EventKind::*;
+        for (a, wire, kind, group, emotional) in [
+            (
+                UserAction::DanceNakedTogether,
+                "dance_naked_together",
+                NakedDancingTogether,
+                TogetherGroup::Nude,
+                true,
+            ),
+            (
+                UserAction::MassageTogether,
+                "massage_together",
+                MassagingTogether,
+                TogetherGroup::General,
+                false,
+            ),
+            (
+                UserAction::MassageNakedTogether,
+                "massage_naked_together",
+                NakedMassagingTogether,
+                TogetherGroup::Nude,
+                true,
+            ),
+        ] {
+            let v = serde_json::json!({ "type": wire });
+            assert_eq!(serde_json::to_value(&a).unwrap(), v);
+            assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
+            assert_eq!(a.together_kind(), Some(kind), "{a:?}");
+            assert_eq!(a.together_group(), Some(group), "{a:?}");
+            assert_eq!(a.refusal_lines(), [AffinityLine::Chemistry], "{a:?}");
+            assert_eq!(a.speaks_emotionally(), emotional, "{a:?}");
+            assert!(!a.is_passion(), "{a:?}");
+        }
+        assert_eq!(
+            NakedDancingTogether.clothed_counterpart(),
+            Some(DancingTogether)
+        );
+        assert_eq!(
+            NakedMassagingTogether.clothed_counterpart(),
+            Some(MassagingTogether)
+        );
     }
 }

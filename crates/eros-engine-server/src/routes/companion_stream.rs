@@ -161,7 +161,7 @@ pub enum UserActionKind {
     Pat,
     Wink,
     Blink,
-    AskForDance,
+    AskMassage,
     AskDancing,
     Photo,
     Bluff,
@@ -202,6 +202,9 @@ pub enum UserActionKind {
     YogaNakedTogether,
     HikeNakedTogether,
     HotSpringNakedTogether,
+    DanceNakedTogether,
+    MassageTogether,
+    MassageNakedTogether,
     CustomTogether,
     Challenge,
     Bet,
@@ -581,7 +584,7 @@ impl UserActionDto {
             UserActionKind::Pat => UserAction::Pat,
             UserActionKind::Wink => UserAction::Wink,
             UserActionKind::Blink => UserAction::Blink,
-            UserActionKind::AskForDance => UserAction::AskForDance,
+            UserActionKind::AskMassage => UserAction::AskMassage,
             UserActionKind::AskDancing => UserAction::AskDancing,
             UserActionKind::Photo => UserAction::Photo,
             UserActionKind::Bluff => UserAction::Bluff,
@@ -675,6 +678,9 @@ impl UserActionDto {
             UserActionKind::YogaNakedTogether => UserAction::YogaNakedTogether,
             UserActionKind::HikeNakedTogether => UserAction::HikeNakedTogether,
             UserActionKind::HotSpringNakedTogether => UserAction::HotSpringNakedTogether,
+            UserActionKind::DanceNakedTogether => UserAction::DanceNakedTogether,
+            UserActionKind::MassageTogether => UserAction::MassageTogether,
+            UserActionKind::MassageNakedTogether => UserAction::MassageNakedTogether,
             UserActionKind::CustomTogether => UserAction::CustomTogether {
                 text: free_text(self.text.as_deref(), "text", MAX_ACTION_TEXT_CHARS)?
                     .ok_or("action.text is required for custom_together")?,
@@ -745,11 +751,16 @@ impl UserActionView {
     /// Parse a stored `metadata.action`; what does not parse is dropped rather
     /// than failing the history page. A `sex_together`'s act and custom
     /// clothing are stored in plain text and read back as base64 only (spec
-    /// 2026-11-27-passion-group-design.md §5.3).
+    /// 2026-11-27-passion-group-design.md §5.3). A stored `ask_for_dance`, no
+    /// longer an action type, reads back as `dance_together` (spec
+    /// 2026-11-28-dance-massage-and-passion-actions-design.md §4.1).
     pub(crate) fn from_metadata_action(raw: &serde_json::Value) -> Option<Self> {
         use base64::Engine as _;
         let b64 = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
         let mut raw = raw.clone();
+        if raw.get("type").and_then(|t| t.as_str()) == Some("ask_for_dance") {
+            raw["type"] = serde_json::json!("dance_together");
+        }
         if raw.get("type").and_then(|t| t.as_str()) == Some("sex_together") {
             if let Some(name) = raw.as_object_mut().and_then(|o| o.remove("name")) {
                 raw["name_base64"] = serde_json::json!(b64(name.as_str().unwrap_or("")));
@@ -5504,7 +5515,6 @@ mod validate_payload_tests {
         for (wire, want) in [
             ("wink", UserAction::Wink),
             ("blink", UserAction::Blink),
-            ("ask_for_dance", UserAction::AskForDance),
             ("ask_dancing", UserAction::AskDancing),
         ] {
             let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
@@ -6083,5 +6093,66 @@ mod validate_payload_tests {
         assert_eq!(view.action.kind, UserActionKind::Date);
         assert_eq!(view.action.duration, Some(DateDurationDto::Mid));
         assert_eq!(view.action.place.as_deref(), Some("海边"));
+    }
+
+    // ── Dance, massage and the passion attribute (spec
+    // 2026-11-28-dance-massage-and-passion-actions-design.md) ──
+
+    #[test]
+    fn ask_for_dance_is_no_longer_accepted() {
+        assert!(serde_json::from_value::<UserActionDto>(
+            serde_json::json!({"type": "ask_for_dance"})
+        )
+        .is_err());
+    }
+
+    /// A stored `ask_for_dance` reads back as `dance_together` (§4.1).
+    #[test]
+    fn a_stored_ask_for_dance_reads_back_as_dance_together() {
+        let view = UserActionView::from_metadata_action(
+            &serde_json::json!({"type": "ask_for_dance", "response": "accept"}),
+        )
+        .expect("history parses a stored ask_for_dance");
+        assert_eq!(view.action.kind, UserActionKind::DanceTogether);
+        assert_eq!(view.response, Some(ActionResponseDto::Accept));
+        assert_eq!(
+            serde_json::to_value(&view).unwrap(),
+            serde_json::json!({"type": "dance_together", "response": "accept"})
+        );
+    }
+
+    #[test]
+    fn the_four_new_actions_map_one_to_one() {
+        for (wire, kind, want) in [
+            (
+                "ask_massage",
+                UserActionKind::AskMassage,
+                UserAction::AskMassage,
+            ),
+            (
+                "massage_together",
+                UserActionKind::MassageTogether,
+                UserAction::MassageTogether,
+            ),
+            (
+                "massage_naked_together",
+                UserActionKind::MassageNakedTogether,
+                UserAction::MassageNakedTogether,
+            ),
+            (
+                "dance_naked_together",
+                UserActionKind::DanceNakedTogether,
+                UserAction::DanceNakedTogether,
+            ),
+        ] {
+            let dto: UserActionDto = serde_json::from_value(serde_json::json!({"type": wire}))
+                .unwrap_or_else(|e| panic!("{wire}: {e}"));
+            assert_eq!(dto.to_core().unwrap(), want, "{wire}");
+            let view = UserActionView::from_metadata_action(
+                &serde_json::json!({"type": wire, "response": "accept"}),
+            )
+            .unwrap_or_else(|| panic!("history parses a stored {wire}"));
+            assert_eq!(view.action.kind, kind);
+        }
     }
 }

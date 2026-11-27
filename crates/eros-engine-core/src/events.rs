@@ -261,6 +261,16 @@ pub enum EventKind {
     NakedYogaTogether,
     NakedHikingTogether,
     NakedHotSpringTogether,
+    /// She and the user dance naked together: written when she accepts the
+    /// user's `dance_naked_together` (spec 2026-11-28-dance-massage-and-
+    /// passion-actions-design.md §4.2).
+    NakedDancingTogether,
+    /// The user gives her a massage: written when she accepts the user's
+    /// `massage_together` (spec 2026-11-28 §5).
+    MassagingTogether,
+    /// She and the user undress and massage each other: written when she
+    /// accepts the user's `massage_naked_together` (spec 2026-11-28 §5).
+    NakedMassagingTogether,
     /// She and the user do the thing the user named: written when she
     /// accepts the user's `custom_together` (spec 2026-11-26 §8). The row's
     /// `message_id` is the user's message, which holds the text.
@@ -360,7 +370,7 @@ impl EventKind {
     ];
 
     /// Kinds the writers place directly, never drawn: parsed and stored, not in `ALL`.
-    pub const SPECIAL: [EventKind; 37] = [
+    pub const SPECIAL: [EventKind; 40] = [
         EventKind::TakingSpace,
         EventKind::FellOut,
         EventKind::TravelingTogether,
@@ -397,6 +407,9 @@ impl EventKind {
         EventKind::NakedYogaTogether,
         EventKind::NakedHikingTogether,
         EventKind::NakedHotSpringTogether,
+        EventKind::NakedDancingTogether,
+        EventKind::MassagingTogether,
+        EventKind::NakedMassagingTogether,
         EventKind::CustomTogether,
     ];
 
@@ -406,7 +419,7 @@ impl EventKind {
     /// actions-bath-outfit-chemistry-drop-and-custom-together-design.md §6;
     /// spec 2026-11-27-together-action-groups-design.md §5.1). A test pins it
     /// to `together_group`.
-    pub const ENDS_ON_CHEMISTRY_DROP: [EventKind; 9] = [
+    pub const ENDS_ON_CHEMISTRY_DROP: [EventKind; 11] = [
         EventKind::ShoweringTogether,
         EventKind::BathingTogether,
         EventKind::HavingSexTogether,
@@ -416,6 +429,8 @@ impl EventKind {
         EventKind::NakedYogaTogether,
         EventKind::NakedHikingTogether,
         EventKind::NakedHotSpringTogether,
+        EventKind::NakedDancingTogether,
+        EventKind::NakedMassagingTogether,
     ];
 
     /// The kinds under which she holds back her `bathe_together` and
@@ -551,6 +566,9 @@ impl EventKind {
             EventKind::NakedYogaTogether => "naked_yoga_together",
             EventKind::NakedHikingTogether => "naked_hiking_together",
             EventKind::NakedHotSpringTogether => "naked_hot_spring_together",
+            EventKind::NakedDancingTogether => "naked_dancing_together",
+            EventKind::MassagingTogether => "massaging_together",
+            EventKind::NakedMassagingTogether => "naked_massaging_together",
             EventKind::CustomTogether => "custom_together",
         }
     }
@@ -627,6 +645,9 @@ impl EventKind {
             | NakedHorseRidingTogether
             | NakedYogaTogether
             | NakedHotSpringTogether
+            | NakedDancingTogether
+            | MassagingTogether
+            | NakedMassagingTogether
             | CustomTogether => EventCategory::Short,
             AsleepTogether | FightingTogether | HikingTogether | AdventuringTogether
             | FishingTogether | NakedHikingTogether | TempWork | ExMessage | GotHit | Breakup
@@ -720,7 +741,9 @@ impl EventKind {
             | NakedHorseRidingTogether
             | NakedYogaTogether
             | NakedHikingTogether
-            | NakedHotSpringTogether => Some(TogetherGroup::Nude),
+            | NakedHotSpringTogether
+            | NakedDancingTogether
+            | NakedMassagingTogether => Some(TogetherGroup::Nude),
             AdventuringTogether
             | CommittingCrimeTogether
             | PlayingWithFireTogether
@@ -729,9 +752,8 @@ impl EventKind {
             | HorseRidingTogether | DrinkingTogether | SmokingTogether | SmokingWeedTogether
             | UsingToiletTogether | AsleepTogether | WorkingOutTogether | SwimmingTogether
             | CyclingTogether | HikingTogether | FishingTogether | DancingTogether
-            | SingingTogether | HotSpringTogether | SaunaTogether | CustomTogether => {
-                Some(TogetherGroup::General)
-            }
+            | SingingTogether | HotSpringTogether | SaunaTogether | MassagingTogether
+            | CustomTogether => Some(TogetherGroup::General),
             _ => None,
         }
     }
@@ -763,6 +785,8 @@ impl EventKind {
             NakedHotSpringTogether => Some(HotSpringTogether),
             NakedYogaTogether => Some(YogaTogether),
             NakedHorseRidingTogether => Some(HorseRidingTogether),
+            NakedDancingTogether => Some(DancingTogether),
+            NakedMassagingTogether => Some(MassagingTogether),
             _ => None,
         }
     }
@@ -990,6 +1014,9 @@ fn rule(kind: EventKind) -> Rule {
         NakedYogaTogether => (0.0, 0, Lasts::Hours(1, 1)),
         NakedHikingTogether => (0.0, 0, Lasts::Hours(2, 3)),
         NakedHotSpringTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        NakedDancingTogether => (0.0, 0, Lasts::Hours(1, 1)),
+        MassagingTogether => (0.0, 0, Lasts::Minutes(30)),
+        NakedMassagingTogether => (0.0, 0, Lasts::Minutes(30)),
         CustomTogether => (0.0, 0, Lasts::Hours(1, 1)),
     };
     Rule {
@@ -2811,7 +2838,7 @@ mod tests {
         assert!(!EventKind::ALL.contains(&TakingSpace));
         assert!(!EventKind::ALL.contains(&FellOut));
         assert_eq!(EventKind::ALL.len(), 70);
-        assert_eq!(EventKind::SPECIAL.len(), 37);
+        assert_eq!(EventKind::SPECIAL.len(), 40);
         for k in EventKind::SPECIAL {
             assert_eq!(serde_json::to_value(k).unwrap(), k.as_str());
             assert_eq!(EventKind::parse(k.as_str()), Some(k));
@@ -3980,7 +4007,9 @@ mod tests {
                 NakedHorseRidingTogether,
                 NakedYogaTogether,
                 NakedHikingTogether,
-                NakedHotSpringTogether
+                NakedHotSpringTogether,
+                NakedDancingTogether,
+                NakedMassagingTogether
             ]
         );
         assert_eq!(
@@ -4046,6 +4075,8 @@ mod tests {
             (NakedHotSpringTogether, HotSpringTogether),
             (NakedYogaTogether, YogaTogether),
             (NakedHorseRidingTogether, HorseRidingTogether),
+            (NakedDancingTogether, DancingTogether),
+            (NakedMassagingTogether, MassagingTogether),
         ];
         for k in every() {
             let want = pairs.iter().find(|(n, _)| *n == k).map(|(_, c)| *c);
@@ -5051,5 +5082,31 @@ mod tests {
             assert!(k.is_background(), "{k:?}");
         }
         assert!(Period.is_background());
+    }
+
+    /// Spec 2026-11-28-dance-massage-and-passion-actions-design.md §4.2, §5.
+    #[test]
+    fn the_three_dance_and_massage_kinds() {
+        use EventKind::*;
+        for (k, name, minutes) in [
+            (NakedDancingTogether, "naked_dancing_together", 60),
+            (MassagingTogether, "massaging_together", 30),
+            (NakedMassagingTogether, "naked_massaging_together", 30),
+        ] {
+            assert!(EventKind::SPECIAL.contains(&k), "{k:?}");
+            assert_eq!(k.as_str(), name);
+            assert_eq!(EventKind::parse(name), Some(k));
+            assert_eq!(k.category(), EventCategory::Short, "{k:?}");
+            assert_eq!(k.place(), Place::Neutral, "{k:?}");
+            assert!(k.fits(Setting::Modern) && k.fits(Setting::Fantasy), "{k:?}");
+            assert!(!k.is_wet(), "{k:?}");
+            assert!(k.is_shared(), "{k:?}");
+            for roll in [0.0, 0.999] {
+                assert_eq!(lasts(k, roll).num_minutes(), minutes, "{k:?}");
+            }
+        }
+        assert!(EventKind::ENDS_ON_CHEMISTRY_DROP.contains(&NakedDancingTogether));
+        assert!(EventKind::ENDS_ON_CHEMISTRY_DROP.contains(&NakedMassagingTogether));
+        assert!(!EventKind::ENDS_ON_CHEMISTRY_DROP.contains(&MassagingTogether));
     }
 }

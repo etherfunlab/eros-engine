@@ -173,6 +173,9 @@ pub enum EventKindDto {
     NakedYogaTogether,
     NakedHikingTogether,
     NakedHotSpringTogether,
+    NakedDancingTogether,
+    MassagingTogether,
+    NakedMassagingTogether,
     CustomTogether,
 }
 
@@ -301,6 +304,9 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::NakedYogaTogether => EventKind::NakedYogaTogether,
             EventKindDto::NakedHikingTogether => EventKind::NakedHikingTogether,
             EventKindDto::NakedHotSpringTogether => EventKind::NakedHotSpringTogether,
+            EventKindDto::NakedDancingTogether => EventKind::NakedDancingTogether,
+            EventKindDto::MassagingTogether => EventKind::MassagingTogether,
+            EventKindDto::NakedMassagingTogether => EventKind::NakedMassagingTogether,
             EventKindDto::CustomTogether => EventKind::CustomTogether,
         }
     }
@@ -415,6 +421,9 @@ impl From<EventKind> for EventKindDto {
             EventKind::NakedYogaTogether => EventKindDto::NakedYogaTogether,
             EventKind::NakedHikingTogether => EventKindDto::NakedHikingTogether,
             EventKind::NakedHotSpringTogether => EventKindDto::NakedHotSpringTogether,
+            EventKind::NakedDancingTogether => EventKindDto::NakedDancingTogether,
+            EventKind::MassagingTogether => EventKindDto::MassagingTogether,
+            EventKind::NakedMassagingTogether => EventKindDto::NakedMassagingTogether,
             EventKind::CustomTogether => EventKindDto::CustomTogether,
         }
     }
@@ -2993,6 +3002,13 @@ mod tests {
             (
                 EventKind::NakedHotSpringTogether,
                 "naked_hot_spring_together",
+            ),
+            // Spec 2026-11-28-dance-massage-and-passion-actions-design.md §4.2, §5.
+            (EventKind::NakedDancingTogether, "naked_dancing_together"),
+            (EventKind::MassagingTogether, "massaging_together"),
+            (
+                EventKind::NakedMassagingTogether,
+                "naked_massaging_together",
             ),
         ] {
             let dto = EventKindDto::from(kind);

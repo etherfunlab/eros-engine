@@ -832,7 +832,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::Pat => "伸手想拍拍你".into(),
         UserAction::Wink => "冲你抛了个媚眼".into(),
         UserAction::Blink => "冲你眨巴眨巴眼睛".into(),
-        UserAction::AskForDance => "伸出手，想请你跳支舞".into(),
+        UserAction::AskMassage => "想让你帮忙按摩".into(),
         UserAction::AskDancing => "想看你跳支舞".into(),
         UserAction::Photo => "举起手机想给你拍张照".into(),
         UserAction::Bluff => "在你面前虚张声势，想唬住你".into(),
@@ -874,6 +874,9 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::YogaNakedTogether => "想和你一起裸体做瑜伽".into(),
         UserAction::HikeNakedTogether => "想和你一起裸体爬山".into(),
         UserAction::HotSpringNakedTogether => "想和你一起裸体泡温泉".into(),
+        UserAction::DanceNakedTogether => "想和你一起裸舞".into(),
+        UserAction::MassageTogether => "想给你按摩".into(),
+        UserAction::MassageNakedTogether => "想和你脱了衣服互相按摩".into(),
         UserAction::CustomTogether { text } => format!("想和你一起：{text}"),
         UserAction::Challenge => "向你发起挑战".into(),
         UserAction::Bet => "想和你打个赌".into(),
@@ -1223,6 +1226,9 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         NakedYogaTogether => "和对方一起裸体做瑜伽",
         NakedHikingTogether => "和对方一起裸体爬山",
         NakedHotSpringTogether => "和对方一起裸体泡温泉",
+        NakedDancingTogether => "和对方一起裸舞",
+        MassagingTogether => "让对方给自己按摩",
+        NakedMassagingTogether => "和对方脱了衣服互相按摩",
         CustomTogether => "和对方一起做一件事",
     }
 }
@@ -7674,7 +7680,7 @@ mod tests {
             UserAction::Pat,
             UserAction::Wink,
             UserAction::Blink,
-            UserAction::AskForDance,
+            UserAction::AskMassage,
             UserAction::AskDancing,
             UserAction::Photo,
             UserAction::Bluff,
@@ -7722,7 +7728,7 @@ mod tests {
                 "伸手想拍拍你",
                 "冲你抛了个媚眼",
                 "冲你眨巴眨巴眼睛",
-                "伸出手，想请你跳支舞",
+                "想让你帮忙按摩",
                 "想看你跳支舞",
                 "举起手机想给你拍张照",
                 "在你面前虚张声势，想唬住你",
@@ -9490,5 +9496,32 @@ mod tests {
         assert_eq!(with(serde_json::json!({"moody": true})), Some(true));
         assert_eq!(with(serde_json::json!({"moody": false})), Some(false));
         assert_eq!(with(serde_json::json!({"moody": "true"})), None);
+    }
+
+    /// Spec 2026-11-28-dance-massage-and-passion-actions-design.md §4.2, §5.
+    #[test]
+    fn dance_and_massage_markers_and_labels() {
+        use eros_engine_core::events::EventKind;
+        for (a, marker) in [
+            (UserAction::DanceNakedTogether, "想和你一起裸舞"),
+            (UserAction::AskMassage, "想让你帮忙按摩"),
+            (UserAction::MassageTogether, "想给你按摩"),
+            (UserAction::MassageNakedTogether, "想和你脱了衣服互相按摩"),
+        ] {
+            assert_eq!(action_marker(&a), format!("（{marker}）"), "{a:?}");
+        }
+        for (k, label) in [
+            (EventKind::NakedDancingTogether, "和对方一起裸舞"),
+            (EventKind::MassagingTogether, "让对方给自己按摩"),
+            (EventKind::NakedMassagingTogether, "和对方脱了衣服互相按摩"),
+        ] {
+            assert_eq!(event_label(k), label, "{k:?}");
+        }
+        let stored: UserAction =
+            serde_json::from_value(serde_json::json!({"type": "ask_for_dance"})).unwrap();
+        assert_eq!(
+            user_text_with_action(Some(&stored), ""),
+            "（想和你一起跳舞）"
+        );
     }
 }
