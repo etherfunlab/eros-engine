@@ -60,9 +60,9 @@ cargo add eros-engine-core eros-engine-store eros-engine-llm
 
 ```toml
 [dependencies]
-eros-engine-core  = "2.8"
-eros-engine-store = "2.8"   # optional: Postgres + pgvector persistence
-eros-engine-llm   = "2.8"   # optional: model and embedding clients
+eros-engine-core  = "2.9"
+eros-engine-store = "2.9"   # optional: Postgres + pgvector persistence
+eros-engine-llm   = "2.9"   # optional: model and embedding clients
 ```
 
 `eros-engine-server` は crates.io では公開していません。Docker イメージで実行してください。
@@ -72,14 +72,14 @@ eros-engine-llm   = "2.8"   # optional: model and embedding clients
 各 `v*` タグについて、複数アーキテクチャ対応のイメージを GitHub Container Registry へ公開しています。
 
 ```bash
-docker pull ghcr.io/etherfunlab/eros-engine:2.8.4
+docker pull ghcr.io/etherfunlab/eros-engine:2.9.0
 # Or follow the latest tagged release
 docker pull ghcr.io/etherfunlab/eros-engine:latest
 ```
 
 ```bash
 docker run --rm -p 8080:8080 --env-file .env \
-  ghcr.io/etherfunlab/eros-engine:2.8.4 serve
+  ghcr.io/etherfunlab/eros-engine:2.9.0 serve
 ```
 
 Postgres と `.env` は利用者側で用意してください。同じ `docker/Dockerfile` を任意のコンテナ環境へ配備できます。詳細は [Deploying](docs/deploying.md) を参照してください。

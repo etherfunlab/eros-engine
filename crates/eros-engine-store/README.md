@@ -22,8 +22,8 @@ SQL migrations ship inside this crate under [`migrations/`](https://github.com/e
 
 ```toml
 [dependencies]
-eros-engine-store = "2.8"
-eros-engine-core  = "2.8"
+eros-engine-store = "2.9"
+eros-engine-core  = "2.9"
 ```
 
 ## License
