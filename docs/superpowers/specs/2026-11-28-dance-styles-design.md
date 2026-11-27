@@ -62,8 +62,8 @@ take a dance more readily, or turn it down more often.
 
 **Anti-goals.**
 
-- A second list of the styles or of their words: one enum in
-  `eros-engine-core`, one table of words in the prompt module.
+- A second list of the styles or of their words: one enum with its words
+  in `eros-engine-core`, beside the tier labels' words.
 - A second list of the actions the `dance` key rolls on: one function in
   `eros-engine-core`.
 - A user-written name reaching a prompt unquoted.
@@ -170,7 +170,9 @@ any other value reads as `neutral`, as `outdoorsy` is read. Character card
 
 On a 1:1 turn whose action is `ask_dancing` or `dance_together`, with or
 without a style, the engine rolls once before the judge runs, unless a
-rule that refuses before the judge already refused the action:
+rule that refuses before the judge already refused the action. The
+`dislike` side is the habit roll of a `give` (the same one in three, the
+same forced refusal); the `love` side is its mirror:
 
 | `dance` | the roll | then |
 |---|---|---|
