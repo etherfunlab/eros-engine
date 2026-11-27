@@ -888,8 +888,11 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::FightTogether => "想和你一起去战斗".into(),
         UserAction::WorkoutTogether => "想和你一起健身".into(),
         UserAction::SwimTogether => "想和你一起游泳".into(),
+        UserAction::ScubaDiveTogether => "想和你一起潜水".into(),
+        UserAction::SurfTogether => "想和你一起冲浪".into(),
         UserAction::CycleTogether => "想和你一起骑单车".into(),
         UserAction::HikeTogether => "想和你一起爬山".into(),
+        UserAction::SkiTogether => "想和你一起滑雪".into(),
         UserAction::DanceTogether { .. } => match a.dance_words() {
             Some(words) => format!("想和你一起跳{words}"),
             None => "想和你一起跳舞".into(),
@@ -898,11 +901,14 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::PlayWithFireTogether => "想和你一起玩火".into(),
         UserAction::SingTogether => "想和你一起唱歌".into(),
         UserAction::SkinnyDipTogether => "想和你一起裸泳".into(),
+        UserAction::FreeDiveTogether => "想和你一起裸潜".into(),
+        UserAction::SurfNakedTogether => "想和你一起裸体冲浪".into(),
         UserAction::CommitCrimeTogether => "想和你一起去犯罪".into(),
         UserAction::FishTogether => "想和你一起钓鱼".into(),
         UserAction::RideHorseNakedTogether => "想和你一起裸体骑马".into(),
         UserAction::YogaNakedTogether => "想和你一起裸体做瑜伽".into(),
         UserAction::HikeNakedTogether => "想和你一起裸体爬山".into(),
+        UserAction::SkiNakedTogether => "想和你一起裸体滑雪".into(),
         UserAction::HotSpringNakedTogether => "想和你一起裸体泡温泉".into(),
         UserAction::DanceNakedTogether { .. } => match a.dance_words() {
             Some(words) => format!("想和你一起裸着跳{words}"),
@@ -1255,18 +1261,24 @@ pub(crate) fn event_label(kind: eros_engine_core::events::EventKind) -> &'static
         FightingTogether => "和对方并肩作战",
         WorkingOutTogether => "和对方一起健身",
         SwimmingTogether => "和对方一起游泳",
+        ScubaDivingTogether => "和对方一起潜水",
+        SurfingTogether => "和对方一起冲浪",
         CyclingTogether => "和对方一起骑单车",
         HikingTogether => "和对方一起爬山",
+        SkiingTogether => "和对方一起滑雪",
         DancingTogether => "和对方一起跳舞",
         AdventuringTogether => "和对方一起冒险",
         PlayingWithFireTogether => "和对方一起玩火",
         SingingTogether => "和对方一起唱歌",
         SkinnyDippingTogether => "和对方一起裸泳",
+        FreeDivingTogether => "和对方一起裸潜",
+        NakedSurfingTogether => "和对方一起裸体冲浪",
         CommittingCrimeTogether => "和对方一起犯罪",
         FishingTogether => "和对方一起钓鱼",
         NakedHorseRidingTogether => "和对方一起裸体骑马",
         NakedYogaTogether => "和对方一起裸体做瑜伽",
         NakedHikingTogether => "和对方一起裸体爬山",
+        NakedSkiingTogether => "和对方一起裸体滑雪",
         NakedHotSpringTogether => "和对方一起裸体泡温泉",
         NakedDancingTogether => "和对方一起裸舞",
         MassagingTogether => "让对方给自己按摩",
@@ -1842,6 +1854,8 @@ impl WaterWear {
             foreground,
             Some(
                 eros_engine_core::events::EventKind::SwimmingTogether
+                    | eros_engine_core::events::EventKind::ScubaDivingTogether
+                    | eros_engine_core::events::EventKind::SurfingTogether
                     | eros_engine_core::events::EventKind::HotSpringTogether
             )
         ) && self.wearer == Wearer::Female
@@ -1864,7 +1878,10 @@ pub(crate) fn water_clothing(
     wear: &WaterWear,
 ) -> Option<&'static str> {
     use eros_engine_core::events::{
-        EventKind::{HotSpringTogether, SaunaTogether, SwimmingTogether},
+        EventKind::{
+            HotSpringTogether, SaunaTogether, ScubaDivingTogether, SurfingTogether,
+            SwimmingTogether,
+        },
         TogetherGroup,
     };
     let towel = || {
@@ -1880,6 +1897,8 @@ pub(crate) fn water_clothing(
         // §7): nothing on unless a 1:1 picture's action says otherwise.
         eros_engine_core::events::EventKind::HavingSexTogether => Some("什么都没穿"),
         SwimmingTogether => swimsuit(wear),
+        ScubaDivingTogether => swimsuit(wear),
+        SurfingTogether => swimsuit(wear),
         HotSpringTogether => swimsuit(wear).or_else(towel),
         SaunaTogether => towel(),
         _ => None,
@@ -10041,5 +10060,86 @@ mod tests {
         p.genome.art_metadata = serde_json::json!({"naturism": false, "risky": "yes"});
         let t = persona_traits(&p);
         assert_eq!((t.naturism, t.risky), (Taste::Neutral, Taste::Neutral));
+    }
+
+    /// Spec 2026-11-28-dives-ski-and-surf-together-design.md.
+    #[test]
+    fn the_dives_the_ski_and_the_surf_have_their_words_and_their_wear() {
+        use eros_engine_core::events::EventKind::*;
+        for (a, phrase, kind, label) in [
+            (
+                UserAction::ScubaDiveTogether,
+                "想和你一起潜水",
+                ScubaDivingTogether,
+                "和对方一起潜水",
+            ),
+            (
+                UserAction::SurfTogether,
+                "想和你一起冲浪",
+                SurfingTogether,
+                "和对方一起冲浪",
+            ),
+            (
+                UserAction::SkiTogether,
+                "想和你一起滑雪",
+                SkiingTogether,
+                "和对方一起滑雪",
+            ),
+            (
+                UserAction::FreeDiveTogether,
+                "想和你一起裸潜",
+                FreeDivingTogether,
+                "和对方一起裸潜",
+            ),
+            (
+                UserAction::SurfNakedTogether,
+                "想和你一起裸体冲浪",
+                NakedSurfingTogether,
+                "和对方一起裸体冲浪",
+            ),
+            (
+                UserAction::SkiNakedTogether,
+                "想和你一起裸体滑雪",
+                NakedSkiingTogether,
+                "和对方一起裸体滑雪",
+            ),
+        ] {
+            assert_eq!(action_phrase(&a), phrase);
+            assert_eq!(action_subject(&a), format!("对方{phrase}"));
+            assert_eq!(event_label(kind), label);
+            assert_eq!(doing_label(kind, None), label);
+        }
+        // A scuba dive and a surf wear what a swim wears, on every rung.
+        for chemistry in [0.05, 0.2, 0.5, 0.7, 0.92, 0.97] {
+            for (compatible, virgin) in [(true, false), (true, true), (false, false)] {
+                let wear = WaterWear {
+                    romance_compatible: compatible,
+                    wearer: Wearer::Female,
+                    virgin,
+                    chemistry,
+                    coin: false,
+                };
+                for k in [ScubaDivingTogether, SurfingTogether] {
+                    assert_eq!(
+                        water_clothing(Some(k), &wear),
+                        water_clothing(Some(SwimmingTogether), &wear),
+                        "{k:?} {chemistry} {compatible} {virgin}"
+                    );
+                    assert_eq!(
+                        wear.virginity_matters(Some(k)),
+                        wear.virginity_matters(Some(SwimmingTogether)),
+                        "{k:?}"
+                    );
+                }
+                for k in [
+                    FreeDivingTogether,
+                    NakedSurfingTogether,
+                    NakedSkiingTogether,
+                ] {
+                    assert_eq!(water_clothing(Some(k), &wear), Some("什么都没穿"), "{k:?}");
+                }
+                assert_eq!(water_clothing(Some(SkiingTogether), &wear), None);
+            }
+        }
     }
 }

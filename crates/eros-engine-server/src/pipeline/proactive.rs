@@ -472,18 +472,24 @@ fn kind_cue(
         | FightingTogether
         | WorkingOutTogether
         | SwimmingTogether
+        | ScubaDivingTogether
+        | SurfingTogether
         | CyclingTogether
         | HikingTogether
+        | SkiingTogether
         | DancingTogether
         | AdventuringTogether
         | PlayingWithFireTogether
         | SingingTogether
         | SkinnyDippingTogether
+        | FreeDivingTogether
+        | NakedSurfingTogether
         | CommittingCrimeTogether
         | FishingTogether
         | NakedHorseRidingTogether
         | NakedYogaTogether
         | NakedHikingTogether
+        | NakedSkiingTogether
         | NakedHotSpringTogether
         | NakedDancingTogether
         | MassagingTogether

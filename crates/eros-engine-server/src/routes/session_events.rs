@@ -160,18 +160,24 @@ pub enum EventKindDto {
     FightingTogether,
     WorkingOutTogether,
     SwimmingTogether,
+    ScubaDivingTogether,
+    SurfingTogether,
     CyclingTogether,
     HikingTogether,
+    SkiingTogether,
     DancingTogether,
     AdventuringTogether,
     PlayingWithFireTogether,
     SingingTogether,
     SkinnyDippingTogether,
+    FreeDivingTogether,
+    NakedSurfingTogether,
     CommittingCrimeTogether,
     FishingTogether,
     NakedHorseRidingTogether,
     NakedYogaTogether,
     NakedHikingTogether,
+    NakedSkiingTogether,
     NakedHotSpringTogether,
     NakedDancingTogether,
     MassagingTogether,
@@ -291,18 +297,24 @@ impl From<EventKindDto> for EventKind {
             EventKindDto::FightingTogether => EventKind::FightingTogether,
             EventKindDto::WorkingOutTogether => EventKind::WorkingOutTogether,
             EventKindDto::SwimmingTogether => EventKind::SwimmingTogether,
+            EventKindDto::ScubaDivingTogether => EventKind::ScubaDivingTogether,
+            EventKindDto::SurfingTogether => EventKind::SurfingTogether,
             EventKindDto::CyclingTogether => EventKind::CyclingTogether,
             EventKindDto::HikingTogether => EventKind::HikingTogether,
+            EventKindDto::SkiingTogether => EventKind::SkiingTogether,
             EventKindDto::DancingTogether => EventKind::DancingTogether,
             EventKindDto::AdventuringTogether => EventKind::AdventuringTogether,
             EventKindDto::PlayingWithFireTogether => EventKind::PlayingWithFireTogether,
             EventKindDto::SingingTogether => EventKind::SingingTogether,
             EventKindDto::SkinnyDippingTogether => EventKind::SkinnyDippingTogether,
+            EventKindDto::FreeDivingTogether => EventKind::FreeDivingTogether,
+            EventKindDto::NakedSurfingTogether => EventKind::NakedSurfingTogether,
             EventKindDto::CommittingCrimeTogether => EventKind::CommittingCrimeTogether,
             EventKindDto::FishingTogether => EventKind::FishingTogether,
             EventKindDto::NakedHorseRidingTogether => EventKind::NakedHorseRidingTogether,
             EventKindDto::NakedYogaTogether => EventKind::NakedYogaTogether,
             EventKindDto::NakedHikingTogether => EventKind::NakedHikingTogether,
+            EventKindDto::NakedSkiingTogether => EventKind::NakedSkiingTogether,
             EventKindDto::NakedHotSpringTogether => EventKind::NakedHotSpringTogether,
             EventKindDto::NakedDancingTogether => EventKind::NakedDancingTogether,
             EventKindDto::MassagingTogether => EventKind::MassagingTogether,
@@ -408,18 +420,24 @@ impl From<EventKind> for EventKindDto {
             EventKind::FightingTogether => EventKindDto::FightingTogether,
             EventKind::WorkingOutTogether => EventKindDto::WorkingOutTogether,
             EventKind::SwimmingTogether => EventKindDto::SwimmingTogether,
+            EventKind::ScubaDivingTogether => EventKindDto::ScubaDivingTogether,
+            EventKind::SurfingTogether => EventKindDto::SurfingTogether,
             EventKind::CyclingTogether => EventKindDto::CyclingTogether,
             EventKind::HikingTogether => EventKindDto::HikingTogether,
+            EventKind::SkiingTogether => EventKindDto::SkiingTogether,
             EventKind::DancingTogether => EventKindDto::DancingTogether,
             EventKind::AdventuringTogether => EventKindDto::AdventuringTogether,
             EventKind::PlayingWithFireTogether => EventKindDto::PlayingWithFireTogether,
             EventKind::SingingTogether => EventKindDto::SingingTogether,
             EventKind::SkinnyDippingTogether => EventKindDto::SkinnyDippingTogether,
+            EventKind::FreeDivingTogether => EventKindDto::FreeDivingTogether,
+            EventKind::NakedSurfingTogether => EventKindDto::NakedSurfingTogether,
             EventKind::CommittingCrimeTogether => EventKindDto::CommittingCrimeTogether,
             EventKind::FishingTogether => EventKindDto::FishingTogether,
             EventKind::NakedHorseRidingTogether => EventKindDto::NakedHorseRidingTogether,
             EventKind::NakedYogaTogether => EventKindDto::NakedYogaTogether,
             EventKind::NakedHikingTogether => EventKindDto::NakedHikingTogether,
+            EventKind::NakedSkiingTogether => EventKindDto::NakedSkiingTogether,
             EventKind::NakedHotSpringTogether => EventKindDto::NakedHotSpringTogether,
             EventKind::NakedDancingTogether => EventKindDto::NakedDancingTogether,
             EventKind::MassagingTogether => EventKindDto::MassagingTogether,
@@ -4530,5 +4548,24 @@ mod tests {
         assert!(body.get("image_request").is_none(), "{body}");
         assert!(!body.to_string().contains("姿势甲"), "{body}");
         assert!(calls(&mock).await.is_empty(), "nothing is generated");
+    }
+
+    /// Spec 2026-11-28-dives-ski-and-surf-together-design.md: the six kinds
+    /// are on the wire under their own names.
+    #[test]
+    fn the_dive_ski_and_surf_kinds_are_on_the_wire() {
+        use eros_engine_core::events::EventKind;
+        for (kind, wire) in [
+            (EventKind::ScubaDivingTogether, "scuba_diving_together"),
+            (EventKind::FreeDivingTogether, "free_diving_together"),
+            (EventKind::SkiingTogether, "skiing_together"),
+            (EventKind::NakedSkiingTogether, "naked_skiing_together"),
+            (EventKind::SurfingTogether, "surfing_together"),
+            (EventKind::NakedSurfingTogether, "naked_surfing_together"),
+        ] {
+            let dto = EventKindDto::from(kind);
+            assert_eq!(serde_json::to_value(dto).unwrap(), wire);
+            assert_eq!(EventKind::from(dto), kind);
+        }
     }
 }
