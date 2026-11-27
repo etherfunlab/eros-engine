@@ -42,14 +42,15 @@ pub fn settle_action_response(
     }
 }
 
-/// How often she still takes tobacco, alcohol, weed, coffee or a dish whose
-/// habit key is `false`, of the times she would otherwise take it (spec
+/// How often she still takes something the habit roll is made on
+/// (`Habits::rolls_on`), of the times she would otherwise take it (spec
 /// 2026-10-28-outing-indulgence-needs-and-habits-design.md §3.1, 2026-11-08 §4).
 pub const UNUSED_SUBSTANCE_ACCEPT: f64 = 1.0 / 3.0;
 
-/// Whether the habit roll refuses this turn's give: a `give` of tobacco,
-/// alcohol, weed, coffee or cuisine whose key is explicitly `false`, with `roll` (uniform in
-/// [0, 1)) at or above `UNUSED_SUBSTANCE_ACCEPT`. Rolled before the judge,
+/// Whether the habit roll refuses this turn's give: a `give` the persona's
+/// keys roll on (`Habits::rolls_on`: an item whose habit key is explicitly
+/// `false`, or food, a dish or a dessert while she is on a diet), with `roll`
+/// (uniform in [0, 1)) at or above `UNUSED_SUBSTANCE_ACCEPT`. Rolled before the judge,
 /// so the judge can be told. A `smoke_together`, `smoke_weed_together` or
 /// `drink_together` is rolled as a give of its item is (spec 2026-11-23-
 /// twelve-together-actions-and-propose-design.md §5).
@@ -58,9 +59,9 @@ pub fn refuses_give(event: &Event, habits: Habits, roll: f64) -> bool {
         Event::UserMessage {
             action: Some(action),
             ..
-        } => action.consumed().is_some_and(|(item, _)| {
-            habits.uses(item) == Some(false) && roll >= UNUSED_SUBSTANCE_ACCEPT
-        }),
+        } => action
+            .consumed()
+            .is_some_and(|(item, _)| habits.rolls_on(item) && roll >= UNUSED_SUBSTANCE_ACCEPT),
         _ => false,
     }
 }
@@ -1303,6 +1304,7 @@ mod tests {
             drug: Some(false),
             coffee: Some(false),
             gluttony: Some(false),
+            ..Habits::default()
         };
         for a in [
             UserAction::SmokeTogether,
@@ -1623,6 +1625,7 @@ mod tests {
             drug,
             coffee: None,
             gluttony: None,
+            ..Habits::default()
         };
         let cig = give(GivenItem::Cigarette, None);
         let no_smoke = with(Some(false), None);
@@ -1655,6 +1658,40 @@ mod tests {
         assert!(!refuses_give(&dish, no_glut, 0.0));
         assert!(!refuses_give(&give(GivenItem::Food, None), no_glut, 0.99));
         assert!(!refuses_give(&dish, Habits::default(), 0.99));
+        let no_sugar = Habits {
+            sugar: Some(false),
+            ..Habits::default()
+        };
+        let sweet = give(GivenItem::Dessert, None);
+        assert!(refuses_give(&sweet, no_sugar, 0.99));
+        assert!(!refuses_give(&sweet, no_sugar, 0.0));
+        assert!(!refuses_give(&give(GivenItem::Soup, None), no_sugar, 0.99));
+        // On a diet she turns down food, a dish and a dessert, whatever she
+        // craves; a turn with both reasons still rolls once.
+        let diet = Habits {
+            diet: Some(true),
+            gluttony: Some(false),
+            sugar: Some(true),
+            ..Habits::default()
+        };
+        for item in [GivenItem::Food, GivenItem::Cuisine, GivenItem::Dessert] {
+            let e = give(item, None);
+            assert!(
+                !refuses_give(&e, diet, UNUSED_SUBSTANCE_ACCEPT - 1e-9),
+                "{item:?}"
+            );
+            assert!(refuses_give(&e, diet, UNUSED_SUBSTANCE_ACCEPT), "{item:?}");
+        }
+        for item in [GivenItem::Soup, GivenItem::SoftDrink, GivenItem::Tea] {
+            assert!(!refuses_give(&give(item, None), diet, 0.99), "{item:?}");
+        }
+        for d in [Some(false), None] {
+            let h = Habits {
+                diet: d,
+                ..Habits::default()
+            };
+            assert!(!refuses_give(&give(GivenItem::Food, None), h, 0.99));
+        }
         let named_gift = action_msg(UserAction::Gift {
             kind: ItemKind::Item,
             name: "一条香烟".into(),

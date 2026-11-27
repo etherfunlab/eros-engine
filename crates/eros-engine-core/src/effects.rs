@@ -38,7 +38,9 @@ fn shape(item: GivenItem) -> Option<Shape> {
         | GivenItem::Food
         | GivenItem::SoftDrink
         | GivenItem::Tea
-        | GivenItem::Cuisine => Some(Shape::Front),
+        | GivenItem::Cuisine
+        | GivenItem::Dessert
+        | GivenItem::Soup => Some(Shape::Front),
         GivenItem::Alcohol => Some(Shape::Back),
         GivenItem::Medicine | GivenItem::Coffee | GivenItem::Herb => Some(Shape::Middle),
         GivenItem::Watch
@@ -364,6 +366,8 @@ mod tests {
             (GivenItem::Coffee, GivenItem::Medicine),
             (GivenItem::Herb, GivenItem::Medicine),
             (GivenItem::Cuisine, GivenItem::Cigarette),
+            (GivenItem::Dessert, GivenItem::Cigarette),
+            (GivenItem::Soup, GivenItem::Cigarette),
         ] {
             for q in (0..=7u8).chain([99]) {
                 assert_eq!(curve(item, q), curve(like, q), "{item:?} ×{q}");

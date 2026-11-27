@@ -579,6 +579,8 @@ pub enum GivenItem {
     Herb,
     /// A proper dish or meal; `food` is something to eat.
     Cuisine,
+    Dessert,
+    Soup,
     Watch,
     Gem,
     Gold,
@@ -1942,6 +1944,8 @@ mod tests {
 
     #[test]
     fn given_item_keeps_its_wire_values() {
+        assert_eq!(serde_json::to_value(GivenItem::Dessert).unwrap(), "dessert");
+        assert_eq!(serde_json::to_value(GivenItem::Soup).unwrap(), "soup");
         assert_eq!(
             serde_json::to_value(GivenItem::Cigarette).unwrap(),
             "cigarette"
