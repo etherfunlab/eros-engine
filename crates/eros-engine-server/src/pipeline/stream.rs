@@ -28474,8 +28474,8 @@ data: [DONE]\n\n"
         /// The session's cold war is on.
         cold_war: bool,
         /// An event of this kind, placed by the turn's own session, ended
-        /// this many seconds ago: after `EARLIER-REPLY` at 30, before it at
-        /// 90.
+        /// this many seconds ago: after `EARLIER-REPLY` (a minute ago) at
+        /// 5, before it at 90.
         woke: Option<(eros_engine_core::events::EventKind, f64)>,
     }
 
@@ -31595,7 +31595,7 @@ data: [DONE]\n\n"
 
     fn woke_from(kind: eros_engine_core::events::EventKind) -> ToneScene {
         ToneScene {
-            woke: Some((kind, 30.0)),
+            woke: Some((kind, 5.0)),
             ..ToneScene::default()
         }
     }
@@ -31816,7 +31816,7 @@ data: [DONE]\n\n"
             ..ToneScene::default()
         };
         let busy = ToneScene {
-            woke: Some((AsleepTogether, 30.0)),
+            woke: Some((AsleepTogether, 5.0)),
             ..at_temp_work()
         };
         for (name, scene, action) in [

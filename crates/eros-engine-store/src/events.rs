@@ -3302,6 +3302,32 @@ mod tests {
         assert!(!woke(&pool, s, i).await, "one that has not started yet");
     }
 
+    /// An event that starts after the turn's own moment is not the newest
+    /// one for that turn: it does not hide the one she just woke from.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn one_that_starts_after_the_turn_s_moment_hides_nothing(pool: PgPool) {
+        let (_, i, s) = instance_and_session(&pool).await;
+        let e = ev(
+            i,
+            s,
+            "a",
+            AsleepTogether,
+            "2026-11-28T08:00:00Z",
+            "2026-11-28T11:00:00Z",
+        );
+        seed(&pool, e, None).await;
+        let e = ev(
+            i,
+            s,
+            "b",
+            HavingSexTogether,
+            "2026-11-28T12:00:01Z",
+            "2026-11-28T13:00:00Z",
+        );
+        seed(&pool, e, None).await;
+        assert!(woke(&pool, s, i).await);
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn twelve_hours_is_the_bound(pool: PgPool) {
         let (_, i, s) = instance_and_session(&pool).await;
