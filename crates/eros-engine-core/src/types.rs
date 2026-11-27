@@ -135,8 +135,16 @@ pub enum UserAction {
     /// §5, §6).
     AskMassage,
     /// The user asks her to dance for them; accepted, the turn shows her
-    /// picture (spec 2026-11-19-vehicles-actions-species-design.md §4).
-    AskDancing,
+    /// picture (spec 2026-11-19-vehicles-actions-species-design.md §4). The
+    /// client may say which dance: a `style`, with a `name` when the style is
+    /// `custom` (spec 2026-11-28-dance-styles-design.md §5). Without one it
+    /// serialises as `{"type":"ask_dancing"}`.
+    AskDancing {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<DanceStyle>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     /// The user takes her picture; accepted, the turn shows it (spec
     /// 2026-11-08-five-actions-two-items-gluttony-card-1-1-design.md §2.3).
     Photo,
@@ -229,8 +237,14 @@ pub enum UserAction {
     /// 2026-11-27-together-action-groups-design.md §5).
     /// A stored `ask_for_dance`, removed as an action type, reads as this
     /// (spec 2026-11-28 §4.1).
+    /// It may say which dance, as `ask_dancing` does.
     #[serde(alias = "ask_for_dance")]
-    DanceTogether,
+    DanceTogether {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<DanceStyle>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     AdventureTogether,
     PlayWithFireTogether,
     SingTogether,
@@ -253,7 +267,13 @@ pub enum UserAction {
     HikeNakedTogether,
     HotSpringNakedTogether,
     /// Spec 2026-11-28-dance-massage-and-passion-actions-design.md §4.2, §5.
-    DanceNakedTogether,
+    /// It may say which dance, as `ask_dancing` does.
+    DanceNakedTogether {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<DanceStyle>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     MassageTogether,
     MassageNakedTogether,
     /// The user asks her to do something with them, in their own words (spec
@@ -475,7 +495,7 @@ impl UserAction {
             UserAction::SwimTogether => Some(EventKind::SwimmingTogether),
             UserAction::CycleTogether => Some(EventKind::CyclingTogether),
             UserAction::HikeTogether => Some(EventKind::HikingTogether),
-            UserAction::DanceTogether => Some(EventKind::DancingTogether),
+            UserAction::DanceTogether { .. } => Some(EventKind::DancingTogether),
             UserAction::AdventureTogether => Some(EventKind::AdventuringTogether),
             UserAction::PlayWithFireTogether => Some(EventKind::PlayingWithFireTogether),
             UserAction::SingTogether => Some(EventKind::SingingTogether),
@@ -486,7 +506,7 @@ impl UserAction {
             UserAction::YogaNakedTogether => Some(EventKind::NakedYogaTogether),
             UserAction::HikeNakedTogether => Some(EventKind::NakedHikingTogether),
             UserAction::HotSpringNakedTogether => Some(EventKind::NakedHotSpringTogether),
-            UserAction::DanceNakedTogether => Some(EventKind::NakedDancingTogether),
+            UserAction::DanceNakedTogether { .. } => Some(EventKind::NakedDancingTogether),
             UserAction::MassageTogether => Some(EventKind::MassagingTogether),
             UserAction::MassageNakedTogether => Some(EventKind::NakedMassagingTogether),
             UserAction::CustomTogether { .. } => Some(EventKind::CustomTogether),
@@ -494,14 +514,55 @@ impl UserAction {
         }
     }
 
-    /// The user's own words of a `custom_together`, or a `sex_together`'s act
-    /// name: what the event it places is about. `None` for every other
-    /// action.
-    pub fn together_text(&self) -> Option<&str> {
+    /// The user's own words of a `custom_together`, a `sex_together`'s act
+    /// name, or the words of a dance together that names its style: what the
+    /// event it places is about. `None` for every other action.
+    pub fn together_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
         match self {
-            UserAction::CustomTogether { text } => Some(text),
-            UserAction::SexTogether { name, .. } => name.as_deref(),
+            UserAction::CustomTogether { text } => Some(Cow::Borrowed(text)),
+            UserAction::SexTogether { name, .. } => name.as_deref().map(Cow::Borrowed),
+            UserAction::DanceTogether { .. } | UserAction::DanceNakedTogether { .. } => {
+                self.dance_words().map(Cow::Owned)
+            }
             _ => None,
+        }
+    }
+
+    /// The words of the dance a dance action names (spec
+    /// 2026-11-28-dance-styles-design.md §6); `None` for a dance action
+    /// without a style and for every other action.
+    pub fn dance_words(&self) -> Option<String> {
+        match self {
+            UserAction::AskDancing { style, name }
+            | UserAction::DanceTogether { style, name }
+            | UserAction::DanceNakedTogether { style, name } => {
+                style.map(|s| dance_words(s, name.as_deref()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The three dance actions without a style: what each was before a style
+    /// could be named.
+    pub const fn ask_dancing() -> Self {
+        UserAction::AskDancing {
+            style: None,
+            name: None,
+        }
+    }
+
+    pub const fn dance_together() -> Self {
+        UserAction::DanceTogether {
+            style: None,
+            name: None,
+        }
+    }
+
+    pub const fn dance_naked_together() -> Self {
+        UserAction::DanceNakedTogether {
+            style: None,
+            name: None,
         }
     }
 
@@ -559,6 +620,146 @@ impl UserAction {
                 _ => &[Chemistry],
             },
         }
+    }
+}
+
+/// Which dance a dance action names (spec 2026-11-28-dance-styles-design.md
+/// §4). Wording only: no rule reads it. `Custom` is a dance in the user's own
+/// words, carried in the action's `name`. Stored in the user row's
+/// `metadata.action`, so the serde names are a persisted contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DanceStyle {
+    Ballroom,
+    Courtly,
+    Sexy,
+    Tiktok,
+    House,
+    Hiphop,
+    Flamenco,
+    Oriental,
+    Indian,
+    Arabic,
+    Ballet,
+    Jazz,
+    Latin,
+    Tango,
+    Cossack,
+    Austronesian,
+    Indigenous,
+    African,
+    Kpop,
+    Pole,
+    Folk,
+    Contemporary,
+    Geisha,
+    Custom,
+}
+
+impl DanceStyle {
+    /// Every style, `Custom` last.
+    pub const ALL: [DanceStyle; 24] = [
+        DanceStyle::Ballroom,
+        DanceStyle::Courtly,
+        DanceStyle::Sexy,
+        DanceStyle::Tiktok,
+        DanceStyle::House,
+        DanceStyle::Hiphop,
+        DanceStyle::Flamenco,
+        DanceStyle::Oriental,
+        DanceStyle::Indian,
+        DanceStyle::Arabic,
+        DanceStyle::Ballet,
+        DanceStyle::Jazz,
+        DanceStyle::Latin,
+        DanceStyle::Tango,
+        DanceStyle::Cossack,
+        DanceStyle::Austronesian,
+        DanceStyle::Indigenous,
+        DanceStyle::African,
+        DanceStyle::Kpop,
+        DanceStyle::Pole,
+        DanceStyle::Folk,
+        DanceStyle::Contemporary,
+        DanceStyle::Geisha,
+        DanceStyle::Custom,
+    ];
+
+    /// The stored and wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DanceStyle::Ballroom => "ballroom",
+            DanceStyle::Courtly => "courtly",
+            DanceStyle::Sexy => "sexy",
+            DanceStyle::Tiktok => "tiktok",
+            DanceStyle::House => "house",
+            DanceStyle::Hiphop => "hiphop",
+            DanceStyle::Flamenco => "flamenco",
+            DanceStyle::Oriental => "oriental",
+            DanceStyle::Indian => "indian",
+            DanceStyle::Arabic => "arabic",
+            DanceStyle::Ballet => "ballet",
+            DanceStyle::Jazz => "jazz",
+            DanceStyle::Latin => "latin",
+            DanceStyle::Tango => "tango",
+            DanceStyle::Cossack => "cossack",
+            DanceStyle::Austronesian => "austronesian",
+            DanceStyle::Indigenous => "indigenous",
+            DanceStyle::African => "african",
+            DanceStyle::Kpop => "kpop",
+            DanceStyle::Pole => "pole",
+            DanceStyle::Folk => "folk",
+            DanceStyle::Contemporary => "contemporary",
+            DanceStyle::Geisha => "geisha",
+            DanceStyle::Custom => "custom",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|style| style.as_str() == s)
+    }
+
+    /// What the prompts call the dance; `None` for `Custom`, which is called
+    /// by its name.
+    pub fn zh(self) -> Option<&'static str> {
+        Some(match self {
+            DanceStyle::Ballroom => "交际舞",
+            DanceStyle::Courtly => "宫廷舞",
+            DanceStyle::Sexy => "性感的舞",
+            DanceStyle::Tiktok => "TikTok 舞",
+            DanceStyle::House => "House 舞",
+            DanceStyle::Hiphop => "嘻哈舞",
+            DanceStyle::Flamenco => "弗拉明戈",
+            DanceStyle::Oriental => "东方古风舞",
+            DanceStyle::Indian => "印度舞",
+            DanceStyle::Arabic => "阿拉伯舞",
+            DanceStyle::Ballet => "芭蕾",
+            DanceStyle::Jazz => "爵士舞",
+            DanceStyle::Latin => "拉丁舞",
+            DanceStyle::Tango => "探戈",
+            DanceStyle::Cossack => "哥萨克舞",
+            DanceStyle::Austronesian => "南岛语族的传统舞",
+            DanceStyle::Indigenous => "原住民的传统舞",
+            DanceStyle::African => "非洲舞",
+            DanceStyle::Kpop => "韩舞",
+            DanceStyle::Pole => "钢管舞",
+            DanceStyle::Folk => "民族舞",
+            DanceStyle::Contemporary => "现代舞",
+            DanceStyle::Geisha => "日本艺伎舞",
+            DanceStyle::Custom => return None,
+        })
+    }
+}
+
+/// The words that stand for 舞 in a dance's phrase (spec
+/// 2026-11-28-dance-styles-design.md §6): the style's own, or the user's
+/// `name` quoted with 「」 so that it reads as data. A `Custom` without a name
+/// reads as a plain dance.
+pub fn dance_words(style: DanceStyle, name: Option<&str>) -> String {
+    match (style.zh(), name) {
+        (Some(words), _) => words.to_string(),
+        (None, Some(name)) => format!("「{name}」"),
+        (None, None) => "舞".to_string(),
     }
 }
 
@@ -839,7 +1040,7 @@ mod tests {
             UserAction::Wink,
             UserAction::Blink,
             UserAction::AskMassage,
-            UserAction::AskDancing,
+            UserAction::ask_dancing(),
             UserAction::Photo,
             UserAction::Bluff,
             UserAction::Threaten,
@@ -970,7 +1171,7 @@ mod tests {
         for a in [
             UserAction::Kiss,
             UserAction::Strip,
-            UserAction::AskDancing,
+            UserAction::ask_dancing(),
             UserAction::Photo,
             UserAction::Custom { text: "x".into() },
             UserAction::Date {
@@ -1112,7 +1313,11 @@ mod tests {
     fn six_more_together_actions_name_their_events() {
         use EventKind::*;
         for (a, wire, kind) in [
-            (UserAction::DanceTogether, "dance_together", DancingTogether),
+            (
+                UserAction::dance_together(),
+                "dance_together",
+                DancingTogether,
+            ),
             (
                 UserAction::AdventureTogether,
                 "adventure_together",
@@ -1155,7 +1360,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&a).unwrap(), v);
         assert_eq!(serde_json::from_value::<UserAction>(v).unwrap(), a);
         assert_eq!(a.together_kind(), Some(EventKind::CustomTogether));
-        assert_eq!(a.together_text(), Some("去海边放烟花"));
+        assert_eq!(a.together_text().as_deref(), Some("去海边放烟花"));
         assert_eq!(a.together_group(), Some(TogetherGroup::General));
         assert!(!a.speaks_emotionally());
         assert_eq!(a.refusal_lines(), [AffinityLine::Chemistry]);
@@ -1173,7 +1378,7 @@ mod tests {
     fn only_skinny_dip_of_the_six_speaks_emotionally_and_only_crime_drops_bond() {
         assert!(UserAction::SkinnyDipTogether.speaks_emotionally());
         for a in [
-            UserAction::DanceTogether,
+            UserAction::dance_together(),
             UserAction::AdventureTogether,
             UserAction::PlayWithFireTogether,
             UserAction::SingTogether,
@@ -1214,7 +1419,7 @@ mod tests {
             UserAction::WorkoutTogether,
             UserAction::YogaTogether,
             UserAction::StargazeTogether,
-            UserAction::DanceTogether,
+            UserAction::dance_together(),
             UserAction::SingTogether,
         ] {
             assert_eq!(a.refusal_lines(), [AffinityLine::Chemistry], "{a:?}");
@@ -1363,7 +1568,7 @@ mod tests {
             named.refusal_lines(),
             [AffinityLine::Bond, AffinityLine::Chemistry]
         );
-        assert_eq!(named.together_text(), Some("姿势甲"));
+        assert_eq!(named.together_text().as_deref(), Some("姿势甲"));
     }
 
     /// Spec 2026-11-27-together-action-groups-design.md §6.
@@ -1417,7 +1622,7 @@ mod tests {
             Wink,
             Blink,
             AskMassage,
-            AskDancing,
+            UserAction::ask_dancing(),
             Photo,
             Bluff,
             Threaten,
@@ -1446,7 +1651,7 @@ mod tests {
             SwimTogether,
             CycleTogether,
             HikeTogether,
-            DanceTogether,
+            UserAction::dance_together(),
             AdventureTogether,
             PlayWithFireTogether,
             SingTogether,
@@ -1457,7 +1662,7 @@ mod tests {
             YogaNakedTogether,
             HikeNakedTogether,
             HotSpringNakedTogether,
-            DanceNakedTogether,
+            UserAction::dance_naked_together(),
             MassageTogether,
             MassageNakedTogether,
             CustomTogether { text: "x".into() },
@@ -1502,7 +1707,7 @@ mod tests {
     }
 
     const NUDE_ACTIONS: [UserAction; 10] = [
-        UserAction::DanceNakedTogether,
+        UserAction::dance_naked_together(),
         UserAction::MassageNakedTogether,
         UserAction::ShowerTogether,
         UserAction::BathTogether,
@@ -1851,7 +2056,7 @@ mod tests {
             (UserAction::Wink, "wink"),
             (UserAction::Blink, "blink"),
             (UserAction::AskMassage, "ask_massage"),
-            (UserAction::AskDancing, "ask_dancing"),
+            (UserAction::ask_dancing(), "ask_dancing"),
             (UserAction::Photo, "photo"),
             (UserAction::Bluff, "bluff"),
             (UserAction::Threaten, "threaten"),
@@ -1885,7 +2090,7 @@ mod tests {
             UserAction::Wink,
             UserAction::Blink,
             UserAction::AskMassage,
-            UserAction::AskDancing,
+            UserAction::ask_dancing(),
             UserAction::Photo,
             UserAction::Strip,
             UserAction::ShowerTogether,
@@ -2075,7 +2280,7 @@ mod tests {
     fn a_stored_ask_for_dance_reads_as_dance_together() {
         let read: UserAction =
             serde_json::from_value(serde_json::json!({"type": "ask_for_dance"})).unwrap();
-        assert_eq!(read, UserAction::DanceTogether);
+        assert_eq!(read, UserAction::dance_together());
         assert_eq!(
             serde_json::to_value(&read).unwrap(),
             serde_json::json!({"type": "dance_together"})
@@ -2096,7 +2301,7 @@ mod tests {
         use EventKind::*;
         for (a, wire, kind, group, emotional) in [
             (
-                UserAction::DanceNakedTogether,
+                UserAction::dance_naked_together(),
                 "dance_naked_together",
                 NakedDancingTogether,
                 TogetherGroup::Nude,
@@ -2133,6 +2338,175 @@ mod tests {
         assert_eq!(
             NakedMassagingTogether.clothed_counterpart(),
             Some(MassagingTogether)
+        );
+    }
+
+    // ── Dance styles (spec 2026-11-28-dance-styles-design.md §4–§6) ──
+
+    const DANCE_WORDS: [(DanceStyle, &str, &str); 23] = [
+        (DanceStyle::Ballroom, "ballroom", "交际舞"),
+        (DanceStyle::Courtly, "courtly", "宫廷舞"),
+        (DanceStyle::Sexy, "sexy", "性感的舞"),
+        (DanceStyle::Tiktok, "tiktok", "TikTok 舞"),
+        (DanceStyle::House, "house", "House 舞"),
+        (DanceStyle::Hiphop, "hiphop", "嘻哈舞"),
+        (DanceStyle::Flamenco, "flamenco", "弗拉明戈"),
+        (DanceStyle::Oriental, "oriental", "东方古风舞"),
+        (DanceStyle::Indian, "indian", "印度舞"),
+        (DanceStyle::Arabic, "arabic", "阿拉伯舞"),
+        (DanceStyle::Ballet, "ballet", "芭蕾"),
+        (DanceStyle::Jazz, "jazz", "爵士舞"),
+        (DanceStyle::Latin, "latin", "拉丁舞"),
+        (DanceStyle::Tango, "tango", "探戈"),
+        (DanceStyle::Cossack, "cossack", "哥萨克舞"),
+        (DanceStyle::Austronesian, "austronesian", "南岛语族的传统舞"),
+        (DanceStyle::Indigenous, "indigenous", "原住民的传统舞"),
+        (DanceStyle::African, "african", "非洲舞"),
+        (DanceStyle::Kpop, "kpop", "韩舞"),
+        (DanceStyle::Pole, "pole", "钢管舞"),
+        (DanceStyle::Folk, "folk", "民族舞"),
+        (DanceStyle::Contemporary, "contemporary", "现代舞"),
+        (DanceStyle::Geisha, "geisha", "日本艺伎舞"),
+    ];
+
+    #[test]
+    fn every_dance_style_has_its_wire_name_and_its_words() {
+        for (style, wire, words) in DANCE_WORDS {
+            assert_eq!(style.as_str(), wire);
+            assert_eq!(DanceStyle::parse(wire), Some(style));
+            assert_eq!(serde_json::to_value(style).unwrap(), wire);
+            assert_eq!(style.zh(), Some(words));
+            assert_eq!(dance_words(style, None), words);
+        }
+        assert_eq!(DanceStyle::Custom.as_str(), "custom");
+        assert_eq!(DanceStyle::parse("custom"), Some(DanceStyle::Custom));
+        assert_eq!(DanceStyle::Custom.zh(), None);
+        assert_eq!(
+            dance_words(DanceStyle::Custom, Some("机械舞")),
+            "「机械舞」"
+        );
+        assert_eq!(DanceStyle::parse("waltz"), None);
+        assert_eq!(DanceStyle::ALL.len(), 24);
+        let mut names: Vec<&str> = DanceStyle::ALL.iter().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 24, "no style twice");
+        for (i, (style, _, _)) in DANCE_WORDS.iter().enumerate() {
+            assert_eq!(DanceStyle::ALL[i], *style, "the spec's order");
+        }
+        assert_eq!(DanceStyle::ALL[23], DanceStyle::Custom);
+    }
+
+    fn styled(style: DanceStyle, name: Option<&str>) -> [UserAction; 3] {
+        let name = name.map(str::to_owned);
+        [
+            UserAction::AskDancing {
+                style: Some(style),
+                name: name.clone(),
+            },
+            UserAction::DanceTogether {
+                style: Some(style),
+                name: name.clone(),
+            },
+            UserAction::DanceNakedTogether {
+                style: Some(style),
+                name,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_dance_action_serialises_with_and_without_a_style() {
+        let [ask, together, naked] = styled(DanceStyle::Tango, None);
+        assert_eq!(
+            serde_json::to_value(&together).unwrap(),
+            serde_json::json!({"type": "dance_together", "style": "tango"})
+        );
+        assert_eq!(
+            serde_json::to_value(&ask).unwrap(),
+            serde_json::json!({"type": "ask_dancing", "style": "tango"})
+        );
+        assert_eq!(
+            serde_json::to_value(&naked).unwrap(),
+            serde_json::json!({"type": "dance_naked_together", "style": "tango"})
+        );
+        let [custom, _, _] = styled(DanceStyle::Custom, Some("机械舞"));
+        let wire = serde_json::json!({"type": "ask_dancing", "style": "custom", "name": "机械舞"});
+        assert_eq!(serde_json::to_value(&custom).unwrap(), wire);
+        assert_eq!(serde_json::from_value::<UserAction>(wire).unwrap(), custom);
+        for (plain, wire) in [
+            (UserAction::ask_dancing(), "ask_dancing"),
+            (UserAction::dance_together(), "dance_together"),
+            (UserAction::dance_naked_together(), "dance_naked_together"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&plain).unwrap(),
+                serde_json::json!({"type": wire}),
+                "no style, no key"
+            );
+            assert_eq!(
+                serde_json::from_value::<UserAction>(serde_json::json!({"type": wire})).unwrap(),
+                plain
+            );
+        }
+        // A stored `ask_for_dance` still reads as a dance without a style.
+        assert_eq!(
+            serde_json::from_value::<UserAction>(serde_json::json!({"type": "ask_for_dance"}))
+                .unwrap(),
+            UserAction::dance_together()
+        );
+    }
+
+    #[test]
+    fn a_style_changes_no_property_of_a_dance_action() {
+        let plain = [
+            UserAction::ask_dancing(),
+            UserAction::dance_together(),
+            UserAction::dance_naked_together(),
+        ];
+        for with in [
+            styled(DanceStyle::Pole, None),
+            styled(DanceStyle::Custom, Some("机械舞")),
+        ] {
+            for (a, b) in plain.iter().zip(with.iter()) {
+                assert_eq!(a.together_kind(), b.together_kind(), "{b:?}");
+                assert_eq!(a.together_group(), b.together_group(), "{b:?}");
+                assert_eq!(a.refusal_lines(), b.refusal_lines(), "{b:?}");
+                assert_eq!(a.speaks_emotionally(), b.speaks_emotionally(), "{b:?}");
+                assert_eq!(a.is_passion(), b.is_passion(), "{b:?}");
+                assert_eq!(a.consumed(), b.consumed(), "{b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_words_of_a_dance_action() {
+        let [ask, together, naked] = styled(DanceStyle::Tango, None);
+        for a in [&ask, &together, &naked] {
+            assert_eq!(a.dance_words().as_deref(), Some("探戈"), "{a:?}");
+        }
+        let [_, custom, _] = styled(DanceStyle::Custom, Some("机械舞"));
+        assert_eq!(custom.dance_words().as_deref(), Some("「机械舞」"));
+        for a in [
+            UserAction::ask_dancing(),
+            UserAction::dance_together(),
+            UserAction::dance_naked_together(),
+            UserAction::Kiss,
+        ] {
+            assert_eq!(a.dance_words(), None, "{a:?}");
+        }
+        // What the event it places is about: the two that place one.
+        assert_eq!(together.together_text().as_deref(), Some("探戈"));
+        assert_eq!(naked.together_text().as_deref(), Some("探戈"));
+        assert_eq!(ask.together_text(), None, "ask_dancing places no event");
+        assert_eq!(UserAction::dance_together().together_text(), None);
+        assert_eq!(
+            UserAction::CustomTogether {
+                text: "去海边".into()
+            }
+            .together_text()
+            .as_deref(),
+            Some("去海边")
         );
     }
 }

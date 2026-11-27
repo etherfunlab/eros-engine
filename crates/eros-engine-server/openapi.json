@@ -6160,7 +6160,7 @@
               "string",
               "null"
             ],
-            "description": "The user's words of a `custom_together`, read from the message that\nasked; `null` once that message is gone, and for every other kind."
+            "description": "The user's words of a `custom_together`, or the words of the style a\ndance names (`dancing_together`, `naked_dancing_together`), read from\nthe message that asked; `null` once that message is gone, for a dance\nwithout a style, and for every other kind."
           }
         }
       },
@@ -8942,7 +8942,7 @@
               "string",
               "null"
             ],
-            "description": "`give`: optional, a short name for what is handed over, 1–32 chars.\n`gift`: required, what is given, 1–64 chars. `sex_together`:\noptional, the act in plain text, 1–100 chars (or `name_base64`).",
+            "description": "`give`: optional, a short name for what is handed over, 1–32 chars.\n`gift`: required, what is given, 1–64 chars. `sex_together`:\noptional, the act in plain text, 1–100 chars (or `name_base64`).\n`ask_dancing`, `dance_together`, `dance_naked_together`: required\nwith `style: \"custom\"` and refused otherwise, the dance in the user's\nown words, 1–32 chars.",
             "maxLength": 100
           },
           "name_base64": {
@@ -8980,6 +8980,13 @@
                 "description": "`sex_together` only: what each side wears. `false` (the default) both\nfully naked, `true` both as they are, or `{\"active\": …, \"passive\": …}`\nwith `full_naked`, `half_naked`, `{\"custom\": \"…\"}` or\n`{\"custom_base64\": \"…\"}` per side (a missing side is `full_naked`)."
               }
             ]
+          },
+          "style": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`ask_dancing`, `dance_together` and `dance_naked_together` only,\noptional: which dance. One of `ballroom`, `courtly`, `sexy`, `tiktok`,\n`house`, `hiphop`, `flamenco`, `oriental`, `indian`, `arabic`,\n`ballet`, `jazz`, `latin`, `tango`, `cossack`, `austronesian`,\n`indigenous`, `african`, `kpop`, `pole`, `folk`, `contemporary`,\n`geisha`, or `custom` with `name`. Wording only: it names the dance to\nher and in the picture, and changes no rule."
           },
           "text": {
             "type": [

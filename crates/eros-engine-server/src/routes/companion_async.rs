@@ -725,6 +725,7 @@ mod tests {
                 item_kind: None,
                 name: None,
                 name_base64: None,
+                style: None,
                 active: None,
                 remain_clothing: None,
                 ignore_orientation: None,

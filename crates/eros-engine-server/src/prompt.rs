@@ -857,7 +857,10 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::Wink => "冲你抛了个媚眼".into(),
         UserAction::Blink => "冲你眨巴眨巴眼睛".into(),
         UserAction::AskMassage => "想让你帮忙按摩".into(),
-        UserAction::AskDancing => "想看你跳支舞".into(),
+        UserAction::AskDancing { .. } => match a.dance_words() {
+            Some(words) => format!("想看你跳{words}"),
+            None => "想看你跳支舞".into(),
+        },
         UserAction::Photo => "举起手机想给你拍张照".into(),
         UserAction::Bluff => "在你面前虚张声势，想唬住你".into(),
         UserAction::Threaten => "威胁你".into(),
@@ -887,7 +890,10 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::SwimTogether => "想和你一起游泳".into(),
         UserAction::CycleTogether => "想和你一起骑单车".into(),
         UserAction::HikeTogether => "想和你一起爬山".into(),
-        UserAction::DanceTogether => "想和你一起跳舞".into(),
+        UserAction::DanceTogether { .. } => match a.dance_words() {
+            Some(words) => format!("想和你一起跳{words}"),
+            None => "想和你一起跳舞".into(),
+        },
         UserAction::AdventureTogether => "想和你一起去冒险".into(),
         UserAction::PlayWithFireTogether => "想和你一起玩火".into(),
         UserAction::SingTogether => "想和你一起唱歌".into(),
@@ -898,7 +904,10 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::YogaNakedTogether => "想和你一起裸体做瑜伽".into(),
         UserAction::HikeNakedTogether => "想和你一起裸体爬山".into(),
         UserAction::HotSpringNakedTogether => "想和你一起裸体泡温泉".into(),
-        UserAction::DanceNakedTogether => "想和你一起裸舞".into(),
+        UserAction::DanceNakedTogether { .. } => match a.dance_words() {
+            Some(words) => format!("想和你一起裸着跳{words}"),
+            None => "想和你一起裸舞".into(),
+        },
         UserAction::MassageTogether => "想给你按摩".into(),
         UserAction::MassageNakedTogether => "想和你脱了衣服互相按摩".into(),
         UserAction::CustomTogether { text } => format!("想和你一起：{text}"),
@@ -1279,6 +1288,14 @@ pub(crate) fn doing_label(kind: eros_engine_core::events::EventKind, text: Optio
         // A named passion act (spec 2026-11-27-passion-group-design.md §7.1).
         (eros_engine_core::events::EventKind::HavingSexTogether, Some(text)) => {
             format!("和对方上床：「{text}」")
+        }
+        // A dance that names its style: `text` is the style's words (spec
+        // 2026-11-28-dance-styles-design.md §6).
+        (eros_engine_core::events::EventKind::DancingTogether, Some(words)) => {
+            format!("和对方一起跳{words}")
+        }
+        (eros_engine_core::events::EventKind::NakedDancingTogether, Some(words)) => {
+            format!("和对方一起裸着跳{words}")
         }
         _ => event_label(kind).to_string(),
     }
@@ -1972,6 +1989,15 @@ pub(crate) fn persona_traits(
         habits: persona_habits(persona),
         outdoorsy: meta_str(persona, "outdoorsy")
             .and_then(Outdoorsy::parse)
+            .unwrap_or_default(),
+        dance: meta_str(persona, "dance")
+            .and_then(eros_engine_core::events::Taste::parse)
+            .unwrap_or_default(),
+        naturism: meta_str(persona, "naturism")
+            .and_then(eros_engine_core::events::Taste::parse)
+            .unwrap_or_default(),
+        risky: meta_str(persona, "risky")
+            .and_then(eros_engine_core::events::Taste::parse)
             .unwrap_or_default(),
         machine,
         period: female && !machine && card_period.unwrap_or(human),
@@ -6669,6 +6695,9 @@ mod tests {
                     ..Default::default()
                 },
                 outdoorsy: Default::default(),
+                dance: Default::default(),
+                naturism: Default::default(),
+                risky: Default::default(),
                 machine: false,
                 period: true,
             }
@@ -7913,7 +7942,7 @@ mod tests {
             UserAction::Wink,
             UserAction::Blink,
             UserAction::AskMassage,
-            UserAction::AskDancing,
+            UserAction::ask_dancing(),
             UserAction::Photo,
             UserAction::Bluff,
             UserAction::Threaten,
@@ -8026,7 +8055,7 @@ mod tests {
     fn six_more_together_actions_read_their_markers_and_labels() {
         for (a, marker, label) in [
             (
-                UserAction::DanceTogether,
+                UserAction::dance_together(),
                 "想和你一起跳舞",
                 "和对方一起跳舞",
             ),
@@ -8567,7 +8596,7 @@ mod tests {
             "对方的动作：「捏了捏你的脸」，你没有接受。"
         );
         assert_eq!(
-            action_outcome(&UserAction::AskDancing, ActionResponse::Accept),
+            action_outcome(&UserAction::ask_dancing(), ActionResponse::Accept),
             "对方想看你跳支舞，你接受了。"
         );
     }
@@ -9901,7 +9930,7 @@ mod tests {
     fn dance_and_massage_markers_and_labels() {
         use eros_engine_core::events::EventKind;
         for (a, marker) in [
-            (UserAction::DanceNakedTogether, "想和你一起裸舞"),
+            (UserAction::dance_naked_together(), "想和你一起裸舞"),
             (UserAction::AskMassage, "想让你帮忙按摩"),
             (UserAction::MassageTogether, "想给你按摩"),
             (UserAction::MassageNakedTogether, "想和你脱了衣服互相按摩"),
@@ -9921,5 +9950,96 @@ mod tests {
             user_text_with_action(Some(&stored), ""),
             "（想和你一起跳舞）"
         );
+    }
+
+    // ── Dance styles and the `dance` key (spec 2026-11-28-dance-styles-design.md §6, §7) ──
+
+    #[test]
+    fn a_dance_names_its_style_in_every_phrase() {
+        use eros_engine_core::events::EventKind::{DancingTogether, NakedDancingTogether};
+        use eros_engine_core::types::DanceStyle;
+        let of = |style: Option<DanceStyle>, name: Option<&str>| {
+            let name = name.map(str::to_owned);
+            [
+                UserAction::AskDancing {
+                    style,
+                    name: name.clone(),
+                },
+                UserAction::DanceTogether {
+                    style,
+                    name: name.clone(),
+                },
+                UserAction::DanceNakedTogether { style, name },
+            ]
+        };
+        let phrases = |a: &[UserAction; 3]| a.iter().map(action_phrase).collect::<Vec<_>>();
+        assert_eq!(
+            phrases(&of(None, None)),
+            ["想看你跳支舞", "想和你一起跳舞", "想和你一起裸舞"],
+            "without a style, today's words"
+        );
+        assert_eq!(
+            phrases(&of(Some(DanceStyle::Tango), None)),
+            ["想看你跳探戈", "想和你一起跳探戈", "想和你一起裸着跳探戈"]
+        );
+        assert_eq!(
+            phrases(&of(Some(DanceStyle::Custom), Some("机械舞"))),
+            [
+                "想看你跳「机械舞」",
+                "想和你一起跳「机械舞」",
+                "想和你一起裸着跳「机械舞」"
+            ]
+        );
+        let [_, together, _] = of(Some(DanceStyle::Tango), None);
+        assert_eq!(action_subject(&together), "对方想和你一起跳探戈");
+        assert_eq!(action_marker(&together), "（想和你一起跳探戈）");
+
+        assert_eq!(doing_label(DancingTogether, None), "和对方一起跳舞");
+        assert_eq!(doing_label(NakedDancingTogether, None), "和对方一起裸舞");
+        assert_eq!(
+            doing_label(DancingTogether, Some("探戈")),
+            "和对方一起跳探戈"
+        );
+        assert_eq!(
+            doing_label(NakedDancingTogether, Some("探戈")),
+            "和对方一起裸着跳探戈"
+        );
+        assert_eq!(
+            doing_label(DancingTogether, Some("「机械舞」")),
+            "和对方一起跳「机械舞」"
+        );
+        assert_eq!(
+            doing_label(NakedDancingTogether, Some("「机械舞」")),
+            "和对方一起裸着跳「机械舞」"
+        );
+    }
+
+    #[test]
+    fn persona_traits_read_the_three_tastes() {
+        use eros_engine_core::events::Taste;
+        for (art, want) in [
+            (serde_json::json!({"dance": "love"}), Taste::Love),
+            (serde_json::json!({"dance": "dislike"}), Taste::Dislike),
+            (serde_json::json!({"dance": "neutral"}), Taste::Neutral),
+            (serde_json::json!({"dance": "LOVE"}), Taste::Neutral),
+            (serde_json::json!({"dance": true}), Taste::Neutral),
+            (serde_json::json!({"dance": 1}), Taste::Neutral),
+            (serde_json::json!({}), Taste::Neutral),
+        ] {
+            let mut p = fixture_persona();
+            p.genome.art_metadata = art.clone();
+            assert_eq!(persona_traits(&p).dance, want, "{art}");
+        }
+        let mut p = fixture_persona();
+        p.genome.art_metadata =
+            serde_json::json!({"naturism": "love", "risky": "dislike", "dance": "neutral"});
+        let t = persona_traits(&p);
+        assert_eq!(
+            (t.dance, t.naturism, t.risky),
+            (Taste::Neutral, Taste::Love, Taste::Dislike)
+        );
+        p.genome.art_metadata = serde_json::json!({"naturism": false, "risky": "yes"});
+        let t = persona_traits(&p);
+        assert_eq!((t.naturism, t.risky), (Taste::Neutral, Taste::Neutral));
     }
 }

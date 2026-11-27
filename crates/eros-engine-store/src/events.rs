@@ -24,8 +24,8 @@ pub struct EventRecord {
     pub started_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
     pub message_id: Option<Uuid>,
-    /// The user's words of a `custom_together`, read from that message's
-    /// `metadata.action.text` by [`EventRepo::current`] and
+    /// The user's words of a `custom_together`, or the words of a dance's
+    /// style, read from that message's `metadata.action` by [`EventRepo::current`] and
     /// [`EventRepo::by_key`]; `None` once the message is gone, for every
     /// other kind, and from every other read.
     pub text: Option<String>,
@@ -153,15 +153,19 @@ pub struct EventRepo<'a> {
 }
 
 /// Whether a row of `kind` that a user's action places points at the user's
-/// message that asked, not at hers: a `custom_together`'s text and a
-/// `sex_together`'s act ride on it (spec 2026-11-26-more-together-actions-
-/// bath-outfit-chemistry-drop-and-custom-together-design.md §8.3; spec
-/// 2026-11-27-passion-group-design.md §5.3). Every other placed row points at
-/// no message.
+/// message that asked, not at hers: a `custom_together`'s text, a
+/// `sex_together`'s act and a dance's style ride on it (spec 2026-11-26-more-
+/// together-actions-bath-outfit-chemistry-drop-and-custom-together-design.md
+/// §8.3; spec 2026-11-27-passion-group-design.md §5.3; spec
+/// 2026-11-28-dance-styles-design.md §6). Every other placed row points at no
+/// message.
 pub fn points_at_the_user(kind: EventKind) -> bool {
     matches!(
         kind,
-        EventKind::CustomTogether | EventKind::HavingSexTogether
+        EventKind::CustomTogether
+            | EventKind::HavingSexTogether
+            | EventKind::DancingTogether
+            | EventKind::NakedDancingTogether
     )
 }
 
@@ -495,21 +499,42 @@ impl EventRepo<'_> {
         .flatten())
     }
 
-    /// Fill `e.text` for a `custom_together` whose message is there: the
-    /// user's words, `metadata.action.text` of the row `message_id` names
+    /// Fill `e.text` for a `custom_together` or a dance whose message is
+    /// there, from the action on the row `message_id` names: the user's words
     /// (spec 2026-11-26-more-together-actions-bath-outfit-chemistry-drop-and-
-    /// custom-together-design.md §8.3). Reads nothing for any other kind.
+    /// custom-together-design.md §8.3), or the words of the dance's style
+    /// (spec 2026-11-28-dance-styles-design.md §6; none for a dance without a
+    /// style). An action that does not parse reads as none. Reads nothing for
+    /// any other kind.
     async fn read_text(&self, e: &mut EventRecord) -> Result<(), sqlx::Error> {
-        let (EventKind::CustomTogether, Some(message_id)) = (e.kind, e.message_id) else {
+        let (
+            EventKind::CustomTogether
+            | EventKind::DancingTogether
+            | EventKind::NakedDancingTogether,
+            Some(message_id),
+        ) = (e.kind, e.message_id)
+        else {
             return Ok(());
         };
-        e.text = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT metadata->'action'->>'text' FROM engine.chat_messages WHERE id = $1",
+        let action = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT metadata->'action' FROM engine.chat_messages WHERE id = $1",
         )
         .bind(message_id)
         .fetch_optional(self.pool)
         .await?
         .flatten();
+        // The stored object also holds the decided `response`, which is not
+        // part of the action. An action that places another kind is not the
+        // one that placed this row (the message was edited since): its words
+        // are not this event's.
+        let kind = e.kind;
+        e.text = action
+            .and_then(|mut a| {
+                a.as_object_mut()?.remove("response");
+                serde_json::from_value::<eros_engine_core::types::UserAction>(a).ok()
+            })
+            .filter(|a| a.together_kind() == Some(kind))
+            .and_then(|a| a.together_text().map(|t| t.into_owned()));
         Ok(())
     }
 
@@ -1428,6 +1453,94 @@ mod tests {
         assert_eq!((e.message_id, e.text), (None, None));
         let by_key = repo.by_key(s, &key).await.unwrap().expect("written");
         assert_eq!(by_key.text, None);
+    }
+
+    /// Spec 2026-11-28-dance-styles-design.md §6: a dance event reads its
+    /// style's words from the action on the message that asked, for as long
+    /// as that message is there; a dance without a style reads none.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn current_reads_the_dance_style_from_the_user_row(pool: PgPool) {
+        for (n, action, kind, want) in [
+            (
+                1,
+                json!({"type": "dance_together", "style": "tango", "response": "accept"}),
+                DancingTogether,
+                Some("探戈"),
+            ),
+            (
+                2,
+                json!({"type": "dance_naked_together", "style": "custom", "name": "机械舞",
+                       "response": "accept"}),
+                NakedDancingTogether,
+                Some("「机械舞」"),
+            ),
+            (
+                3,
+                json!({"type": "dance_together", "response": "accept"}),
+                DancingTogether,
+                None,
+            ),
+            // A stored action that no longer parses reads as no style.
+            (
+                4,
+                json!({"type": "dance_together", "style": "waltz", "response": "accept"}),
+                DancingTogether,
+                None,
+            ),
+            // The message's action is no longer the one that placed the row
+            // (an edited message): its words are not this event's.
+            (
+                5,
+                json!({"type": "custom_together", "text": "去海边", "response": "accept"}),
+                DancingTogether,
+                None,
+            ),
+        ] {
+            let (_, i, s) = instance_and_session(&pool).await;
+            let repo = EventRepo { pool: &pool };
+            let asked: Uuid = sqlx::query_scalar(
+                "INSERT INTO engine.chat_messages (session_id, role, content, metadata, sent_at) \
+                 VALUES ($1, 'user', '', $2, '2026-10-01T10:00:00Z') RETURNING id",
+            )
+            .bind(s)
+            .bind(json!({ "action": action }))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let key = format!("action:{asked}:{}", kind.as_str());
+            let mut tx = pool.begin().await.unwrap();
+            EventRepo::place_together_in_tx(
+                &mut tx,
+                &ev(
+                    i,
+                    s,
+                    &key,
+                    kind,
+                    "2026-10-01T10:00:00Z",
+                    "2026-10-01T11:00:00Z",
+                ),
+                asked,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            let at = t("2026-10-01T10:30:00Z");
+
+            let e = repo.current(i, None, at, None).await.unwrap().foreground;
+            let e = e.expect("under way");
+            assert_eq!((e.kind, e.message_id), (kind, Some(asked)), "case {n}");
+            assert_eq!(e.text.as_deref(), want, "case {n}");
+            let by_key = repo.by_key(s, &key).await.unwrap().expect("written");
+            assert_eq!(by_key.text.as_deref(), want, "case {n}");
+
+            sqlx::query("DELETE FROM engine.chat_messages WHERE id = $1")
+                .bind(asked)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let e = repo.current(i, None, at, None).await.unwrap().foreground;
+            assert_eq!(e.expect("still under way").text, None, "case {n}");
+        }
     }
 
     /// Spec 2026-11-27-passion-group-design.md §5.3: the row a user's
