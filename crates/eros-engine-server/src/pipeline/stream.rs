@@ -100,6 +100,29 @@ pub enum ProtocolFrame {
         #[serde(default, skip_serializing_if = "is_false")]
         ghost_fallback: bool,
     },
+    /// The end of one item of a speech-markup request (spec
+    /// 2026-11-27-chat-speech-markup-design.md §4.3): its whole text. Sent
+    /// as `done`, beside the chat `done`, which has no `text`.
+    #[serde(rename = "done")]
+    SpeechDone {
+        message_id: String,
+        text: String,
+        truncated: bool,
+        usage: Option<serde_json::Value>,
+        generation_id: Option<String>,
+        /// The served model: in the JSON response, not on the wire.
+        #[serde(skip)]
+        model: Option<String>,
+    },
+    /// One item of a speech-markup request that failed; the stream goes on.
+    ItemError {
+        message_id: String,
+        code: &'static str,
+        message: String,
+    },
+    /// The end of a speech-markup stream: carries nothing.
+    #[serde(rename = "final")]
+    SpeechFinal,
     Final {
         filtered: bool,
         // null when no trait injected; always present (no skip_serializing_if).
@@ -15287,11 +15310,14 @@ data: [DONE]\n\n";
             let kind = match f {
                 ProtocolFrame::Meta { .. } => "meta",
                 ProtocolFrame::Delta { .. } => "delta",
-                ProtocolFrame::Done { .. } | ProtocolFrame::ProactiveDone { .. } => "done",
+                ProtocolFrame::Done { .. }
+                | ProtocolFrame::ProactiveDone { .. }
+                | ProtocolFrame::SpeechDone { .. } => "done",
                 ProtocolFrame::Event { .. } => "event",
                 ProtocolFrame::Resolved { .. } => "resolved",
-                ProtocolFrame::Final { .. } => "final",
+                ProtocolFrame::Final { .. } | ProtocolFrame::SpeechFinal => "final",
                 ProtocolFrame::Error { .. } => "error",
+                ProtocolFrame::ItemError { .. } => "item_error",
                 ProtocolFrame::ImageRequest { .. } => "image_request",
                 ProtocolFrame::ActionResponse { .. } => "action_response",
                 ProtocolFrame::BodyState { .. } => "body_state",

@@ -357,6 +357,10 @@ async fn build_state(cfg: &ServerConfig, with_auth: bool) -> Result<AppState> {
         anyhow::bail!(msg);
     }
 
+    if let Err(msg) = model_config.validate_speech_model() {
+        anyhow::bail!(msg);
+    }
+
     if let Err(msg) = model_config.validate_product_qa_prompt() {
         anyhow::bail!(msg);
     }

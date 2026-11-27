@@ -1189,12 +1189,24 @@ pub const DEFAULT_VOICE_DIRECTIVE: &str = "You are on a live voice call. Speak t
 /// in `resolve_voice` — kept private since only that call site uses it.
 const VOICE_SPEECH_BASE_AUDIO_TAGS: &str = "You are on a live voice call. Speak the way people talk out loud. Keep replies short — usually one or two sentences. Do not use markdown, lists, or emoji — everything you write is read aloud by a text-to-speech voice.";
 
+/// The commonly supported audio tags, listed once: the voice channel's
+/// addendum and the speech task's guidance are both built around it.
+macro_rules! audio_tag_list {
+    () => {
+        "[amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [whispers]"
+    };
+}
+
 /// Appended to the effective voice directive when `tts_audio_tags` is on. Names
 /// the inline-tag syntax, the commonly-supported tags, and explicit permission
 /// to improvise. Product-identity-free. Authored ONCE here and reused for both
 /// the built-in audio-tags default and the custom-`filter_prompt` path, so the
 /// tag list lives in a single place.
-pub const AUDIO_TAGS_ADDENDUM: &str = "Weave inline audio tags through your speech to make it expressive. An audio tag is a short cue in square brackets placed right before the words it affects. Aim for two to four tags per reply, placed at the emotional beats — mid-sentence placements are better than tagging only the start, and never bunch them all at the beginning. For example: 今天全搞砸了 [sighs] 不想说了…… [giggles] 骗你的啦，你怎么当真了 — or: wait [gasp] you actually did it? [laughs] no way. Commonly supported tags: [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [whispers]. You are not limited to this list — you may use other short emotion or action tags in the same bracket form when they suit the delivery. Write tags in English even when speaking another language. Everything outside the brackets is spoken aloud, so keep it natural and short.";
+pub const AUDIO_TAGS_ADDENDUM: &str = concat!(
+    "Weave inline audio tags through your speech to make it expressive. An audio tag is a short cue in square brackets placed right before the words it affects. Aim for two to four tags per reply, placed at the emotional beats — mid-sentence placements are better than tagging only the start, and never bunch them all at the beginning. For example: 今天全搞砸了 [sighs] 不想说了…… [giggles] 骗你的啦，你怎么当真了 — or: wait [gasp] you actually did it? [laughs] no way. Commonly supported tags: ",
+    audio_tag_list!(),
+    ". You are not limited to this list — you may use other short emotion or action tags in the same bracket form when they suit the delivery. Write tags in English even when speaking another language. Everything outside the brackets is spoken aloud, so keep it natural and short."
+);
 
 /// Resolved `[tasks.chat_voice]` (voice channel). `directive` is the effective
 /// voice instruction: the configured `filter_prompt`, or `DEFAULT_VOICE_DIRECTIVE`
@@ -1209,6 +1221,39 @@ pub struct ResolvedVoice {
     pub recall: bool,
     /// Optional sampling knobs from the task block (issue #246).
     pub sampling: Sampling,
+}
+
+/// Built-in, product-identity-free base directive of `[tasks.chat_speech]`
+/// (spec 2026-11-27-chat-speech-markup-design.md §6.1). Deployments override
+/// it via `filter_prompt`; the mode sentence and the tag guidance below are
+/// appended by the engine either way.
+pub const DEFAULT_SPEECH_BASE: &str = "You are preparing a line she has already said in a text chat so that a text-to-speech voice can read it aloud. Everything above the line to prepare is context: who she is, how she said it, where the two of them stand, what was said before. Do not answer it and do not continue the conversation. Reply with the prepared line and nothing else.";
+
+/// The default mode of the speech task (spec §6.2): her words are kept.
+pub const SPEECH_MODE_VERBATIM: &str = "Keep every spoken word exactly as written, in the same order and the same language. Only add audio tags. Emoji, and narration set in brackets or asterisks, are not spoken: drop them, or turn one into an audio tag where a tag fits.";
+
+/// The `rewrite` mode of the speech task (spec §6.2).
+pub const SPEECH_MODE_REWRITE: &str = "You may rephrase the line so that it sounds natural spoken aloud. What she means and the way she talks stay hers; keep the language she used.";
+
+/// The speech task's tag guidance (spec §6.3), around the voice channel's tag
+/// list.
+pub const SPEECH_TAGS_GUIDANCE: &str = concat!(
+    "An audio tag is a short cue in square brackets placed right before the words it affects, for example [sighs] or [whispers]. Place tags at the emotional beats; a short line may need only one, and a flat line none. Commonly supported tags: ",
+    audio_tag_list!(),
+    ". You may use other short emotion or action tags in the same bracket form when they suit the delivery. Write tags in English even when the line is in another language."
+);
+
+/// Resolved `[tasks.chat_speech]` (spec 2026-11-27-chat-speech-markup-design.md
+/// §7). `base` is the configured `filter_prompt` when it is not blank, else
+/// `DEFAULT_SPEECH_BASE`.
+#[derive(Debug, Clone)]
+pub struct ResolvedSpeech {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub sampling: Sampling,
+    pub base: String,
 }
 
 /// Generic, product-identity-free default prompt for the image-prompt composer.
@@ -1936,6 +1981,47 @@ impl ModelConfig {
                     Err("[tasks.chat_voice].model must be set to a single model id".to_string())
                 }
                 _ => Err("[tasks.chat_voice].model must be a single fixed id \
+                          (no round-robin array or weighted table)"
+                    .to_string()),
+            },
+        }
+    }
+
+    /// Resolve the speech task. `None` ⇒ feature off (no `[tasks.chat_speech]`).
+    /// A blank `filter_prompt` falls back to the built-in base, as on voice.
+    pub fn resolve_speech(&self) -> Option<ResolvedSpeech> {
+        const SPEECH_TASK: &str = "chat_speech";
+        let task_cfg = self.tasks.get(SPEECH_TASK)?;
+        let base = task_cfg
+            .filter_prompt
+            .as_ref()
+            .and_then(PromptSpec::as_plain)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_SPEECH_BASE.to_string());
+        let m = self.resolve(SPEECH_TASK, None);
+        Some(ResolvedSpeech {
+            model: m.model,
+            fallback_model: m.fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            sampling: m.sampling,
+            base,
+        })
+    }
+
+    /// Boot gate: if `[tasks.chat_speech]` is present, its `model` MUST be a
+    /// single fixed id, as `[tasks.chat_voice]`'s.
+    pub fn validate_speech_model(&self) -> Result<(), String> {
+        const SPEECH_TASK: &str = "chat_speech";
+        match self.tasks.get(SPEECH_TASK) {
+            None => Ok(()),
+            Some(t) => match &t.model {
+                ModelSpec::Fixed(s) if !s.trim().is_empty() => Ok(()),
+                ModelSpec::Fixed(_) => {
+                    Err("[tasks.chat_speech].model must be set to a single model id".to_string())
+                }
+                _ => Err("[tasks.chat_speech].model must be a single fixed id \
                           (no round-robin array or weighted table)"
                     .to_string()),
             },
@@ -3000,6 +3086,7 @@ pub const KNOWN_CHAT_TASKS: &[&str] = &[
     "chat_output_filter",
     "chat_input_filter",
     "chat_voice",
+    "chat_speech",
     "chat_image_prompt_compose",
     "chat_image_edit_compose",
     "chat_product_qa",
@@ -5128,6 +5215,89 @@ retry_depth = 0
         let r = cfg.resolve_vision().expect("vision resolves");
         assert_eq!(r.retry_depth, 0);
         assert!(r.fallback_model.is_empty());
+    }
+
+    /// The voice channel's tag guidance, pinned: the speech task shares its tag
+    /// list, and sharing it must not move a byte of what voice sends.
+    #[test]
+    fn the_voice_addendum_does_not_move() {
+        assert_eq!(
+            AUDIO_TAGS_ADDENDUM,
+            "Weave inline audio tags through your speech to make it expressive. An audio tag is a short cue in square brackets placed right before the words it affects. Aim for two to four tags per reply, placed at the emotional beats — mid-sentence placements are better than tagging only the start, and never bunch them all at the beginning. For example: 今天全搞砸了 [sighs] 不想说了…… [giggles] 骗你的啦，你怎么当真了 — or: wait [gasp] you actually did it? [laughs] no way. Commonly supported tags: [amazed], [crying], [curious], [excited], [sighs], [gasp], [giggles], [laughs], [mischievously], [panicked], [sarcastic], [serious], [shouting], [tired], [whispers]. You are not limited to this list — you may use other short emotion or action tags in the same bracket form when they suit the delivery. Write tags in English even when speaking another language. Everything outside the brackets is spoken aloud, so keep it natural and short."
+        );
+    }
+
+    const SPEECH_BLOCK: &str = "[tasks.chat_speech]\nmodel = \"vendor/speech\"\nmax_tokens = 400\n";
+
+    #[test]
+    fn resolve_speech_none_when_task_absent() {
+        let cfg = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert!(cfg.resolve_speech().is_none());
+        cfg.validate_speech_model().unwrap();
+    }
+
+    #[test]
+    fn resolve_speech_uses_the_built_in_base() {
+        let cfg = ModelConfig::from_toml_str(SPEECH_BLOCK).unwrap();
+        cfg.validate_speech_model().unwrap();
+        let s = cfg.resolve_speech().expect("speech resolved");
+        assert_eq!(s.model, "vendor/speech");
+        assert_eq!(s.max_tokens, 400);
+        assert_eq!(s.base, DEFAULT_SPEECH_BASE);
+        assert!(s.fallback_model.is_empty());
+    }
+
+    #[test]
+    fn resolve_speech_base_override() {
+        let custom = ModelConfig::from_toml_str(&format!(
+            "{SPEECH_BLOCK}filter_prompt = \"prepare it my way\"\n"
+        ))
+        .unwrap();
+        assert_eq!(custom.resolve_speech().unwrap().base, "prepare it my way");
+        let blank =
+            ModelConfig::from_toml_str(&format!("{SPEECH_BLOCK}filter_prompt = \"  \"\n")).unwrap();
+        assert_eq!(blank.resolve_speech().unwrap().base, DEFAULT_SPEECH_BASE);
+    }
+
+    #[test]
+    fn validate_speech_model_rejects_non_fixed_and_empty() {
+        let empty = ModelConfig::from_toml_str("[tasks.chat_speech]\nmodel = \"\"\n").unwrap();
+        assert!(empty
+            .validate_speech_model()
+            .unwrap_err()
+            .contains("[tasks.chat_speech].model"));
+        let rr = ModelConfig::from_toml_str("[tasks.chat_speech]\nmodel = [\"a/b\", \"c/d\"]\n")
+            .unwrap();
+        assert!(rr
+            .validate_speech_model()
+            .unwrap_err()
+            .contains("single fixed id"));
+    }
+
+    #[test]
+    fn the_speech_guidance_shares_the_voice_tag_list() {
+        let list = AUDIO_TAGS_ADDENDUM
+            .split("Commonly supported tags: ")
+            .nth(1)
+            .and_then(|rest| rest.split(". You are not limited").next())
+            .expect("the voice addendum lists its tags");
+        assert!(
+            list.starts_with("[amazed]") && list.ends_with("[whispers]"),
+            "{list}"
+        );
+        assert!(
+            SPEECH_TAGS_GUIDANCE.contains(list),
+            "{SPEECH_TAGS_GUIDANCE}"
+        );
+        assert!(KNOWN_CHAT_TASKS.contains(&"chat_speech"));
+    }
+
+    #[test]
+    fn shipped_model_config_has_speech_off() {
+        let text = include_str!("../../../examples/model_config.toml");
+        let cfg = ModelConfig::from_toml_str(text).expect("examples/model_config.toml parses");
+        assert!(cfg.resolve_speech().is_none());
+        cfg.validate_speech_model().unwrap();
     }
 
     #[test]

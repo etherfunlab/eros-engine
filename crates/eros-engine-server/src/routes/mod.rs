@@ -39,6 +39,7 @@ pub mod reaction;
 pub mod session_effects;
 pub mod session_events;
 pub mod session_open;
+pub mod speech;
 pub mod svc;
 pub mod user_rows;
 pub mod voice;
@@ -57,6 +58,7 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         .merge(companion_async::router())
         .merge(companion_stream::router())
         .merge(voice::router())
+        .merge(speech::router())
         .merge(bff::router())
         .merge(byoc::router())
         .merge(world_town::router())
@@ -113,6 +115,7 @@ pub fn router_for_openapi() -> OpenApiRouter<AppState> {
         .merge(companion_async::router())
         .merge(companion_stream::router())
         .merge(voice::router())
+        .merge(speech::router())
         .merge(bff::router())
         .merge(byoc::router())
         .merge(world_town::router())
