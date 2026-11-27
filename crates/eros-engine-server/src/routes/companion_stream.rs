@@ -445,10 +445,10 @@ impl From<DateDurationDto> for eros_engine_core::types::DateDuration {
 /// start an event the same way, as do `yoga_naked_together` →
 /// `naked_yoga_together` and `hot_spring_naked_together` →
 /// `naked_hot_spring_together` (one hour each) and `hike_naked_together` →
-/// `naked_hiking_together` (two to three hours). Only a `sex_together` is
-/// refused before the judge for the pair's scopes, when they are not
-/// romance-compatible and the action does not say `ignore_orientation`; the
-/// judge decides every other together action. A `sex_together` may name the
+/// `naked_hiking_together` (two to three hours). A `sex_together` from a
+/// pair whose scopes are not romance-compatible is refused before the judge
+/// unless it says `ignore_orientation`; no other together action is refused
+/// for the pair's scopes. A `sex_together` may name the
 /// act (`name` or `name_base64`), say who leads (`active`) and what each side
 /// wears (`remain_clothing`); these shape her picture, and a read returns the
 /// act and custom clothing as base64. During her period a
