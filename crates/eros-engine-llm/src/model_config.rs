@@ -797,6 +797,15 @@ pub struct Tones {
     /// off.
     #[serde(default)]
     pub focused: f64,
+    /// Probability that one of the three fixed moments is written in the
+    /// `erotic` tone: her reply to an accepted `sex_together`, her reply to an
+    /// accepted `sleep_together` or `bathe_together` ask, the `sudden_desire`
+    /// message. In everyday chat a `sex_addict = true` persona draws it at a
+    /// fixed 1/8 once this key is above `0.0` (spec
+    /// 2026-11-27-erotic-tone-design.md §4, §5). Legal range `[0.0, 1.0]`,
+    /// enforced by `validate_tones`; `0.0` is off.
+    #[serde(default)]
+    pub erotic: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1799,6 +1808,16 @@ impl ModelConfig {
             .get("chat_companion")
             .and_then(|t| t.tones)
             .map(|t| t.focused)
+            .unwrap_or(0.0)
+    }
+
+    /// chat_companion task-level `tones.erotic` probability at the fixed
+    /// moments; no tier override. Absent → 0.0, which switches the tone off.
+    pub fn tone_erotic_probability(&self) -> f64 {
+        self.tasks
+            .get("chat_companion")
+            .and_then(|t| t.tones)
+            .map(|t| t.erotic)
             .unwrap_or(0.0)
     }
 
@@ -2913,7 +2932,11 @@ impl ModelConfig {
             let Some(tones) = self.tasks[name].tones else {
                 continue;
             };
-            for (key, v) in [("emotional", tones.emotional), ("focused", tones.focused)] {
+            for (key, v) in [
+                ("emotional", tones.emotional),
+                ("focused", tones.focused),
+                ("erotic", tones.erotic),
+            ] {
                 if !v.is_finite() || !(0.0..=1.0).contains(&v) {
                     return Err(format!(
                         "[tasks].{name}.tones.{key}: must be in [0.0, 1.0], got {v}"
@@ -6338,6 +6361,53 @@ temperature = 0.8
         );
     }
 
+    #[test]
+    fn tones_erotic_parses_alone_and_beside_the_others() {
+        let alone = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\ntones = { erotic = 1.0 }\n",
+        )
+        .unwrap();
+        alone.validate_tones().unwrap();
+        assert_eq!(alone.tone_erotic_probability(), 1.0);
+        assert_eq!(alone.tone_emotional_probability(), 0.0);
+        assert_eq!(alone.tone_focused_probability(), 0.0);
+
+        let all = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\n\
+             tones = { emotional = 0.05, focused = 0.5, erotic = 0.25 }\n",
+        )
+        .unwrap();
+        all.validate_tones().unwrap();
+        assert_eq!(all.tone_emotional_probability(), 0.05);
+        assert_eq!(all.tone_focused_probability(), 0.5);
+        assert_eq!(all.tone_erotic_probability(), 0.25);
+
+        let absent = ModelConfig::from_toml_str("[tasks.chat_companion]\nmodel = \"m\"\n").unwrap();
+        assert_eq!(absent.tone_erotic_probability(), 0.0);
+        // Read on chat_companion only, as the other two are.
+        let elsewhere = ModelConfig::from_toml_str(
+            "[tasks.chat_companion]\nmodel = \"m\"\n\
+             [tasks.pde_decision]\nmodel = \"j\"\ntones = { erotic = 0.9 }\n",
+        )
+        .unwrap();
+        assert_eq!(elsewhere.tone_erotic_probability(), 0.0);
+    }
+
+    #[test]
+    fn tones_erotic_out_of_range_is_refused() {
+        for bad in ["1.5", "-0.1", "nan"] {
+            let cfg = ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel = \"m\"\ntones = {{ erotic = {bad} }}\n"
+            ))
+            .unwrap();
+            let err = cfg.validate_tones().unwrap_err();
+            assert!(
+                err.contains("chat_companion") && err.contains("tones.erotic"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
     /// The shipped example must pass the tones boot gate, with the key
     /// commented out: off by default.
     #[test]
@@ -6347,6 +6417,7 @@ temperature = 0.8
         cfg.validate_tones().unwrap();
         assert_eq!(cfg.tone_emotional_probability(), 0.0);
         assert_eq!(cfg.tone_focused_probability(), 0.0);
+        assert_eq!(cfg.tone_erotic_probability(), 0.0);
     }
 
     #[test]

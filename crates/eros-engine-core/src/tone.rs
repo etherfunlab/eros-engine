@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The tone of a chat turn, drawn by the engine and never by the judge
 //! (spec 2026-11-12-chat-tone-emotional-design.md §3; the `focused` tone is
-//! spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §5).
+//! spec 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md §5;
+//! the `erotic` tone is spec 2026-11-27-erotic-tone-design.md).
 
-use crate::events::{Employment, EventKind};
+use crate::events::{Employment, EventKind, TogetherGroup};
 use crate::needs::{NeedLevel, Needs};
 
 /// How a turn's reply is written.
@@ -20,6 +21,10 @@ pub enum Tone {
     /// and `[emotional_context]`, hold `[reply_length]` at the lowest tier
     /// and put one work line in `[this_turn]` (spec §5.4).
     Focused,
+    /// The alluring version of `Emotional`: its template, plus the
+    /// `[relationship]` block and one line set by the chemistry tier (spec
+    /// 2026-11-27-erotic-tone-design.md §7).
+    Erotic,
 }
 
 impl Tone {
@@ -29,7 +34,15 @@ impl Tone {
             Tone::Default => "default",
             Tone::Emotional => "emotional",
             Tone::Focused => "focused",
+            Tone::Erotic => "erotic",
         }
+    }
+
+    /// Whether the message is built on the `emotional` template: whatever
+    /// holds for an `emotional` message holds for it (spec
+    /// 2026-11-27-erotic-tone-design.md §7.3).
+    pub fn on_emotional_template(self) -> bool {
+        matches!(self, Tone::Emotional | Tone::Erotic)
     }
 }
 
@@ -111,6 +124,91 @@ pub fn draw_focused(p: f64, roll: f64) -> Tone {
     } else {
         Tone::Default
     }
+}
+
+/// The chance of an `erotic` turn in everyday chat for a persona whose card
+/// says `sex_addict = true` (spec 2026-11-27-erotic-tone-design.md §5). The
+/// `tones.erotic` key switches it on and does not scale it.
+pub const STRONG_DESIRE_P: f64 = 0.125;
+
+/// The lowest chemistry tier at which the everyday draw is made.
+const EVERYDAY_MIN_CHEM_TIER: u8 = 3;
+/// The lowest chemistry tier at which a persona whose card says
+/// `is_virgin = true` is `erotic` at all, at a fixed moment or in everyday
+/// chat. The card's key alone decides: having had sex since does not lift it
+/// (the tone reads the key as character, the event draw as a fact).
+const VIRGIN_MIN_CHEM_TIER: u8 = 4;
+
+/// What every `erotic` message is gated on (spec
+/// 2026-11-27-erotic-tone-design.md §4.1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EroticGate {
+    /// `tones.erotic`; at `0` or below the tone is off.
+    pub key: f64,
+    /// `scope::romance_compatible` for the message's affinity scope.
+    pub compatible: bool,
+    pub cold_war: bool,
+    /// The card's `is_virgin`.
+    pub is_virgin: bool,
+    /// The pair's chemistry tier as the message's prompt reads it.
+    pub chem_tier: u8,
+}
+
+impl EroticGate {
+    /// The common conditions: the key above 0, a romantically compatible
+    /// pair, no cold war, and a virgin persona at her floor or above.
+    pub fn open(&self) -> bool {
+        self.key > 0.0
+            && self.compatible
+            && !self.cold_war
+            && (!self.is_virgin || self.chem_tier >= VIRGIN_MIN_CHEM_TIER)
+    }
+}
+
+/// The chance that a fixed moment is `erotic` (spec §4): `tones.erotic` when
+/// the gate is open, `None` (no roll) otherwise.
+pub fn fixed_erotic_probability(gate: &EroticGate) -> Option<f64> {
+    gate.open().then_some(gate.key)
+}
+
+/// Whether the incident under way lets the everyday draw roll (spec §5): none,
+/// or one of the desire kinds, or a naturism- or passion-group kind.
+fn everyday_foreground_allows(foreground: Option<EventKind>) -> bool {
+    match foreground {
+        None => true,
+        Some(
+            EventKind::SuddenDesire
+            | EventKind::Strip
+            | EventKind::Streaking
+            | EventKind::JustHaveSex
+            | EventKind::Masturbating,
+        ) => true,
+        Some(k) => matches!(
+            k.together_group(),
+            Some(TogetherGroup::Nude | TogetherGroup::Sex)
+        ),
+    }
+}
+
+/// The chance that an everyday turn is `erotic` (spec §5), or `None` when no
+/// roll is made: `STRONG_DESIRE_P` for a `sex_addict = true` persona behind an
+/// open gate, at chemistry tier 3 or above, with no incident under way or one
+/// that allows it.
+pub fn everyday_erotic_probability(
+    gate: &EroticGate,
+    sex_addict: Option<bool>,
+    foreground: Option<EventKind>,
+) -> Option<f64> {
+    (gate.open()
+        && sex_addict == Some(true)
+        && gate.chem_tier >= EVERYDAY_MIN_CHEM_TIER
+        && everyday_foreground_allows(foreground))
+    .then_some(STRONG_DESIRE_P)
+}
+
+/// Whether a `roll` in `[0, 1)` wins against the probability `p`.
+pub fn won(p: f64, roll: f64) -> bool {
+    roll < p
 }
 
 #[cfg(test)]
@@ -268,5 +366,143 @@ mod tests {
         assert_eq!(draw_focused(0.125, 0.125), Tone::Default);
         assert_eq!(draw_focused(1.0, 0.999_999), Tone::Focused);
         assert_eq!(Tone::Focused.as_str(), "focused");
+    }
+
+    fn gate(chem_tier: u8) -> EroticGate {
+        EroticGate {
+            key: 1.0,
+            compatible: true,
+            cold_war: false,
+            is_virgin: false,
+            chem_tier,
+        }
+    }
+
+    #[test]
+    fn the_common_conditions() {
+        assert!(gate(1).open(), "no floor for a persona who is not a virgin");
+        assert!(!EroticGate {
+            key: 0.0,
+            ..gate(5)
+        }
+        .open());
+        assert!(!EroticGate {
+            compatible: false,
+            ..gate(5)
+        }
+        .open());
+        assert!(!EroticGate {
+            cold_war: true,
+            ..gate(5)
+        }
+        .open());
+        assert!(!EroticGate {
+            is_virgin: true,
+            ..gate(3)
+        }
+        .open());
+        assert!(EroticGate {
+            is_virgin: true,
+            ..gate(4)
+        }
+        .open());
+    }
+
+    #[test]
+    fn a_fixed_moment_rolls_against_the_key() {
+        assert_eq!(
+            fixed_erotic_probability(&EroticGate {
+                key: 0.4,
+                ..gate(2)
+            }),
+            Some(0.4)
+        );
+        assert_eq!(
+            fixed_erotic_probability(&EroticGate {
+                cold_war: true,
+                ..gate(5)
+            }),
+            None
+        );
+        assert_eq!(
+            fixed_erotic_probability(&EroticGate {
+                is_virgin: true,
+                ..gate(3)
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn the_everyday_probability_table() {
+        use crate::events::EventKind::{
+            Bathing, HavingSexTogether, JustHaveSex, Masturbating, NakedYogaTogether, Quarrel,
+            Showering, ShoweringTogether, Sick, Streaking, Strip, SuddenDesire,
+        };
+        let p = |g: &EroticGate, addict, fg| everyday_erotic_probability(g, addict, fg);
+        for key in [1e-12, 0.4, 1.0] {
+            assert_eq!(
+                p(&EroticGate { key, ..gate(3) }, Some(true), None),
+                Some(0.125)
+            );
+        }
+        assert_eq!(p(&gate(2), Some(true), None), None, "below tier 3");
+        assert_eq!(p(&gate(5), Some(false), None), None);
+        assert_eq!(p(&gate(5), None, None), None);
+        let virgin = |chem_tier| EroticGate {
+            is_virgin: true,
+            ..gate(chem_tier)
+        };
+        assert_eq!(p(&virgin(3), Some(true), None), None);
+        assert_eq!(p(&virgin(4), Some(true), None), Some(0.125));
+        for g in [
+            EroticGate {
+                key: 0.0,
+                ..gate(5)
+            },
+            EroticGate {
+                compatible: false,
+                ..gate(5)
+            },
+            EroticGate {
+                cold_war: true,
+                ..gate(5)
+            },
+        ] {
+            assert_eq!(p(&g, Some(true), None), None, "{g:?}");
+        }
+        for fg in [
+            SuddenDesire,
+            Strip,
+            Streaking,
+            JustHaveSex,
+            Masturbating,
+            HavingSexTogether,
+            ShoweringTogether,
+            NakedYogaTogether,
+        ] {
+            assert_eq!(p(&gate(3), Some(true), Some(fg)), Some(0.125), "{fg:?}");
+        }
+        for fg in [
+            Quarrel,
+            Sick,
+            Showering,
+            Bathing,
+            TempWork,
+            JoggingTogether,
+            OnADate,
+        ] {
+            assert_eq!(p(&gate(5), Some(true), Some(fg)), None, "{fg:?}");
+        }
+    }
+
+    #[test]
+    fn erotic_is_built_on_the_emotional_template() {
+        assert!(Tone::Erotic.on_emotional_template());
+        assert!(Tone::Emotional.on_emotional_template());
+        assert!(!Tone::Focused.on_emotional_template());
+        assert!(!Tone::Default.on_emotional_template());
+        assert_eq!(Tone::Erotic.as_str(), "erotic");
+        assert!(won(0.125, 0.1249) && !won(0.125, 0.125) && !won(0.0, 0.0));
     }
 }

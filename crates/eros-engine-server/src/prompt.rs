@@ -272,6 +272,19 @@ pub const NUDGE_QUESTION_P: f64 = 0.05;
 /// §5.4).
 const FOCUSED_WORK_LINE: &str = "你手上有工作，心思在工作上：回得简短利落，先顾手上的事";
 
+/// The one `[this_turn]` line of an `erotic` message, set by the pair's
+/// chemistry tier (spec 2026-11-27-erotic-tone-design.md §7.2): tier 3 and
+/// below the first, tier 4 the second, tier 5 the third. A fixed moment has
+/// no chemistry floor for a persona who is not a virgin, so tiers 1 and 2
+/// read the first line.
+pub(crate) fn erotic_line(chem_tier: u8) -> &'static str {
+    match chem_tier {
+        0..=3 => "你此刻对对方有欲望：话里带着撩拨和暗示，慢一点，贴近一点",
+        4 => "你现在很想要对方：语气放软、放慢，带着勾人的意味",
+        _ => "你的心思和身体都在对方身上：说话带着诱惑，不必遮掩",
+    }
+}
+
 /// Veto-then-roll (spec 2026-09-13 §3.2 moves the call site, not the odds):
 /// an axis the affinity has already judged cold (same floors and scope gating
 /// as the cold `[mood]` directives) keeps its die out of the cup entirely.
@@ -2119,6 +2132,12 @@ pub(crate) fn render_recall_sections(
 /// 2026-11-24-focused-tone-four-together-actions-and-user-gender-design.md
 /// §5.4): no `[feelings]`, `[reply_length]` at the lowest tier whatever the
 /// affinity and the mode, and `[this_turn]` holding `FOCUSED_WORK_LINE` alone.
+///
+/// `erotic = Some((affinity, scope))` renders the two things the `erotic`
+/// tone adds to the `emotional` prompt (spec 2026-11-27-erotic-tone-design.md
+/// §7): the `[relationship]` block of that affinity and scope, and
+/// `[this_turn]` holding `erotic_line` of its chemistry tier alone. Nothing
+/// else reads it.
 #[allow(clippy::too_many_arguments)] // signature mirrors the gateway's port-of-origin
 fn render_prompt(
     persona: &CompanionPersona,
@@ -2181,6 +2200,7 @@ fn render_prompt(
     anniversaries: &[String],
     user_profile: bool,
     focused: bool,
+    erotic: Option<(&Affinity, AffinityScope)>,
 ) -> String {
     let name = persona.genome.name.as_str();
     let age = meta_i32(persona, "age")
@@ -2267,7 +2287,10 @@ fn render_prompt(
         None => rel_sec.unwrap_or_else(|| "（还没有专属记忆，慢慢来）".to_string()),
     };
 
-    let relationship = relationship_ground(affinity, affinity_scope, persona);
+    let relationship = match erotic {
+        Some((a, scope)) => relationship_ground(Some(a), scope, persona),
+        None => relationship_ground(affinity, affinity_scope, persona),
+    };
     let attitude = affinity
         .map(|a| affinity_to_attitude_prompt(a, affinity_scope))
         .unwrap_or_default();
@@ -2489,7 +2512,9 @@ fn render_prompt(
     // the behavior, so absence is the default (naming demonstrates, #329).
     let this_turn = {
         let mut won: Vec<&str> = Vec::new();
-        if focused {
+        if let Some((a, _)) = erotic {
+            won.push(erotic_line(a.chem_tier()));
+        } else if focused {
             won.push(FOCUSED_WORK_LINE);
         } else {
             if nudges.affirm {
@@ -2625,6 +2650,7 @@ pub fn build_prompt(
         anniversaries,
         true,
         false,
+        None,
     )
 }
 
@@ -2652,6 +2678,82 @@ pub fn build_emotional_prompt(
     event: Option<&EventLines>,
     shared_memories: Option<&str>,
 ) -> String {
+    emotional_template(
+        persona,
+        reply_mode,
+        clothing,
+        prompt_traits,
+        world,
+        stories,
+        quote,
+        character_state,
+        now,
+        body_state,
+        needs,
+        event,
+        shared_memories,
+        None,
+    )
+}
+
+/// The `erotic` tone's system prompt (spec 2026-11-27-erotic-tone-design.md
+/// §7): the `emotional` prompt, plus the `[relationship]` block of `affinity`
+/// under `affinity_scope` and one `[this_turn]` line set by its chemistry
+/// tier. Everything the `emotional` prompt withholds stays withheld.
+#[allow(clippy::too_many_arguments)]
+pub fn build_erotic_prompt(
+    persona: &CompanionPersona,
+    reply_mode: Option<ReplyMode>,
+    clothing: Option<&str>,
+    prompt_traits: &[PromptTrait],
+    world: Option<&WorldContext>,
+    stories: Option<&StoriesContext>,
+    quote: Option<&QuotedMessage>,
+    character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    now: &NowContext,
+    body_state: Option<&str>,
+    needs: Option<&str>,
+    event: Option<&EventLines>,
+    shared_memories: Option<&str>,
+    affinity: &Affinity,
+    affinity_scope: AffinityScope,
+) -> String {
+    emotional_template(
+        persona,
+        reply_mode,
+        clothing,
+        prompt_traits,
+        world,
+        stories,
+        quote,
+        character_state,
+        now,
+        body_state,
+        needs,
+        event,
+        shared_memories,
+        Some((affinity, affinity_scope)),
+    )
+}
+
+/// The least-hint template the `emotional` and the `erotic` prompts share.
+#[allow(clippy::too_many_arguments)]
+fn emotional_template(
+    persona: &CompanionPersona,
+    reply_mode: Option<ReplyMode>,
+    clothing: Option<&str>,
+    prompt_traits: &[PromptTrait],
+    world: Option<&WorldContext>,
+    stories: Option<&StoriesContext>,
+    quote: Option<&QuotedMessage>,
+    character_state: Option<&eros_engine_store::character_insight::CharacterInsightsRow>,
+    now: &NowContext,
+    body_state: Option<&str>,
+    needs: Option<&str>,
+    event: Option<&EventLines>,
+    shared_memories: Option<&str>,
+    erotic: Option<(&Affinity, AffinityScope)>,
+) -> String {
     render_prompt(
         persona,
         &[],
@@ -2676,6 +2778,7 @@ pub fn build_emotional_prompt(
         &[],
         false,
         false,
+        erotic,
     )
 }
 
@@ -2730,6 +2833,7 @@ pub fn build_focused_prompt(
         anniversaries,
         true,
         true,
+        None,
     )
 }
 
@@ -9275,6 +9379,103 @@ mod tests {
 
             let e = emotional(mode, None);
             assert!(!e.contains("你手上有工作"), "{mode:?}: {e}");
+        }
+    }
+
+    const EROTIC_LINES: [&str; 3] = [
+        "你此刻对对方有欲望：话里带着撩拨和暗示，慢一点，贴近一点",
+        "你现在很想要对方：语气放软、放慢，带着勾人的意味",
+        "你的心思和身体都在对方身上：说话带着诱惑，不必遮掩",
+    ];
+
+    /// `emotional`'s fixture with the affinity and the scope an `erotic`
+    /// prompt reads its `[relationship]` block and its line from.
+    fn erotic(a: &Affinity, scope: AffinityScope, reply_mode: Option<ReplyMode>) -> String {
+        build_erotic_prompt(
+            &fixture_persona(),
+            reply_mode,
+            Some("白衬衫"),
+            &emotional_traits(),
+            Some(&WorldContext {
+                digest: "WORLD-DIGEST".into(),
+                fragments: vec![],
+            }),
+            Some(&StoriesContext {
+                digest: "STORY-DIGEST".into(),
+                episodes: vec![],
+            }),
+            None,
+            None,
+            &NowContext::default(),
+            Some("微醺"),
+            Some("想找人说说话"),
+            None,
+            None,
+            a,
+            scope,
+        )
+    }
+
+    fn erotic_this_turn(line: &str) -> String {
+        format!("\n\n[this_turn]（这一轮自然融入，别刻意）\n- {line}")
+    }
+
+    #[test]
+    fn the_erotic_line_follows_the_chemistry_tier() {
+        for tier in [0, 1, 2, 3] {
+            assert_eq!(erotic_line(tier), EROTIC_LINES[0], "tier {tier}");
+        }
+        assert_eq!(erotic_line(4), EROTIC_LINES[1]);
+        assert_eq!(erotic_line(5), EROTIC_LINES[2]);
+    }
+
+    #[test]
+    fn an_erotic_prompt_is_the_emotional_one_plus_the_relationship_and_the_line() {
+        let mut a = lines(0.70, 0.70); // (4, 4)
+        a.relationship.status = RelationshipStatus::Dating;
+        a.feeling_clause = Some(FOCUSED_CLAUSE.into());
+        let scope = AffinityScope::full();
+        let p = erotic(&a, scope, None);
+
+        let relationship = relationship_ground(Some(&a), scope, &fixture_persona());
+        assert!(relationship.contains("[relationship]"), "{relationship}");
+        assert!(p.contains(&relationship), "{p}");
+        let this_turn = erotic_this_turn(EROTIC_LINES[1]);
+        assert!(p.contains(&this_turn), "{p}");
+        assert_eq!(p.matches("[this_turn]").count(), 1, "{p}");
+        assert!(p.contains("[reply_length]\n最多 1 句，不超过 40 字"), "{p}");
+        for gone in [
+            "[user_profile]",
+            "[mood]",
+            "[feelings]",
+            FOCUSED_CLAUSE,
+            "[inner_state]",
+            "[emotional_context]",
+            "[reactions]",
+        ] {
+            assert!(!p.contains(gone), "{gone} must not render: {p}");
+        }
+        // Nothing else moved: without its two additions it is the emotional
+        // prompt of the same inputs.
+        assert_eq!(
+            p.replace(&relationship, "").replace(&this_turn, ""),
+            emotional(None, None)
+        );
+    }
+
+    #[test]
+    fn an_erotic_prompt_holds_its_line_in_every_reply_mode() {
+        for (score, line) in [(0.20, 0), (0.50, 0), (0.70, 1), (0.95, 2)] {
+            let a = lines(score, score);
+            for mode in FOCUSED_MODES {
+                let p = erotic(&a, AffinityScope::full(), mode);
+                assert!(
+                    p.contains(&erotic_this_turn(EROTIC_LINES[line])),
+                    "{score} {mode:?}: {p}"
+                );
+                assert_eq!(p.matches("[this_turn]").count(), 1, "{score} {mode:?}: {p}");
+                assert!(!p.contains("你手上有工作"), "{score} {mode:?}: {p}");
+            }
         }
     }
 

@@ -266,6 +266,25 @@ impl LifeChoiceCue {
 }
 
 impl Occasion {
+    /// Whether this message is one of the `erotic` tone's fixed moments
+    /// (spec 2026-11-27-erotic-tone-design.md §4): the `sudden_desire`
+    /// message, or her reply to an accepted `sleep_together` or
+    /// `bathe_together` ask (a bath that turned out a shower included).
+    fn erotic_moment(&self) -> bool {
+        match self {
+            Self::Event { kind, .. } => *kind == EventKind::SuddenDesire,
+            Self::LifeChoice(cue) => matches!(
+                cue,
+                LifeChoiceCue::ShowerAgreed
+                    | LifeChoiceCue::Answered {
+                        kind: LifeChoiceKind::SleepTogether | LifeChoiceKind::BatheTogether,
+                        accepted: true,
+                    }
+            ),
+            _ => false,
+        }
+    }
+
     /// The row's `metadata.proactive`.
     fn name(&self) -> &'static str {
         match self {
@@ -578,8 +597,10 @@ struct Prepared {
     chat_req: eros_engine_llm::openrouter::ChatRequest,
     plan: ActionPlan,
     injected_tags: Vec<String>,
-    /// `Some(Emotional)` on an event message written in the `emotional`
-    /// tone, stored as the row's `metadata.tone`; `None` otherwise.
+    /// The message's tone, stored as the row's `metadata.tone`: `Emotional`
+    /// on a listed event's message, `Erotic` on a fixed moment that won its
+    /// roll, `Default` on one that lost it and has no tone of its own; `None`
+    /// when no roll was made.
     tone: Option<eros_engine_core::tone::Tone>,
     /// The pair's chemistry after decay, as the prompt read it: what her
     /// picture's swimsuit follows (spec 2026-11-27-swim-outfit-ladder-and-
@@ -693,7 +714,24 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
     // alone, and the cue below as the one user message.
     let emotional = state.model_config.tone_emotional_probability() > 0.0
         && matches!(&g.occasion, Occasion::Event { kind, .. } if kind.speaks_emotionally());
-    let (mut chat_req, injected_tags) = if emotional {
+    // At a fixed moment one roll against `tones.erotic` comes first (spec
+    // 2026-11-27-erotic-tone-design.md §4): won, the message is `erotic`;
+    // lost, or a common condition failing, it is what it is today.
+    let erotic_p = g
+        .occasion
+        .erotic_moment()
+        .then(|| {
+            eros_engine_core::tone::fixed_erotic_probability(&eros_engine_core::tone::EroticGate {
+                key: state.model_config.tone_erotic_probability(),
+                compatible: eros_engine_core::scope::romance_compatible(g.affinity_scope),
+                cold_war: input.affinity.relationship.cold_war(),
+                is_virgin: traits.is_virgin,
+                chem_tier: input.affinity.chem_tier(),
+            })
+        })
+        .flatten();
+    let erotic = erotic_p.is_some_and(|p| eros_engine_core::tone::won(p, rand::random()));
+    let (mut chat_req, injected_tags) = if erotic || emotional {
         build_emotional_system_request(
             state,
             &input,
@@ -704,6 +742,7 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
             None,
             None,
             Some(&event_lines),
+            erotic,
         )
         .await?
     } else {
@@ -734,7 +773,15 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
         chat_req,
         plan,
         injected_tags,
-        tone: emotional.then_some(eros_engine_core::tone::Tone::Emotional),
+        // The final tone of a message for which a roll was made; a lost
+        // `erotic` roll on a message with no tone of its own is `default`.
+        tone: if erotic {
+            Some(eros_engine_core::tone::Tone::Erotic)
+        } else if emotional {
+            Some(eros_engine_core::tone::Tone::Emotional)
+        } else {
+            erotic_p.map(|_| eros_engine_core::tone::Tone::Default)
+        },
         chemistry,
     })
 }

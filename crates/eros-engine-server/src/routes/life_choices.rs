@@ -2482,4 +2482,284 @@ mod tests {
             assert!(s.events().await.is_empty());
         }
     }
+
+    // ── Her erotic reply to an accepted ask (spec 2026-11-27-erotic-tone-design.md §4) ──
+
+    const EROTIC_LINES: [&str; 3] = [
+        "- 你此刻对对方有欲望：话里带着撩拨和暗示，慢一点，贴近一点",
+        "- 你现在很想要对方：语气放软、放慢，带着勾人的意味",
+        "- 你的心思和身体都在对方身上：说话带着诱惑，不必遮掩",
+    ];
+
+    fn with_tones(mut state: AppState, tones: &str) -> AppState {
+        state.model_config = Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel = \"companion\"\ntones = {tones}\n"
+            ))
+            .unwrap(),
+        );
+        state
+    }
+
+    /// An answer under the full affinity scope: a romantically compatible
+    /// message.
+    fn scoped_answer(response: LifeChoiceAnswer) -> LifeChoiceRespondRequest {
+        LifeChoiceRespondRequest {
+            affinity_scope: Some(serde_json::from_value(json!("full")).unwrap()),
+            ..answer(response)
+        }
+    }
+
+    impl Scene {
+        async fn respond_scoped(&self, state: &AppState, choice: Uuid, response: LifeChoiceAnswer) {
+            respond_at(
+                state,
+                self.session_id,
+                choice,
+                self.user_id,
+                scoped_answer(response),
+                recent(0),
+            )
+            .await
+            .unwrap();
+        }
+
+        /// The pair's chemistry line at `score`, both axes.
+        async fn set_chemistry(&self, score: f64) {
+            sqlx::query(
+                "UPDATE engine.companion_affinity \
+                    SET intimacy = $2, tension = $2, updated_at = now() WHERE session_id = $1",
+            )
+            .bind(self.session_id)
+            .bind(score)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        async fn set_art(&self, art: serde_json::Value) {
+            sqlx::query(
+                "UPDATE engine.persona_genomes SET art_metadata = $2 \
+                  WHERE id = (SELECT genome_id FROM engine.persona_instances WHERE id = $1)",
+            )
+            .bind(self.instance_id)
+            .bind(art)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        /// `metadata.tone` of her newest row.
+        async fn reply_tone(&self) -> Option<String> {
+            sqlx::query_scalar(
+                "SELECT metadata->>'tone' FROM engine.chat_messages \
+                  WHERE session_id = $1 AND role = 'assistant' \
+                  ORDER BY sent_at DESC, id DESC LIMIT 1",
+            )
+            .bind(self.session_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+    }
+
+    /// The system prompt of the mock's newest companion call.
+    async fn last_system(mock: &MockServer) -> String {
+        let c = calls(mock).await;
+        let call = c.last().expect("a companion call");
+        assert_eq!(call["messages"][0]["role"], json!("system"));
+        call["messages"][0]["content"].as_str().unwrap().to_string()
+    }
+
+    fn assert_erotic(system: &str, line: &str) {
+        for kept in ["[relationship]\n", line] {
+            assert!(system.contains(kept), "{kept}: {system}");
+        }
+        for gone in ["[user_profile]", "[mood]", "[feelings]"] {
+            assert!(!system.contains(gone), "{gone} must not render: {system}");
+        }
+    }
+
+    /// Today's reply: the default prompt, with no `erotic` line.
+    fn assert_as_today(system: &str) {
+        assert!(system.contains("[user_profile]"), "{system}");
+        for line in EROTIC_LINES {
+            assert!(!system.contains(line), "{line}: {system}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn accepting_sleep_together_is_answered_erotically(pool: PgPool) {
+        let mock = companion_mock(Some("好呀。")).await;
+        let state = with_tones(
+            with_companion(test_state(pool.clone()), &mock.uri()),
+            "{ erotic = 1.0 }",
+        );
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("sleep_together", recent(30)).await;
+        s.respond_scoped(&state, choice, LifeChoiceAnswer::Accept)
+            .await;
+
+        let c = calls(&mock).await;
+        assert_eq!(c[0]["messages"].as_array().unwrap().len(), 2, "{c:?}");
+        assert_eq!(last_user_turn(&c[0]), json!(SLEEP_ACCEPT_CUE));
+        let system = last_system(&mock).await;
+        assert_erotic(&system, EROTIC_LINES[1]);
+        assert!(
+            system.contains("和对方上床"),
+            "the event just placed tells her what was agreed: {system}"
+        );
+        assert_eq!(s.reply_tone().await.as_deref(), Some("erotic"));
+    }
+
+    /// Both outcomes of an accepted bath, the shower and the tub.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn accepting_a_bath_is_answered_erotically(pool: PgPool) {
+        let mock = companion_mock(Some("来吧。")).await;
+        let state = with_tones(
+            with_companion(test_state(pool.clone()), &mock.uri()),
+            "{ erotic = 1.0 }",
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        // Both kinds turn up within 64 accepts but for a 2^-63 chance.
+        for _ in 0..64 {
+            let s = scene(&pool).await;
+            let choice = s.ask_kind("bathe_together", recent(30)).await;
+            s.respond_scoped(&state, choice, LifeChoiceAnswer::Accept)
+                .await;
+            assert_erotic(&last_system(&mock).await, EROTIC_LINES[1]);
+            assert_eq!(s.reply_tone().await.as_deref(), Some("erotic"));
+            seen.insert(s.events().await[0].1.clone());
+            if seen.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 2, "both a shower and a bath: {seen:?}");
+    }
+
+    /// A fixed moment has no chemistry floor for a persona who is not a
+    /// virgin: a bath accepted at tier 2 reads the tier-3 line.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_bath_accepted_at_chemistry_2_reads_the_first_line(pool: PgPool) {
+        let mock = companion_mock(Some("来吧。")).await;
+        let state = with_tones(
+            with_companion(test_state(pool.clone()), &mock.uri()),
+            "{ erotic = 1.0 }",
+        );
+        let s = scene(&pool).await;
+        s.set_chemistry(0.2).await;
+        let choice = s.ask_kind("bathe_together", recent(30)).await;
+        s.respond_scoped(&state, choice, LifeChoiceAnswer::Accept)
+            .await;
+        assert_erotic(&last_system(&mock).await, EROTIC_LINES[0]);
+        assert_eq!(s.reply_tone().await.as_deref(), Some("erotic"));
+    }
+
+    /// The virgin's floor reads the card alone: at chemistry tier 3 she is
+    /// answered as today even with sex already in her past; at tier 4 she
+    /// starts from the tier-4 line.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_virgin_below_chemistry_4_is_answered_as_today(pool: PgPool) {
+        let mock = companion_mock(Some("好呀。")).await;
+        let state = with_tones(
+            with_companion(test_state(pool.clone()), &mock.uri()),
+            "{ erotic = 1.0 }",
+        );
+        let s = scene(&pool).await;
+        s.set_art(json!({"is_virgin": true})).await;
+        s.set_chemistry(0.5).await;
+        s.put("having_sex_together", recent(3000), recent(2940))
+            .await;
+        let choice = s.ask_kind("sleep_together", recent(30)).await;
+        s.respond_scoped(&state, choice, LifeChoiceAnswer::Accept)
+            .await;
+        assert_as_today(&last_system(&mock).await);
+        assert_eq!(s.reply_tone().await, None, "no roll was made");
+
+        let s = scene(&pool).await;
+        s.set_art(json!({"is_virgin": true})).await;
+        let choice = s.ask_kind("sleep_together", recent(30)).await;
+        s.respond_scoped(&state, choice, LifeChoiceAnswer::Accept)
+            .await;
+        assert_erotic(&last_system(&mock).await, EROTIC_LINES[1]);
+        assert_eq!(s.reply_tone().await.as_deref(), Some("erotic"));
+    }
+
+    /// Not fixed moments: a decline, `fall_asleep_together`, and an accept
+    /// whose request names no romantically compatible scope.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_other_answers_are_not_erotic(pool: PgPool) {
+        let mock = companion_mock(Some("嗯。")).await;
+        let state = with_tones(
+            with_companion(test_state(pool.clone()), &mock.uri()),
+            "{ erotic = 1.0 }",
+        );
+        for (kind, response) in [
+            ("sleep_together", LifeChoiceAnswer::Decline),
+            ("bathe_together", LifeChoiceAnswer::Decline),
+            ("fall_asleep_together", LifeChoiceAnswer::Accept),
+        ] {
+            let s = scene(&pool).await;
+            let choice = s.ask_kind(kind, recent(30)).await;
+            s.respond_scoped(&state, choice, response).await;
+            assert_as_today(&last_system(&mock).await);
+            assert_eq!(s.reply_tone().await, None, "{kind}");
+        }
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("sleep_together", recent(30)).await;
+        s.respond(&state, choice, LifeChoiceAnswer::Accept, recent(0))
+            .await
+            .unwrap();
+        assert_as_today(&last_system(&mock).await);
+        assert_eq!(s.reply_tone().await, None, "no scope named");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_lost_roll_on_an_accepted_ask_records_default(pool: PgPool) {
+        let mock = companion_mock(Some("好呀。")).await;
+        let state = with_tones(
+            with_companion(test_state(pool.clone()), &mock.uri()),
+            "{ erotic = 1e-12 }",
+        );
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("sleep_together", recent(30)).await;
+        s.respond_scoped(&state, choice, LifeChoiceAnswer::Accept)
+            .await;
+        assert_as_today(&last_system(&mock).await);
+        assert_eq!(s.reply_tone().await.as_deref(), Some("default"));
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_streamed_accept_is_answered_erotically(pool: PgPool) {
+        let mock = MockServer::start().await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("you are a companion"))
+            .respond_with(upstream_sse(&["好", "呀。"]))
+            .mount(&mock)
+            .await;
+        let state = with_tones(
+            with_companion(test_state(pool.clone()), &mock.uri()),
+            "{ erotic = 1.0 }",
+        );
+        let s = scene(&pool).await;
+        let choice = s.ask_kind("sleep_together", recent(30)).await;
+        let resp = respond_stream_at(
+            &state,
+            s.session_id,
+            choice,
+            s.user_id,
+            scoped_answer(LifeChoiceAnswer::Accept),
+            recent(0),
+        )
+        .await
+        .unwrap();
+        let frames = read_sse(resp).await;
+        assert_eq!(
+            frame_types(&frames).last().copied(),
+            Some("final"),
+            "{frames:?}"
+        );
+        assert_erotic(&last_system(&mock).await, EROTIC_LINES[1]);
+        assert_eq!(s.reply_tone().await.as_deref(), Some("erotic"));
+    }
 }

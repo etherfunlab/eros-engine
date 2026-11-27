@@ -45,7 +45,7 @@ model_name_display_override = true
 # gating. See docs/prompt-traits.md.
 #allow_traits = ["nsfw_boost","politics_open"]
 # Chat tones (optional). The engine decides the tone of a reply; the judge does
-# not. Two keys, each off when absent or 0, each working without the other.
+# not. Three keys, each off when absent or 0, each working without the others.
 # With `emotional` above 0:
 # - a 1:1 text turn without a user action is `emotional` with this base
 #   probability, times 3 for a persona whose art_metadata.moody is true (a
@@ -67,8 +67,17 @@ model_name_display_override = true
 # is full_time and who has no incident under way. A focused reply keeps the
 # history and the relationship, and is brief: at most one sentence and 40
 # characters.
+# With `erotic` above 0, three moments are `erotic` with that probability, for
+# a romantically compatible pair outside a cold war: her reply to an accepted
+# sex_together, her reply to an accepted sleep_together or bathe_together
+# ask, and the start message of sudden_desire. A persona whose
+# art_metadata.sex_addict is true also draws it 1 time in 8 on an everyday
+# 1:1 text turn from chemistry tier 3, whatever the value. A persona whose
+# art_metadata.is_virgin is true is never erotic below chemistry tier 4. An
+# erotic reply is an emotional one that is also told who the user is to her.
+# erotic wins over emotional, and emotional over focused.
 # Task-level.
-#tones = { emotional = 0.05, focused = 1.0 }
+#tones = { emotional = 0.05, focused = 1.0, erotic = 1.0 }
 
 # Per-tier overrides are OPTIONAL and downstream-defined: `tier` is whatever
 # your product sends per request. The OSS template enables none — with no tier
