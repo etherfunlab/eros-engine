@@ -1123,3 +1123,20 @@ model = "voyage-4-lite"
 # Set to false to keep the voice prompt recall-free, regardless of the
 # request's memory_scope — config always wins over the per-request scope.
 #recall = false
+
+# ── Speech markup (chat_speech) ──────────────────────────────────────────────
+# OPT-IN. Feature is OFF unless this block exists. Powers
+# POST /comp/chat/{session_id}/messages/speech: up to eight of her stored chat
+# messages come back as the same text with inline audio tags ([whispers],
+# [sighs], …) for the caller's TTS model. One model call per message; nothing
+# is stored. `model` MUST be a single fixed id, as for chat_voice; `fallback`
+# is the outage retry chain. `filter_prompt` is OPTIONAL: it overrides the
+# built-in base directive only — the engine always appends whether her words
+# are kept (the request's `rewrite` flag) and the tag guidance. `max_tokens`
+# has to leave room for the source line plus its tags; too low a value comes
+# back as `truncated` items.
+#[tasks.chat_speech]
+#model        = "vendor/fast-model"
+#fallback     = ["vendor/backup-model"]
+#temperature  = 0.7
+#max_tokens   = 400
