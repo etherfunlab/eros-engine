@@ -156,6 +156,10 @@ pub enum UserAction {
     /// The user undresses her; only a romance-compatible pair can have it
     /// accepted (spec 2026-11-08-strip-and-world-setting-design.md §2).
     Strip,
+    /// The user asks her to undress herself: `strip`'s passive form, with
+    /// every rule of `strip`; accepted, how far she goes is set by the pair's
+    /// chemistry tier (spec 2026-11-28-ask-strip-design.md).
+    AskStrip,
     /// The user asks to shower, take a bath or take a sauna with her (spec
     /// 2026-11-20-together-actions-state-in-picture-and-genome-routes-
     /// design.md §5). Accepted, she is in the event `together_kind` names,
@@ -449,6 +453,7 @@ impl UserAction {
                 | UserAction::HugFromBehind
                 | UserAction::Touch
                 | UserAction::Strip
+                | UserAction::AskStrip
                 | UserAction::Propose
                 | UserAction::BreakUp
                 | UserAction::Threaten
@@ -1655,6 +1660,7 @@ mod tests {
             Threaten,
             Trick,
             Strip,
+            AskStrip,
             ShowerTogether,
             BathTogether,
             SaunaTogether,
@@ -2600,5 +2606,28 @@ mod tests {
             assert_eq!(a.is_passion(), model.is_passion(), "{a:?}");
             assert_eq!(a.consumed(), None, "{a:?}");
         }
+    }
+
+    /// Spec 2026-11-28-ask-strip-design.md §4: `ask_strip` is `strip` in
+    /// every property.
+    #[test]
+    fn ask_strip_shares_the_properties_of_strip() {
+        let (ask, strip) = (UserAction::AskStrip, UserAction::Strip);
+        assert_eq!(
+            serde_json::to_value(&ask).unwrap(),
+            serde_json::json!({"type": "ask_strip"})
+        );
+        assert_eq!(
+            serde_json::from_value::<UserAction>(serde_json::json!({"type": "ask_strip"})).unwrap(),
+            ask
+        );
+        assert_eq!(ask.together_kind(), None);
+        assert_eq!(ask.together_group(), None);
+        assert_eq!(ask.refusal_lines(), strip.refusal_lines());
+        assert_eq!(ask.speaks_emotionally(), strip.speaks_emotionally());
+        assert!(ask.speaks_emotionally());
+        assert_eq!(ask.is_passion(), strip.is_passion());
+        assert!(!ask.is_passion());
+        assert_eq!(ask.consumed(), None);
     }
 }

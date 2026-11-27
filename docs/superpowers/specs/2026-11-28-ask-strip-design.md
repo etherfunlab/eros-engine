@@ -98,8 +98,7 @@ not named. A persona who is not female reads tier 3 as
 |---|---|
 | the action | 想让你把衣服脱了 |
 | the judge's `[用户动作]` line | 对方想让你把衣服脱了（accept：{rung}；refuse：不脱） |
-| her reply's action context, accepted | what `strip` says of an accept, with the rung: 你答应了：{rung} |
-| her reply's action context, refused | as any refused action |
+| her reply's action context | as any action: 你接受了 / 你没有接受. How far she went is the turn's clothing (§5) |
 
 `{rung}` is the tier's words without 自己: 脱了外套 / 脱到只剩内衣 /
 脱到只剩内裤，上身用手遮着 / 全脱了，用手遮着 / 全脱了，不遮不掩. The

@@ -168,6 +168,7 @@ pub enum UserActionKind {
     Threaten,
     Trick,
     Strip,
+    AskStrip,
     ShowerTogether,
     BathTogether,
     SaunaTogether,
@@ -654,6 +655,7 @@ impl UserActionDto {
             UserActionKind::Threaten => UserAction::Threaten,
             UserActionKind::Trick => UserAction::Trick,
             UserActionKind::Strip => UserAction::Strip,
+            UserActionKind::AskStrip => UserAction::AskStrip,
             UserActionKind::ShowerTogether => UserAction::ShowerTogether,
             UserActionKind::BathTogether => UserAction::BathTogether,
             UserActionKind::SaunaTogether => UserAction::SaunaTogether,
@@ -6387,5 +6389,20 @@ mod validate_payload_tests {
                 "the stored action is the request's"
             );
         }
+    }
+
+    /// Spec 2026-11-28-ask-strip-design.md.
+    #[test]
+    fn ask_strip_maps_one_to_one_and_takes_no_field() {
+        let dto: UserActionDto =
+            serde_json::from_value(serde_json::json!({"type": "ask_strip"})).unwrap();
+        assert_eq!(
+            dto.to_core().unwrap(),
+            eros_engine_core::types::UserAction::AskStrip
+        );
+        let styled: UserActionDto =
+            serde_json::from_value(serde_json::json!({"type": "ask_strip", "style": "tango"}))
+                .unwrap();
+        assert!(styled.to_core().is_err());
     }
 }

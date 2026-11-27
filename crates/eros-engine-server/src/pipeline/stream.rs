@@ -2921,7 +2921,10 @@ fn is_picture_action(action: &eros_engine_core::types::UserAction) -> bool {
     use eros_engine_core::types::UserAction;
     matches!(
         action,
-        UserAction::Photo | UserAction::Strip | UserAction::AskDancing { .. }
+        UserAction::Photo
+            | UserAction::Strip
+            | UserAction::AskStrip
+            | UserAction::AskDancing { .. }
     ) || action.together_kind().is_some()
 }
 
@@ -3247,6 +3250,16 @@ fn build_pde_ctx_decided(
             "[用户动作] {}{}{}\n",
             crate::prompt::action_subject(a),
             crate::prompt::social_outcomes(a)
+                .or_else(|| {
+                    // An `ask_strip` reads how far a yes goes for this pair
+                    // (spec 2026-11-28-ask-strip-design.md §6).
+                    matches!(a, eros_engine_core::types::UserAction::AskStrip).then(|| {
+                        crate::prompt::ask_strip_outcomes(
+                            input.affinity.chem_tier(),
+                            crate::prompt::wearer(&input.persona),
+                        )
+                    })
+                })
                 .map(|(yes, no)| format!("（accept：{yes}；refuse：{no}）"))
                 .unwrap_or_default(),
             match (decided, a) {
@@ -3256,6 +3269,7 @@ fn build_pde_ctx_decided(
                 (
                     _,
                     eros_engine_core::types::UserAction::AskDancing { .. }
+                    | eros_engine_core::types::UserAction::AskStrip
                     | eros_engine_core::types::UserAction::Bet
                     | eros_engine_core::types::UserAction::Date { .. }
                     | eros_engine_core::types::UserAction::Propose
@@ -5918,6 +5932,24 @@ pub(crate) fn run_stream_with(
         ) = (&input.event, plan.action_response)
         {
             plan.clothing = Some(crate::prompt::stripped_clothing(outfit.as_deref()));
+        }
+        // An accepted `ask_strip` has her undress herself this turn, as far as
+        // the pair's chemistry tier goes (spec 2026-11-28-ask-strip-design.md
+        // §5), over the judge and a named outfit as a `strip` is.
+        if let (
+            Event::UserMessage {
+                action: Some(eros_engine_core::types::UserAction::AskStrip),
+                outfit,
+                ..
+            },
+            Some(eros_engine_core::types::ActionResponse::Accept),
+        ) = (&input.event, plan.action_response)
+        {
+            plan.clothing = Some(crate::prompt::self_stripped_clothing(
+                input.affinity.chem_tier(),
+                crate::prompt::wearer(&input.persona),
+                outfit.as_deref(),
+            ));
         }
 
         // The needs stored on this row (spec 2026-10-13 §5.1, 2026-10-30
@@ -32460,5 +32492,111 @@ data: [DONE]\n\n"
             crate::prompt::doing_label(e.kind, e.text.as_deref()),
             "和对方一起跳探戈"
         );
+    }
+
+    // ── `ask_strip` (spec 2026-11-28-ask-strip-design.md) ──
+
+    #[test]
+    fn the_judge_line_of_an_ask_strip_says_what_an_accept_means() {
+        use eros_engine_core::types::{ActionResponse, Event, UserAction};
+        let t = JudgeTranscript::default();
+        let mut input = fixture_decision_input();
+        if let Event::UserMessage { action, .. } = &mut input.event {
+            *action = Some(UserAction::AskStrip);
+        }
+        for (chem, rung) in [
+            (0.05, "脱了外套"),
+            (0.20, "脱到只剩内衣"),
+            (0.70, "全脱了，用手遮着"),
+            (0.95, "全脱了，不遮不掩"),
+        ] {
+            (input.affinity.intimacy, input.affinity.tension) = (chem, chem);
+            let open = build_pde_ctx_decided(&t, &input, false, None, None, None, None, None);
+            assert!(
+                open.contains(&format!(
+                    "[用户动作] 对方想让你把衣服脱了（accept：{rung}；refuse：不脱）\n"
+                )),
+                "{chem}: {open}"
+            );
+        }
+        let refused = build_pde_ctx_decided(
+            &t,
+            &input,
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(ActionResponse::Refuse),
+        );
+        assert!(refused.contains("，这次你不会答应\n"), "{refused}");
+        assert!(!refused.contains("这次你不会让对方这样做"), "{refused}");
+    }
+
+    /// Accepted at chemistry tier 2, she strips to her underwear: the reply
+    /// reads that as the turn's clothing. Refused, nothing changes. An
+    /// incompatible pair is refused before the judge.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_accepted_ask_strip_undresses_her_by_the_chemistry_tier(pool: PgPool) {
+        use eros_engine_core::types::UserAction;
+        let companion_system = |reqs: &[wiremock::Request]| -> String {
+            reqs.iter()
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .find(|b| b.contains("deepseek/x") && b.contains("\"stream\":true"))
+                .expect("the reply was requested")
+        };
+        for (chemistry, clothing) in [(0.20, "自己脱到只剩内衣"), (0.95, "自己全脱了，不遮不掩")]
+        {
+            let (frames, mock, _) = run_together_turn_tweaked(
+                &pool,
+                UserAction::AskStrip,
+                Some("accept"),
+                "reply_text",
+                true,
+                &[],
+                false,
+                None,
+                Some(chemistry),
+                |_| {},
+            )
+            .await;
+            assert_eq!(action_response_of(&frames), "accept");
+            let system = companion_system(&mock.received_requests().await.unwrap());
+            assert!(system.contains(clothing), "{chemistry}: {system}");
+        }
+        let (frames, mock, _) = run_together_turn_tweaked(
+            &pool,
+            UserAction::AskStrip,
+            Some("refuse"),
+            "reply_text",
+            true,
+            &[],
+            false,
+            None,
+            Some(0.95),
+            |_| {},
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let system = companion_system(&mock.received_requests().await.unwrap());
+        assert!(!system.contains("自己全脱了"), "{system}");
+        // An incompatible pair: refused before the judge, whatever it answers.
+        let (frames, mock, _) = run_together_turn_tweaked(
+            &pool,
+            UserAction::AskStrip,
+            Some("accept"),
+            "reply_text",
+            false,
+            &[],
+            false,
+            None,
+            Some(0.95),
+            |_| {},
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "refuse");
+        let judge = judge_request(&mock.received_requests().await.unwrap());
+        assert!(judge.contains("对方想让你把衣服脱了"), "{judge}");
+        assert!(judge.contains("，这次你不会答应"), "{judge}");
     }
 }

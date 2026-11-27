@@ -866,6 +866,7 @@ pub(crate) fn action_phrase(a: &UserAction) -> String {
         UserAction::Threaten => "威胁你".into(),
         UserAction::Trick => "想捉弄你".into(),
         UserAction::Strip => "伸手想脱你的衣服".into(),
+        UserAction::AskStrip => "想让你把衣服脱了".into(),
         UserAction::ShowerTogether => "想和你一起淋浴".into(),
         UserAction::BathTogether => "想和你一起泡澡".into(),
         UserAction::SaunaTogether => "想和你一起蒸桑拿".into(),
@@ -1710,6 +1711,42 @@ pub(crate) fn composer_user_text(
         (Some(a), Some(r)) => format!("{base}\n{}", action_outcome(a, r)),
         _ => base,
     }
+}
+
+/// How far she undresses on an accepted `ask_strip`, by the pair's chemistry
+/// tier (spec 2026-11-28-ask-strip-design.md §5): the rung's words without
+/// 自己. A persona who is not female has nothing to cover at tier 3.
+pub(crate) fn strip_rung(chem_tier: u8, wearer: Wearer) -> &'static str {
+    match (chem_tier, wearer) {
+        (0..=1, _) => "脱了外套",
+        (2, _) => "脱到只剩内衣",
+        (3, Wearer::Female) => "脱到只剩内裤，上身用手遮着",
+        (3, _) => "脱到只剩内裤",
+        (4, _) => "全脱了，用手遮着",
+        _ => "全脱了，不遮不掩",
+    }
+}
+
+/// Her clothing on a turn whose `ask_strip` she accepted (spec
+/// 2026-11-28-ask-strip-design.md §5): 自己 and the rung. At tier 1 a named
+/// outfit is still on and is named; from tier 2 it is off.
+pub(crate) fn self_stripped_clothing(
+    chem_tier: u8,
+    wearer: Wearer,
+    outfit: Option<&str>,
+) -> String {
+    let rung = strip_rung(chem_tier, wearer);
+    match outfit {
+        Some(o) if chem_tier <= 1 => format!("自己{rung}，里面还穿着「{o}」"),
+        _ => format!("自己{rung}"),
+    }
+}
+
+/// What `accept` and `refuse` mean on an `ask_strip` at this chemistry tier
+/// (spec 2026-11-28-ask-strip-design.md §6): the judge reads how far a yes
+/// goes for this pair.
+pub(crate) fn ask_strip_outcomes(chem_tier: u8, wearer: Wearer) -> (&'static str, &'static str) {
+    (strip_rung(chem_tier, wearer), "不脱")
 }
 
 /// Her clothing on a turn whose `strip` she accepted (spec 2026-11-08-strip-
@@ -10141,5 +10178,53 @@ mod tests {
                 assert_eq!(water_clothing(Some(SkiingTogether), &wear), None);
             }
         }
+    }
+
+    /// Spec 2026-11-28-ask-strip-design.md §5, §6.
+    #[test]
+    fn ask_strip_has_its_phrase_and_five_rungs() {
+        assert_eq!(action_phrase(&UserAction::AskStrip), "想让你把衣服脱了");
+        assert_eq!(
+            action_subject(&UserAction::AskStrip),
+            "对方想让你把衣服脱了"
+        );
+        let rungs = [
+            "脱了外套",
+            "脱到只剩内衣",
+            "脱到只剩内裤，上身用手遮着",
+            "全脱了，用手遮着",
+            "全脱了，不遮不掩",
+        ];
+        for (i, want) in rungs.iter().enumerate() {
+            let tier = i as u8 + 1;
+            assert_eq!(strip_rung(tier, Wearer::Female), *want, "tier {tier}");
+            assert_eq!(
+                self_stripped_clothing(tier, Wearer::Female, None),
+                format!("自己{want}"),
+                "tier {tier}"
+            );
+        }
+        assert_eq!(strip_rung(0, Wearer::Female), rungs[0], "below the scale");
+        assert_eq!(strip_rung(9, Wearer::Female), rungs[4], "above the scale");
+        // A persona who is not female has nothing to cover at tier 3.
+        for w in [Wearer::Male, Wearer::Other] {
+            assert_eq!(strip_rung(3, w), "脱到只剩内裤");
+            for tier in [1, 2, 4, 5] {
+                assert_eq!(strip_rung(tier, w), strip_rung(tier, Wearer::Female));
+            }
+        }
+        // A named outfit is still on at tier 1, and off from tier 2.
+        assert_eq!(
+            self_stripped_clothing(1, Wearer::Female, Some("白衬衫")),
+            "自己脱了外套，里面还穿着「白衬衫」"
+        );
+        assert_eq!(
+            self_stripped_clothing(2, Wearer::Female, Some("白衬衫")),
+            "自己脱到只剩内衣"
+        );
+        assert_eq!(
+            ask_strip_outcomes(2, Wearer::Female),
+            ("脱到只剩内衣", "不脱")
+        );
     }
 }
