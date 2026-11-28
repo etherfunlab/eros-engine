@@ -721,10 +721,19 @@ mod tests {
         let user = Uuid::new_v4();
         let instance = seed_persona_instance(&pool, user).await;
         let other_instance = seed_persona_instance(&pool, user).await;
-        // The turn runs in a session of its own; the picture was taken in another.
+        // The turn answers a message in a session of its own; the picture was
+        // taken in an earlier session of the same instance.
         let earlier_session = seed_session(&pool, user, instance, false).await;
+        let turn_session = seed_session(&pool, user, instance, false).await;
+        let message = seed_chat_message(&pool, turn_session).await;
+        sqlx::query("UPDATE engine.chat_messages SET sent_at = $2 WHERE id = $1")
+            .bind(message)
+            .bind(noon())
+            .execute(&pool)
+            .await
+            .unwrap();
         let other_session = seed_session(&pool, user, other_instance, false).await;
-        // Another instance is newer; another session of this instance is older.
+        // Another instance's picture is newer and is not read.
         seed_picture(
             &pool,
             user,
@@ -745,7 +754,7 @@ mod tests {
         .await;
 
         let got = ImageComposeEventRepo { pool: &pool }
-            .last_worn(instance, None, noon(), 45)
+            .last_worn(instance, Some(message), noon(), 45)
             .await
             .unwrap();
         assert_eq!(
