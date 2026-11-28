@@ -2161,7 +2161,10 @@ pub(crate) fn operation_failure_pointer(
 /// produce one — so it is built by hand. `FILTER_TIMEOUT` is one deadline over
 /// a whole filter attempt — open through finish — so the kind is
 /// `TotalTimeout`, not `OpenTimeout`.
-fn filter_timeout_failure(task: &str, model: &str) -> eros_engine_llm::failure::AttemptFailure {
+pub(crate) fn filter_timeout_failure(
+    task: &str,
+    model: &str,
+) -> eros_engine_llm::failure::AttemptFailure {
     eros_engine_llm::failure::AttemptFailure::Gateway(eros_engine_llm::failure::GatewayError {
         task: task.to_string(),
         model: Some(model.to_string()),

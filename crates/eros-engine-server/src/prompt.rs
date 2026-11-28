@@ -254,6 +254,21 @@ fn now_context_at(
     )
 }
 
+/// Her local date, weekday, time and day-part on the persona clock `[now]`
+/// uses for her: 「2026-11-28（周六）21:05，傍晚」.
+pub(crate) fn persona_local_time(persona: &CompanionPersona, now: &NowContext) -> String {
+    let tz = persona_clock_tz(meta_str(persona, "timezone"), now.user_timezone);
+    let local = now.now.with_timezone(&tz);
+    format!(
+        "{date}（{wd}）{hh:02}:{mm:02}，{period}",
+        date = local.format("%Y-%m-%d"),
+        wd = weekday_cn(local.weekday()),
+        hh = local.hour(),
+        mm = local.minute(),
+        period = period_cn(local.hour()),
+    )
+}
+
 // Cold floors shared by the `[mood]` directives and the nudge veto. At or
 // below the floor the axis's cold directive renders — and a die whose
 // directive would fight that conclusion is not rolled.

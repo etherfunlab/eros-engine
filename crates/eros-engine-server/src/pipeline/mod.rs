@@ -20,6 +20,7 @@ pub mod speech;
 pub mod story;
 pub mod stream;
 pub mod voice;
+pub mod wardrobe;
 pub mod world;
 pub mod world_town;
 
