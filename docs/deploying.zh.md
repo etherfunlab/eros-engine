@@ -297,7 +297,7 @@ World Stories 按实例生活模拟）默认完全关闭：模型配置里没有
   - `FACTS_EXPORT_SECRET`（`x-facts-export-secret`）挂载 `GET /svc/v1/facts/changes`，即以 keyset 流形式交出的事实账本，以及 `GET /svc/v1/facts/deletions`，供事实镜像使用的同一条已抹除用户流。
   - 两个导出 secret 任设一个，还会挂载 `GET /svc/v1/rows/deletions`：用户本人逐条删除的记忆与事实，这两种镜像也都必须读取。任一 header 都能打开它。
   - `USER_ERASE_SECRET`（`x-user-erase-secret`）挂载 `POST /svc/v1/users/{user_id}/erase`，删除引擎关于某个用户派生出的一切。即使部署没有启用任何导出，它也能用。请在删除该用户的 session 之前调用。抹除是永久的，此后引擎不再派生任何关于该用户的东西，即使部署保留了聊天历史（[洞察 → 抹除](insights.zh.md#抹除)）。
-  - `GENOME_WRITE_SECRET`（`x-genome-write-secret`）挂载 `POST /svc/v1/genomes` 与 `PUT /svc/v1/genomes/{id}`，用一张 [eros-character](eros-character-v1.1.md) 卡片创建、覆盖一个角色 genome，这样自己编写角色的下游服务器就不必直接写 `engine.persona_genomes`。这两条路由不做归属检查：请求里没有用户，归属由调用方自己负责。即使部署没有启用任何导出和抹除，它们也能用。
+  - `GENOME_WRITE_SECRET`（`x-genome-write-secret`）挂载 `POST /svc/v1/genomes` 与 `PUT /svc/v1/genomes/{id}`，用一张 [eros-character](eros-character-v1.2.md) 卡片创建、覆盖一个角色 genome，这样自己编写角色的下游服务器就不必直接写 `engine.persona_genomes`。这两条路由不做归属检查：请求里没有用户，归属由调用方自己负责。即使部署没有启用任何导出和抹除，它们也能用。
 - **健康探針：** `GET /healthz` 返 200，響應 `{ status: "ok", service, version, timestamp }`。把這個接到平台的健康檢查上。
 - **OpenAPI / Scalar：** `GET /docs` 提供實時的 Scalar 參考。原始 OpenAPI JSON 不走 HTTP——用 `print-openapi` 子命令导出。
 - **给前端的好感度：** `GET /bff/v1/comp/affinity/{session_id}` 返回读时刷新过的绝对向量，`.../event` 返回逐轮 delta 加该轮结束时的状态；`GET /bff/v1/comp/affinities/{user_id}` 是第一条的列表形态 —— 一次分页往返拿到该用户所有伴侣刷新后的值，给渲染会话列表的客户端用。三条都做 JWT + ownership 检查、都常驻——`v1.3.1` 起 `EXPOSE_AFFINITY_DEBUG` 开关和它挡着的 debug 路由都已删除。见 [migrating/v1-3-1-affinity-4-0.md](migrating/v1-3-1-affinity-4-0.md)。

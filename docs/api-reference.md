@@ -459,8 +459,8 @@ chars. Violations return `400 BadRequest` as a pre-stream error.
 **Optional: action.** The body may include `action` — something the user does to
 the persona besides talking. The persona accepts it or not; a refusal costs the
 relationship one tier on each line the action touches (`give`, `gift`, the thrill together actions
-and the outdoor `jog_together`, `hike_together`, `fish_together`, `cycle_together` and
-`ride_horse_together` → bond; `streak_together`, `hike_naked_together`,
+and the outdoor `jog_together`, `hike_together`, `ski_together`, `fish_together`, `cycle_together` and
+`ride_horse_together` → bond; `streak_together`, `hike_naked_together`, `ski_naked_together`,
 `ride_horse_naked_together` and a `sex_together` with a `name` → bond and chemistry; every other
 physical or custom action → chemistry), and a refused `tip`, `bluff`, `threaten`, `trick`, `challenge`, `bet`, `propose` or `break_up` costs nothing, as does a together action her world rules out or her period refuses (see
 [affinity-model.md](affinity-model.md#refused-actions)).
@@ -468,7 +468,8 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 | `type` | fields |
 |---|---|
 | `give` | `item`: one of the categories below (required); `name`: optional, 1–32 chars; `quantity`: optional, 1–99, default 1 |
-| `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_massage`, `ask_dancing`, `photo`, `strip`, `shower_together`, `bath_together`, `sauna_together`, `toilet_together`, `smoke_together`, `fall_asleep_together`, `walk_together`, `smoke_weed_together`, `jog_together`, `yoga_together`, `stargaze_together`, `ride_horse_together`, `streak_together`, `drink_together`, `hot_spring_together`, `fight_together`, `workout_together`, `swim_together`, `cycle_together`, `hike_together`, `dance_together`, `adventure_together`, `play_with_fire_together`, `sing_together`, `skinny_dip_together`, `commit_crime_together`, `fish_together`, `ride_horse_naked_together`, `yoga_naked_together`, `hike_naked_together`, `hot_spring_naked_together`, `dance_naked_together`, `massage_together`, `massage_naked_together` | none |
+| `kiss`, `hug`, `touch`, `lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_massage`, `photo`, `strip`, `ask_strip`, `shower_together`, `bath_together`, `sauna_together`, `toilet_together`, `smoke_together`, `fall_asleep_together`, `walk_together`, `smoke_weed_together`, `jog_together`, `yoga_together`, `stargaze_together`, `ride_horse_together`, `streak_together`, `drink_together`, `hot_spring_together`, `fight_together`, `workout_together`, `swim_together`, `scuba_dive_together`, `surf_together`, `cycle_together`, `hike_together`, `ski_together`, `adventure_together`, `play_with_fire_together`, `sing_together`, `skinny_dip_together`, `free_dive_together`, `surf_naked_together`, `commit_crime_together`, `fish_together`, `ride_horse_naked_together`, `yoga_naked_together`, `hike_naked_together`, `ski_naked_together`, `hot_spring_naked_together`, `massage_together`, `massage_naked_together` | none |
+| `ask_dancing`, `dance_together`, `dance_naked_together` | both optional: `style`, which dance: one of `ballroom`, `courtly`, `sexy`, `tiktok`, `house`, `hiphop`, `flamenco`, `oriental`, `indian`, `arabic`, `ballet`, `jazz`, `latin`, `tango`, `cossack`, `austronesian`, `indigenous`, `african`, `kpop`, `pole`, `folk`, `contemporary`, `geisha`, or `custom`; `name`: the dance in the user's own words, 1–32 chars after trimming, required with `style: "custom"` and refused with any other style or none |
 | `sex_together` | all optional: `name`, the act, 1–100 chars after trimming, or `name_base64`, the same as base64 (STANDARD) of UTF-8 text, not both; `active`: `user` \| `persona`; `remain_clothing`: `false` (default) \| `true` \| `{"active": …, "passive": …}`, each side `full_naked` \| `half_naked` \| `{"custom": "…"}` \| `{"custom_base64": "…"}`, custom text bounded and decoded as `name`; `ignore_orientation`: `false` (default) \| `true` (the passion group, below) |
 | `bluff`, `threaten`, `trick`, `challenge`, `bet` | none |
 | `propose`, `break_up` | none |
@@ -478,16 +479,16 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 | `gift` | `kind`: `item` \| `clothing` (required); `name`: required, 1–64 chars |
 | `date` | `duration`: `short` (1 h) \| `mid` (4 h), required; `place`: required, 1–40 chars; `content`: required, 1–120 chars; neither may hold a line break or a control character |
 
-**What `give` hands over.** Consumables linger on the persona (below). Valuables do not, and they do not join her items: `gift` is the action for something she keeps. `cash` is money handed over in person, counted in notes; `tip` is the action that carries an amount. `cuisine` is a proper dish or meal; `food` is something to eat.
+**What `give` hands over.** Consumables linger on the persona (below). Valuables do not, and they do not join her items: `gift` is the action for something she keeps. `cash` is money handed over in person, counted in notes; `tip` is the action that carries an amount. `cuisine` is a proper dish or meal; `food` is something to eat. `dessert` is something sweet; `soup` is a bowl of soup.
 
 | group | `item` (unit) |
 |---|---|
-| consumable | `cigarette` (支), `alcohol` (杯), `medicine` (片), `food` (份), `soft_drink` (瓶), `tea` (杯), `coffee` (杯), `herb` (包), `cuisine` (道) |
+| consumable | `cigarette` (支), `alcohol` (杯), `medicine` (片), `food` (份), `soft_drink` (瓶), `tea` (杯), `coffee` (杯), `herb` (包), `cuisine` (道), `dessert` (份), `soup` (碗) |
 | valuable | `watch` (块), `gem` (颗), `gold` (块), `camera` (台), `cash` (张), `antique` (件), `artwork` (件), `handmade` (份), `credit_card` (张), `flower` (朵), `jewelry` (件), `car` (辆), `motorcycle` (辆), `boat` (艘), `horse` (匹) |
 
 **Lingering effects of a `give`.** An accepted consumable keeps affecting the persona on the next `min(quantity, 5)` text turns of the session; the turn that accepts it is not one of them. Each turn the persona is at one step of a curve, at a level from 1 to 4:
 
-| turns | front: `cigarette`, `food`, `soft_drink`, `tea`, `cuisine` | back: `alcohol` | middle: `medicine`, `coffee`, `herb` |
+| turns | front: `cigarette`, `food`, `soft_drink`, `tea`, `cuisine`, `dessert`, `soup` | back: `alcohol` | middle: `medicine`, `coffee`, `herb` |
 |---|---|---|---|
 | 1 | 3 | 1 | 3 |
 | 2 | 3 1 | 1 3 | 3 3 |
@@ -498,15 +499,21 @@ physical or custom action → chemistry), and a refused `tip`, `bluff`, `threate
 
 A turn is a user message of the text session or of one of its dates' sub-sessions; product-QA messages and voice calls do not count, and there is no time limit. The state reaches the judge, the reply prompt and the image composer, and the caller through the `body_state` frame and [`GET /v2/comp/session/{session_id}/effects`](#get-v2compsessionsession_ideffects). A refused give has no effect. An accepted `smoke_together`, `smoke_weed_together` or `drink_together` lingers as a give of one `cigarette`, `herb` or `alcohol`, with no `name`. Design: [lingering effects spec](superpowers/specs/2026-10-12-given-item-lingering-effects-design.md), [give categories spec](superpowers/specs/2026-10-13-give-categories-design.md).
 
-**A give of something she does not use.** The persona's `art_metadata.smoking`, `alcoholic`, `drug`, `coffee` and `gluttony` say whether she smokes, drinks, uses weed, drinks coffee and loves good food (table [below](#post-v2compsessionsession_idevents)). A `give` of `cigarette`, `alcohol`, `herb`, `coffee` or `cuisine` whose key is `false` is rolled once before the judge runs. One time in three the turn goes on as usual. Otherwise the response is `refuse`, whatever the judge answers and with or without the LLM judge: the `action_response` frame and the `response` the history routes return say `refuse`, the give leaves no effect, and it costs the bond line a tier like any refused give. The judge is told the outcome (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)). A `smoke_together`, `smoke_weed_together` or `drink_together` is rolled the same way, as a give of one `cigarette`, `herb` or `alcohol`; its refusal costs the chemistry line a tier, not bond. A key that is `true` or absent never rolls, nor does any other item or action.
+**A give of something she does not use.** The persona's `art_metadata.smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` and `sugar` say whether she smokes, drinks, uses weed, drinks coffee, loves good food and has a sweet tooth, and `art_metadata.diet` whether she is on a diet (table [below](#post-v2compsessionsession_idevents)). A `give` of `cigarette`, `alcohol`, `herb`, `coffee`, `cuisine` or `dessert` whose key is `false`, and a `give` of `food`, `cuisine` or `dessert` to a persona whose `diet` is `true`, is rolled once before the judge runs. One time in three the turn goes on as usual. Otherwise the response is `refuse`, whatever the judge answers and with or without the LLM judge: the `action_response` frame and the `response` the history routes return say `refuse`, the give leaves no effect, and it costs the bond line a tier like any refused give. The judge is told the outcome (see [model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)). A `smoke_together`, `smoke_weed_together` or `drink_together` is rolled the same way, as a give of one `cigarette`, `herb` or `alcohol`; its refusal costs the chemistry line a tier, not bond. A habit key that is `true` or absent never rolls, nor does a `diet` that is `false` or absent, nor any other item or action; a `soup` never rolls.
 
 **Social actions.** For `bluff`, `threaten` and `trick` the response says whether she falls for it: `accept` is 信了, 被吓到了 or 上当了, and `refuse` is 没信, 没吃这一套 or 识破了. For `challenge` and `bet` it says whether she takes the user up on it: `accept` is 应战了 or 答应打这个赌, and `refuse` is 没应战 or 没答应. No winner is decided; what the challenge or the bet is, the user says in the message. As for every action, an undecided response is `accept`. Seeing through one, or turning one down, costs nothing; the affinity judge grades the turn as it grades any other.
 
 **Strip.** `strip` is the user undressing her, and only a romance-compatible pair can have it accepted: a chemistry axis in `affinity_scope` on this turn, whatever `memory_scope` says. Any other pair's `strip` is refused before the judge runs, whatever it answers and with or without the LLM judge, and drops the chemistry line a tier like any refused physical action. An accepted `strip` undresses her this turn: her clothing reads 衣服被对方脱掉了, or 「{outfit}」被对方脱掉了 over a named `outfit`, in her reply and in the picture. With image capability it comes back as her picture, like a photo (below).
 
+**Asking her to strip.** `ask_strip` is the passive form of `strip`: the user asks her to undress, and she does it herself. Every rule is `strip`'s: refused before the judge for a pair that is not romance-compatible, decided by the judge otherwise, a refusal dropping chemistry, her picture on an accept. Accepted, how far she goes is set by the pair's chemistry tier, and reads as her clothing this turn, in her reply and in the picture: tier 1 自己脱了外套 (over a named `outfit`, 自己脱了外套，里面还穿着「{outfit}」), tier 2 自己脱到只剩内衣, tier 3 自己脱到只剩内裤，上身用手遮着 (自己脱到只剩内裤 for a persona who is not female), tier 4 自己全脱了，用手遮着, tier 5 自己全脱了，不遮不掩. The next turn she is dressed as usual. The judge is told what a yes means at that tier ([model-config.md](model-config.md#taskspde_decision--opt-in-llm-pde-judge)).
+
+**Dance styles.** `ask_dancing`, `dance_together` and `dance_naked_together` may say which dance, with `style` (and `name` for `custom`). The style is wording only: it is named to the judge and to her (想和你一起跳探戈, 想看你跳「机械舞」), on the dance's event while it lasts and in the picture's state, and it changes no rule. The history routes return `style` and `name` as sent. The style's words are in [life-events-needs.md](life-events-needs.md#dance-styles).
+
+**What she loves and dislikes.** Three card keys, `art_metadata.dance`, `naturism` and `risky` (each `"love"`, `"neutral"` or `"dislike"`), are rolled once before the judge on the actions they read: `dance` on `ask_dancing` and `dance_together`, `naturism` on every naturism together action, `risky` on every thrill together action and on `bet`. With `love` she accepts two times in three, whatever the judge answers; with `dislike` she refuses two times in three, as a give of something she does not use is refused, and the refusal costs what any refusal of that action costs. The rest of the time, and with `neutral` or no key, the judge decides. A rule that refuses before the judge (a pair that is not romance-compatible, her world, her period, her status) comes first. See [life-events-needs.md](life-events-needs.md#what-she-loves-and-dislikes).
+
 **Passion gestures.** `french_kiss`, `tease`, `lick`, `touch` and `ask_massage` (the user asks her to give them a massage) carry the passion attribute. One from a pair that is not romance-compatible, by the same test as `strip`'s, is refused before the judge runs, whatever it answers and with or without the LLM judge, and drops the chemistry line a tier like any refused physical action; nothing takes it past that gate. Accepted, her reply may be `erotic` (below). None of them places an event or is a picture turn. The rules are in [life-events-needs.md](life-events-needs.md#the-passion-attribute).
 
-**Together actions.** `shower_together`, `bath_together` and `sauna_together` ask her to shower, bathe or take a sauna with the user, and thirty-two more ask her to do something else with the user (table below); `custom_together` asks her to do something the user names (below). Each is in a group (general, naturism, thrill or passion), and the group decides what a refusal costs, whether her reply is `emotional`, whether a chemistry drop ends the event and what her picture wears ([together-action groups](life-events-needs.md#together-action-groups)). The judge decides. A refusal drops bond for a thrill action (`adventure_together`, `commit_crime_together`, `play_with_fire_together`, `fight_together`) and for `jog_together`, `hike_together`, `fish_together`, `cycle_together` and `ride_horse_together`; bond and chemistry for their naturism counterparts `streak_together`, `hike_naked_together` and `ride_horse_naked_together`, and for a `sex_together` with a `name`; chemistry for every other together action. A `sex_together` from a pair that is not romance-compatible, as for `strip`, unless it says `ignore_orientation: true`, and a `toilet_together` to a machine persona (`art_metadata.species` `"robot"` or `"android"`), are refused before the judge runs, whatever it answers and with or without the LLM judge. So is a together action whose event does not fit the persona's world: a `fight_together` to a persona whose `art_metadata.setting` is not `"fantasy"` (absent reads `"modern"`), and a `cycle_together` to one whose setting is `"fantasy"`; that refusal drops no line. The others, the naturism actions included, have no such rule: naturism is not a romantic act, so the judge decides them for any pair, and without the LLM judge, or when its call fails, they are accepted. During her period ([her cycle](life-events-needs.md#her-cycle)), a `sex_together`, or a together action that happens in water (`swim_together`, `hot_spring_together`, `sauna_together`, `shower_together`, `bath_together`, `skinny_dip_together`, `hot_spring_naked_together`), that these rules did not refuse is rolled before the judge: two times in three it is refused, whatever the judge answers and with or without the LLM judge, and that refusal drops no line; otherwise the judge decides as on any day. An accepted one puts her in an event, written with her stored answer in one transaction and keyed on the user's message, so a re-driven turn places it once:
+**Together actions.** `shower_together`, `bath_together` and `sauna_together` ask her to shower, bathe or take a sauna with the user, and thirty-eight more ask her to do something else with the user (table below); `custom_together` asks her to do something the user names (below). Each is in a group (general, naturism, thrill or passion), and the group decides what a refusal costs, whether her reply is `emotional`, whether a chemistry drop ends the event and what her picture wears ([together-action groups](life-events-needs.md#together-action-groups)). The judge decides. A refusal drops bond for a thrill action (`adventure_together`, `commit_crime_together`, `play_with_fire_together`, `fight_together`) and for `jog_together`, `hike_together`, `ski_together`, `fish_together`, `cycle_together` and `ride_horse_together`; bond and chemistry for their naturism counterparts `streak_together`, `hike_naked_together`, `ski_naked_together` and `ride_horse_naked_together`, and for a `sex_together` with a `name`; chemistry for every other together action. A `sex_together` from a pair that is not romance-compatible, as for `strip`, unless it says `ignore_orientation: true`, and a `toilet_together` to a machine persona (`art_metadata.species` `"robot"` or `"android"`), are refused before the judge runs, whatever it answers and with or without the LLM judge. So is a together action whose event does not fit the persona's world: a `fight_together` to a persona whose `art_metadata.setting` is not `"fantasy"` (absent reads `"modern"`), and a `cycle_together` to one whose setting is `"fantasy"`; that refusal drops no line. The others, the naturism actions included, have no such rule: naturism is not a romantic act, so the judge decides them for any pair, and without the LLM judge, or when its call fails, they are accepted. During her period ([her cycle](life-events-needs.md#her-cycle)), a `sex_together`, or a together action that happens in water (`swim_together`, `scuba_dive_together`, `surf_together`, `hot_spring_together`, `sauna_together`, `shower_together`, `bath_together`, `skinny_dip_together`, `free_dive_together`, `surf_naked_together`, `hot_spring_naked_together`), that these rules did not refuse is rolled before the judge: two times in three it is refused, whatever the judge answers and with or without the LLM judge, and that refusal drops no line; otherwise the judge decides as on any day. An accepted one puts her in an event, written with her stored answer in one transaction and keyed on the user's message, so a re-driven turn places it once:
 
 | action | event | lasts |
 |---|---|---|
@@ -529,18 +536,24 @@ A turn is a user message of the text session or of one of its dates' sub-session
 | `fight_together` | `fighting_together` | 1–2 h |
 | `workout_together` | `working_out_together` | 1 h |
 | `swim_together` | `swimming_together` | 1 h |
+| `scuba_dive_together` | `scuba_diving_together` | 1 h |
+| `surf_together` | `surfing_together` | 1 h |
 | `cycle_together` | `cycling_together` | 1 h |
 | `hike_together` | `hiking_together` | 2–3 h |
+| `ski_together` | `skiing_together` | 2–3 h |
 | `dance_together` | `dancing_together` | 1 h |
 | `adventure_together` | `adventuring_together` | 2–3 h |
 | `play_with_fire_together` | `playing_with_fire_together` | 1 h |
 | `sing_together` | `singing_together` | 1 h |
 | `skinny_dip_together` | `skinny_dipping_together` | 1 h |
+| `free_dive_together` | `free_diving_together` | 1 h |
+| `surf_naked_together` | `naked_surfing_together` | 1 h |
 | `commit_crime_together` | `committing_crime_together` | 1 h |
 | `fish_together` | `fishing_together` | 2–3 h |
 | `ride_horse_naked_together` | `naked_horse_riding_together` | 1 h |
 | `yoga_naked_together` | `naked_yoga_together` | 1 h |
 | `hike_naked_together` | `naked_hiking_together` | 2–3 h |
+| `ski_naked_together` | `naked_skiing_together` | 2–3 h |
 | `hot_spring_naked_together` | `naked_hot_spring_together` | 1 h |
 | `dance_naked_together` | `naked_dancing_together` | 1 h |
 | `massage_together` | `massaging_together` | 30 min |
@@ -549,15 +562,15 @@ A turn is a user message of the text session or of one of its dates' sub-session
 
 Starting it ends an incident under way and leaves a background going. None takes her offline: she answers during `asleep_together` too. Accepted inside a date, it places nothing: the date's `on_a_date` is left alone and the date goes on. The event shows as `event` on [`GET …/effects`](#get-v2compsessionsession_ideffects) while it lasts. With image capability the accepted turn comes back as her picture (below), and the picture shows the event. An accepted `smoke_together`, `smoke_weed_together` or `drink_together` also counts as a `give` of one `cigarette`, `herb` or `alcohol` for the habit roll (above), the needs it moves and its lingering effect (above), and for nothing else: a refusal drops chemistry, not bond. The rules are in [life-events-needs.md](life-events-needs.md#showering-bathing-and-the-sauna-together).
 
-**Together, in the user's own words.** `custom_together` carries a `text` and asks her to do that with the user. Nothing rules it out before the judge, and a refusal drops chemistry. Accepted, it places a `custom_together` event whose `message_id` is the user's message that asked, where an event she tells names hers. The words are read from that message (`metadata.action.text`) and kept nowhere else: the event view carries them as `text` (below), and her state block and a picture's `[此刻状态]` print them as 和对方一起：「{text}」. Without the message, `text` is `null` and the label reads 和对方一起做一件事. A client that fetches a message or an image request by an event's `message_id` skips this kind.
+**Together, in the user's own words.** `custom_together` carries a `text` and asks her to do that with the user. Nothing rules it out before the judge, and a refusal drops chemistry. Accepted, it places a `custom_together` event whose `message_id` is the user's message that asked, where an event she tells names hers. A `dancing_together` or `naked_dancing_together` event points at the user's message the same way, and its `text` is the words of the dance's style (`null` for a dance without one). The words are read from that message (`metadata.action.text`) and kept nowhere else: the event view carries them as `text` (below), and her state block and a picture's `[此刻状态]` print them as 和对方一起：「{text}」. Without the message, `text` is `null` and the label reads 和对方一起做一件事. A client that fetches a message or an image request by an event's `message_id` skips this kind.
 
 **The passion group.** `sex_together` alone is in it. Its fields are all optional and reach the prompts and her picture, nothing else: `name` (or `name_base64`) names the act, `active` says who leads, `remain_clothing` what each side still wears. A refused `sex_together` with a `name` drops bond and chemistry, one without drops chemistry. The engine ships no act names; the client passes its own with each request, and an example such as `{"type": "sex_together", "name": "姿势甲"}` uses a placeholder. `name` and `name_base64` together, base64 that does not decode, decoded bytes that are not UTF-8, or a name or custom text outside 1–100 characters after decoding is a `422`, as is an unknown key inside the `remain_clothing` object. `ignore_orientation: true` takes the ask past the romance gate (the judge still decides); it is meant for debugging and changes no cost. Without `active`, a male `user_gender` with a female persona has the user lead, a female one with a male persona has the persona lead, and the user leads otherwise. The judge and the reply read the marker 想和你上床, or 想和你上床：「{name}」 with a name. On a 1:1 chat picture the act is the `[此刻状态]` label (和对方上床：「{name}」), her side of `remain_clothing` is her `[此刻穿着]`, and a `[亲密]` section names who leads and what the user wears; group and event pictures read 什么都没穿 and the plain label. The action is stored on the user row as any action is, and an accepted one's `having_sex_together` event has that user message as its `message_id`, so later pictures in the event read the same act. Both history routes return the act as `name_base64` and custom clothing as `custom_base64`, never in plain text, whatever the request sent; the event view carries no act (`text` is `null`). The rules are in [life-events-needs.md](life-events-needs.md#the-passion-group).
 
-**An intimate event can end early.** Every naturism kind (`showering_together`, `bathing_together`, `streaking_together`, `skinny_dipping_together`, `naked_horse_riding_together`, `naked_yoga_together`, `naked_hiking_together`, `naked_hot_spring_together`, `naked_dancing_together`, `naked_massaging_together`) and `having_sex_together`, whoever asked for them, end when the chemistry tier falls from something the user did after the event started: a refused action, a graded turn that carries chemistry across a tier edge, or her ask that the user declines. Its `ends_at` becomes that moment. Nothing is told and no message is written; a background and her cycle go on. A fall that time decay alone made, the turn that placed the event, an earlier turn whose write lands late, a bond drop, a turn inside a date and a date's settlement end nothing. A client that scheduled anything on one of these events' `ends_at` re-reads events after a turn ([`GET …/effects`](#get-v2compsessionsession_ideffects)).
+**An intimate event can end early.** Every naturism kind (`showering_together`, `bathing_together`, `streaking_together`, `skinny_dipping_together`, `free_diving_together`, `naked_surfing_together`, `naked_horse_riding_together`, `naked_yoga_together`, `naked_hiking_together`, `naked_skiing_together`, `naked_hot_spring_together`, `naked_dancing_together`, `naked_massaging_together`) and `having_sex_together`, whoever asked for them, end when the chemistry tier falls from something the user did after the event started: a refused action, a graded turn that carries chemistry across a tier edge, or her ask that the user declines. Its `ends_at` becomes that moment. Nothing is told and no message is written; a background and her cycle go on. A fall that time decay alone made, the turn that placed the event, an earlier turn whose write lands late, a bond drop, a turn inside a date and a date's settlement end nothing. A client that scheduled anything on one of these events' `ends_at` re-reads events after a turn ([`GET …/effects`](#get-v2compsessionsession_ideffects)).
 
-**What she wears in the water.** While a picture's state holds a naturism kind, `having_sex_together`, `swimming_together`, `hot_spring_together` or `sauna_together`, the engine writes the composer's `[此刻穿着]` itself, over the judge's `clothing` and a named `outfit`: 什么都没穿 for a naturism kind and for sex (a 1:1 chat picture of sex reads the act's clothing instead); in a swim or a hot spring, a swimsuit that follows the persona's `art_metadata.gender`, the pair's romance compatibility, her virginity and the chemistry tier, nothing on from chemistry 0.95; in a sauna, a towel, 身上只松松地裹着一条浴巾 for a romance-compatible pair and 身上只裹着一条浴巾 otherwise, which a hot spring also wears when her gender is neither `female` nor `male`. The table is in [life-events-needs.md](life-events-needs.md#what-she-wears-in-the-water). The pair is read from the request's own scopes: the turn's `affinity_scope`, a group speaker's `member_scopes`, an event request's `affinity_scope`. The accepted turn's own picture counts, and so does a picture drawn in a date, where the kind is her state for that turn only. Her reply's clothing line and her wardrobe are not touched, and no other kind is ([the composer](model-config.md#taskschat_image_prompt_compose--image-prompt-composer-required-for-image-turns)).
+**What she wears in the water.** While a picture's state holds a naturism kind, `having_sex_together`, `swimming_together`, `scuba_diving_together`, `surfing_together`, `hot_spring_together` or `sauna_together`, the engine writes the composer's `[此刻穿着]` itself, over the judge's `clothing` and a named `outfit`: 什么都没穿 for a naturism kind and for sex (a 1:1 chat picture of sex reads the act's clothing instead); in a swim or a hot spring, a swimsuit that follows the persona's `art_metadata.gender`, the pair's romance compatibility, her virginity and the chemistry tier, nothing on from chemistry 0.95; in a sauna, a towel, 身上只松松地裹着一条浴巾 for a romance-compatible pair and 身上只裹着一条浴巾 otherwise, which a hot spring also wears when her gender is neither `female` nor `male`. The table is in [life-events-needs.md](life-events-needs.md#what-she-wears-in-the-water). The pair is read from the request's own scopes: the turn's `affinity_scope`, a group speaker's `member_scopes`, an event request's `affinity_scope`. The accepted turn's own picture counts, and so does a picture drawn in a date, where the kind is her state for that turn only. Her reply's clothing line and her wardrobe are not touched, and no other kind is ([the composer](model-config.md#taskschat_image_prompt_compose--image-prompt-composer-required-for-image-turns)).
 
-**Bed and a proposal.** `sex_together`, `fall_asleep_together` and `propose` ask her to bed, to fall asleep together and to marry the user: her own `sleep_together`, `fall_asleep_together` and `propose` asks ([life choices](#post-v2compsessionsession_idlife-choiceschoice_id)) made the other way round. Once she has accepted the user's `sex_together` in a session, or in a date of it, she never asks `sleep_together` in that session herself, and once she has accepted the user's `fall_asleep_together`, never `fall_asleep_together`; a refused one settles nothing, and an ask of hers already pending stays as it is. While the pair is in the water or in bed (a `swimming_together`, `hot_spring_together`, `sauna_together`, `showering_together`, `bathing_together`, `skinny_dipping_together`, `naked_hot_spring_together` or `having_sex_together` under way) she asks neither `sleep_together` nor `bathe_together`: nothing is settled and no cooldown starts, so the next judged turn after it ends may ask. An accepted `sex_together` outside a date places `having_sex_together`, which ends her virginity as the draw sees it ([events](#post-v2compsessionsession_idevents)). The user may ask any of them again; the judge decides each time.
+**Bed and a proposal.** `sex_together`, `fall_asleep_together` and `propose` ask her to bed, to fall asleep together and to marry the user: her own `sleep_together`, `fall_asleep_together` and `propose` asks ([life choices](#post-v2compsessionsession_idlife-choiceschoice_id)) made the other way round. Once she has accepted the user's `sex_together` in a session, or in a date of it, she never asks `sleep_together` in that session herself, and once she has accepted the user's `fall_asleep_together`, never `fall_asleep_together`; a refused one settles nothing, and an ask of hers already pending stays as it is. While the pair is in the water or in bed (a `swimming_together`, `scuba_diving_together`, `surfing_together`, `hot_spring_together`, `sauna_together`, `showering_together`, `bathing_together`, `skinny_dipping_together`, `free_diving_together`, `naked_surfing_together`, `naked_hot_spring_together` or `having_sex_together` under way) she asks neither `sleep_together` nor `bathe_together`: nothing is settled and no cooldown starts, so the next judged turn after it ends may ask. An accepted `sex_together` outside a date places `having_sex_together`, which ends her virginity as the draw sees it ([events](#post-v2compsessionsession_idevents)). The user may ask any of them again; the judge decides each time.
 
 **The relationship status.** `propose` and `break_up` move the pair's [relationship status](affinity-model.md#relationship-status). Neither is a together action: they place no event and are not picture turns (a picture the judge chose still goes out), and a refusal drops no line. Before the judge, `propose` is refused unless the status is `dating`, `fwb` or `situationship`, and `break_up` unless the status is breakable (`dating`, `partner`, `fwb`, `situationship`, `engaged`): whatever the judge answers and with or without the LLM judge, the response is `refuse` and nothing changes. Otherwise the judge decides. An accepted `propose` makes the pair `engaged`. For `break_up` the response says whether she agrees to it, 同意分手 or 不同意分手: accepted, the pair is `ex` and a cold war ends; refused, the status stays and a cold war starts unless one is on. The status moves when the answer is stored, on this session, or on a date on the session the invitation was sent in; the snapshot routes then report it. On a BYOC instance no status moves: `propose` goes to the judge from any status and moves nothing, and `break_up` is always refused.
 
@@ -565,9 +578,9 @@ Starting it ends an incident under way and leaves a background going. None takes
 
 **Emotional replies.** While the deployment has
 [`tones.emotional`](model-config.md#tones--chat-tones-chat-task-only) above 0, a turn carrying
-`french_kiss`, `tease`, `hug_from_behind`, `touch`, `strip`, a naturism or passion together action
-(`shower_together`, `bath_together`, `streak_together`, `skinny_dip_together`,
-`ride_horse_naked_together`, `yoga_naked_together`, `hike_naked_together`,
+`french_kiss`, `tease`, `hug_from_behind`, `touch`, `strip`, `ask_strip`, a naturism or passion together action
+(`shower_together`, `bath_together`, `streak_together`, `skinny_dip_together`, `free_dive_together`, `surf_naked_together`,
+`ride_horse_naked_together`, `yoga_naked_together`, `hike_naked_together`, `ski_naked_together`,
 `hot_spring_naked_together`, `dance_naked_together`, `massage_naked_together`, `sex_together`),
 `propose`, `break_up`, `threaten` or `tip` is answered in
 the `emotional` tone, accepted or refused: the reply is written from the persona, the action and
@@ -575,7 +588,7 @@ her response, without the chat history, the user profile or the affinity conclus
 response itself is decided as above. The reply's rows carry `metadata.tone = "emotional"`. A
 turn without an action may draw a tone instead
 ([tones](model-config.md#tones--chat-tones-chat-task-only)); its assistant rows carry
-`metadata.tone` (`"erotic"`, `"emotional"`, `"focused"` or `"default"`) only when a draw was made.
+`metadata.tone` (`"mean"`, `"drowsy"`, `"erotic"`, `"emotional"`, `"focused"` or `"default"`) only when a draw was made.
 
 **Erotic replies.** While the deployment has
 [`tones.erotic`](model-config.md#tones--chat-tones-chat-task-only) above 0, her reply to a
@@ -586,6 +599,14 @@ also told who the user is to her. So may her reply to a passion gesture she acce
 persona whose `sex_addict` is `true`. The pair has to be romantically compatible on that message's
 `affinity_scope`, so the answer to her ask should carry the scope the chat turns carry. Such a
 message's rows carry `metadata.tone = "erotic"`.
+
+**Mean and drowsy replies.** Two more tones apply to a turn without an action. While the
+deployment has [`tones.mean`](model-config.md#tones--chat-tones-chat-task-only) above 0 and the
+pair's [cold war](affinity-model.md#the-cold-war) is on, her reply may be written in the `mean` tone:
+the default reply, kept short, with an edge. While it has `tones.drowsy` above 0, her first text
+reply after an `asleep_together` or `having_sex_together` event ended may be written in the
+`drowsy` tone: she just woke beside the user, and answers without the chat history. The rows carry
+`metadata.tone = "mean"` or `"drowsy"`.
 
 **A date.** `date` asks her out. An engine gate runs first: none for `short`,
 bond at tier 2 for `mid`, and never while she is offline or on another date; a
@@ -757,7 +778,7 @@ data: {"type":"image_request","message_id":"01J...","composed_prompt":"5YaZ5a6e.
 - `ghost`: `meta(action_type=ghost) → done → final` — no `delta`, no `model` in `meta`, `usage` and `generation_id` are `null` in `done`. The companion stayed silent this turn; no chat model was called.
 - reasoning: when the judge returned reasoning, `reasoning*` precedes every shape in this list, ahead of `action_response` and `body_state`: `reasoning* → meta(reply) → delta* → done → final`
 - action turn: the same shapes with `action_response` ahead of the first `meta` — `action_response → meta(reply) → delta* → done → final`; never `ghost` or `product_qa`
-- an accepted `photo`, `strip`, `ask_dancing` or together action with image capability: `action_response → meta(reply_text_image) → delta* → done → image_request → final`
+- an accepted `photo`, `strip`, `ask_strip`, `ask_dancing` or together action with image capability: `action_response → meta(reply_text_image) → delta* → done → image_request → final`
 - an accepted `date`: `action_response → meta(reply) → delta* → done → final`, with `activity` on `final`
 - a turn with lingering effects or known needs: `body_state` sits ahead of the first `meta`, after `action_response` when both are sent — e.g. `action_response → body_state → meta(reply) → delta* → done → final`
 - `product_qa`: `meta(action_type=product_qa) → delta* → done → final` — same shape as a normal text reply, streamed by an independent model chain (`[tasks.chat_product_qa]`) instead of `chat_companion`; persisted with `channel='product_qa'` and reported as `product_qa` again on replay.
@@ -1202,7 +1223,7 @@ How the draw works and how events and the persona's needs fit together is in
 | Field | Rules |
 |---|---|
 | `event_key` | required: 1–128 characters of `[A-Za-z0-9_.:-]`, scoped to the session. The same key returns the same event |
-| `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422`, and so is `taking_space`, `fell_out`, `traveling_together`, `bathing_together`, `on_a_date`, `showering_together`, `sauna_together`, `custom_together` or any of the twenty-four kinds the other together actions place: the engine places those itself and never draws them |
+| `kinds` | optional. Absent or `null`: every kind. An array allows the listed kinds (`[]`: nothing is drawn). An object `{"allow": […], "disallow": […]}` allows what `allow` lists (absent or `null`: every kind; `[]`: none) minus what `disallow` lists; a kind in both is not drawn, and `{}` allows every kind. An unknown key in the object or an unknown kind is a `422`, and so is `taking_space`, `fell_out`, `traveling_together`, `bathing_together`, `on_a_date`, `showering_together`, `sauna_together`, `custom_together` or any of the thirty-eight kinds the other together actions place: the engine places those itself and never draws them |
 | `user_timezone`, `user_country`, `user_region`, `tier`, `prompt_traits`, `memory_scope`, `affinity_scope`, `audit` | as on `/open`, for generating the message |
 | `image` | optional: `{"style", "aspect_ratio", "prompt_variant"}`, each as on a chat turn's `image` (no `force`; an unsupported `aspect_ratio` is a `422`). The caller handles images: a `taking_selfie` or `strip` message then carries her picture, when `[tasks.chat_image_prompt_compose]` is configured (below). Absent, or no composer: words only. Every other kind ignores it |
 | `outfit` | optional: what she wears, as on a chat turn — typically one of her wardrobe entries, not checked against it; 1–64 characters after trim, blank reads as absent, longer is a `422`. Her words follow it, and so does her picture. On a `strip` she has just taken it off: 刚把「{outfit}」脱了, or 刚把衣服脱了 without one. Absent: no outfit in her prompt, and the composer dresses her from the scene |
@@ -1288,7 +1309,7 @@ which runs beside both ([her cycle](life-events-needs.md#her-cycle)).
 A range is drawn when the event starts. That is 70 drawable kinds. Both genders
 draw both gatherings, at the same weight; that is deliberate.
 
-Forty more kinds are never drawn: `taking_space` (a separation of the retired
+Forty-six more kinds are never drawn: `taking_space` (a separation of the retired
 ask for space, 12–24 h, offline) and `fell_out` (its falling-out, 1 h), which the
 engine no longer writes and which remain only in stored data,
 `traveling_together` (a trip she
@@ -1299,10 +1320,10 @@ suggested and the user agreed to, 48–72 h, a `trip` background, not offline),
 incident, not offline), `showering_together` (a `shower_together` she accepted,
 or her suggested bath turned out a shower, 30 min, a `short` incident, not offline), `sauna_together` (a
 `sauna_together` she accepted, 1 h, a `short` incident, not offline) and the
-thirty-two kinds of the other together actions, from `using_toilet_together` to
+thirty-eight kinds of the other together actions, from `using_toilet_together` to
 `naked_massaging_together` (each one she accepted, `short` incidents but the `mid`
-`asleep_together`, `fighting_together`, `hiking_together`, `adventuring_together`,
-`fishing_together` and `naked_hiking_together`, none offline; lengths in the
+`asleep_together`, `fighting_together`, `hiking_together`, `skiing_together`, `adventuring_together`,
+`fishing_together`, `naked_hiking_together` and `naked_skiing_together`, none offline; lengths in the
 [together actions](#post-compchatsession_idmessagestream) table; a `having_sex_together` the
 user's `sex_together` placed has the user's message that asked as its `message_id`), and
 `custom_together` (a `custom_together` she accepted, 1 h, a `short` incident, not offline; its
@@ -1319,8 +1340,8 @@ and cannot be listed in `kinds`.
 `sudden_desire`, `strip`, `streaking`, `having_sex`, `just_have_sex`, `masturbating` and `pregnancy_scare`, which implies sex, carry adult themes;
 a caller that serves them only to some users leaves them out with
 `{"disallow": ["sudden_desire", "strip", "streaking", "having_sex", "just_have_sex", "masturbating", "pregnancy_scare"]}`.
-`having_sex_together`, `streaking_together`, `skinny_dipping_together`,
-`naked_horse_riding_together`, `naked_yoga_together`, `naked_hiking_together`,
+`having_sex_together`, `streaking_together`, `skinny_dipping_together`, `free_diving_together`, `naked_surfing_together`,
+`naked_horse_riding_together`, `naked_yoga_together`, `naked_hiking_together`, `naked_skiing_together`,
 `naked_hot_spring_together`, `naked_dancing_together` and `naked_massaging_together` carry them
 too, but only the accepted action that places each does,
 so such a caller does not send those actions. `scolded_by_superior` and
@@ -1408,7 +1429,9 @@ The draw:
   | `employed` | `"free"`, `"part_time"` (default), `"full_time"` | how much of her day is work: `temp_work`, `scolded_by_superior`, `scolded_superior` and `business_trip` come up a third as often / as they are / three times as often within their categories, and a `free` persona never draws `want_to_quit_job`; any other value reads as `part_time`. `full_time` is also career-minded: with [`tones.focused`](model-config.md#tones--chat-tones-chat-task-only) above 0, a turn that may draw a tone, off work and with no incident under way, is answered in the `focused` tone 1 time in 8 ([at work](life-events-needs.md#at-work)) |
   | `outdoorsy` | `"outdoor"`, `"neutral"` (default), `"indoor"` | `outdoor`: the outdoor kinds come up three times as often and the indoor kinds a third as often within their categories; `indoor` the reverse. Kinds that can take her offline are neutral and untouched; the place of each kind is listed in [life-events-needs.md](life-events-needs.md#outdoors-or-in); any other value reads as `neutral` |
   | `setting` | `"modern"` (default), `"fantasy"` | the world she lives in: a `fantasy` persona never draws `police_encounter`, `showering`, `taking_selfie`, `gaming`, `watching_show`, `business_trip`, `hospitalized`, `post_surgery`, `temp_work`, `scolded_superior`, `saw_bag`, `saw_clothes`, `out_shopping`, `want_to_quit_job` or `admiring_art`, whatever `kinds` or `prefer_events` say; a persona that is not `fantasy` refuses the user's `fight_together`, and a `fantasy` one the user's `cycle_together` ([above](#post-compchatsession_idmessagestream)); any other value reads as `modern` |
-  | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee, loves good food: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing, or the together action that takes it (`smoking`: `smoke_together`, `drug`: `smoke_weed_together`, `alcoholic`: `drink_together`) ([above](#post-compchatsession_idmessagestream)); `smoking`, `alcoholic` and `drug` set to `true` let her draw `smoking`, `drinking` and `smoking_weed` |
+  | `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`, `sugar`, `salty`, `spicy` | each `true` / `false` / absent | whether she smokes, drinks, uses weed, drinks coffee, loves good food, has a sweet tooth, a taste for salt, a taste for spice: the more are `true`, the sooner her `indulgence` comes back to `high` and weighs the pick; a `false` key can make her refuse a `give` of that thing (`sugar`: `dessert`; `salty` and `spicy` are the key of no item), or the together action that takes it (`smoking`: `smoke_together`, `drug`: `smoke_weed_together`, `alcoholic`: `drink_together`) ([above](#post-compchatsession_idmessagestream)); `smoking`, `alcoholic` and `drug` set to `true` let her draw `smoking`, `drinking` and `smoking_weed` |
+  | `diet` | `true` / `false` / absent | `true`: she is on a diet, and can refuse a `give` of `food`, `cuisine` or `dessert` ([above](#post-compchatsession_idmessagestream)); it is not a habit and does not move `indulgence` |
+  | `dance`, `naturism`, `risky` | each `"love"` / `"neutral"` (default) / `"dislike"` | how she takes a dance (`ask_dancing`, `dance_together`), a naturism together action, and a thrill together action or a `bet`: `love` accepts two times in three before the judge, `dislike` refuses two times in three ([above](#post-compchatsession_idmessagestream)); no life event reads them |
 
   A value of the wrong shape, an unknown kind or a kind outside `mid` is
   ignored. A preference never lifts a gate.
@@ -1429,9 +1452,10 @@ seconds:
 drawn length. An incident drawn during a background is told from inside it
 (「出差途中遇到一只小猫」). `offline` is `true` for the offline kinds (below)
 and `false` for every other kind. Every event object, here and on `…/effects`, also
-carries `text`: the user's words of a `custom_together` whose asking message still
-exists, `null` for every other kind and once that message is gone. On a
-`custom_together`, and on a `having_sex_together` the user's `sex_together` placed,
+carries `text`: the user's words of a `custom_together`, or the words of the style a
+`dancing_together` or `naked_dancing_together` names, while the asking message still
+exists; `null` for every other kind, for a dance without a style and once that message is
+gone. On a `custom_together`, on a dance event, and on a `having_sex_together` the user's `sex_together` placed,
 `message_id` is the user's message that asked, where on a told kind it is hers; a draw asked
 under such an event's `event_key` returns it with `message: null`.
 
@@ -1477,7 +1501,7 @@ While one lasts, every text turn in any session of the persona ghosts, without
 the judge and without counting towards the ghost streak, and `/open` returns
 `null`. An announced `busy`, `in_battle` or `out_shopping` still ghosts. A turn that carries a
 user `action` (any `type`: `give`, `gift`, `tip`, `kiss`, `hug`, `touch`,
-`lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_massage`, `ask_dancing`, `photo`, `strip`, `shower_together`, `bath_together`, `sauna_together`, `toilet_together`, `smoke_together`, `fall_asleep_together`, `sex_together`, `walk_together`, `smoke_weed_together`, `jog_together`, `yoga_together`, `stargaze_together`, `ride_horse_together`, `streak_together`, `drink_together`, `hot_spring_together`, `fight_together`, `workout_together`, `swim_together`, `cycle_together`, `hike_together`, `dance_together`, `adventure_together`, `play_with_fire_together`, `sing_together`, `skinny_dip_together`, `commit_crime_together`, `fish_together`, `ride_horse_naked_together`, `yoga_naked_together`, `hike_naked_together`, `hot_spring_naked_together`, `dance_naked_together`, `massage_together`, `massage_naked_together`, `custom_together`, `propose`, `break_up`, `bluff`, `threaten`, `trick`, `challenge`, `bet`, `date`, `custom`) or `image.force = true` is the exception: it takes the normal
+`lick`, `french_kiss`, `hug_from_behind`, `tease`, `pat`, `wink`, `blink`, `ask_massage`, `ask_dancing`, `photo`, `strip`, `ask_strip`, `shower_together`, `bath_together`, `sauna_together`, `toilet_together`, `smoke_together`, `fall_asleep_together`, `sex_together`, `walk_together`, `smoke_weed_together`, `jog_together`, `yoga_together`, `stargaze_together`, `ride_horse_together`, `streak_together`, `drink_together`, `hot_spring_together`, `fight_together`, `workout_together`, `swim_together`, `scuba_dive_together`, `surf_together`, `cycle_together`, `hike_together`, `ski_together`, `dance_together`, `adventure_together`, `play_with_fire_together`, `sing_together`, `skinny_dip_together`, `free_dive_together`, `surf_naked_together`, `commit_crime_together`, `fish_together`, `ride_horse_naked_together`, `yoga_naked_together`, `hike_naked_together`, `ski_naked_together`, `hot_spring_naked_together`, `dance_naked_together`, `massage_together`, `massage_naked_together`, `custom_together`, `propose`, `break_up`, `bluff`, `threaten`, `trick`, `challenge`, `bet`, `date`, `custom`) or `image.force = true` is the exception: it takes the normal
 path and is answered, because an action is interaction in person, which needs
 no phone, and a forced image turn is always `reply_image`. The persona goes
 silent this way only where the ghost protection allows it, so with the
@@ -2249,7 +2273,8 @@ The engine speaks nothing itself, and stores no result: synthesise once and keep
 the audio.
 
 Each message is judged from what the engine knows about it: the persona's
-authored prompt, the tone the message was written in (`metadata.tone`), where
+authored prompt, the tone the message was written in (`metadata.tone`; each of
+`emotional`, `erotic`, `focused`, `mean` and `drowsy` has its own sentence), where
 the pair stands (the voice channel's relationship line, read from the session's
 affinity under the scope the message recorded; a date reads its parent
 session's), and the four rows before it. One model call per message; the calls
@@ -2334,7 +2359,7 @@ bearer token and `X-Byoc-Caller-Secret`, which must match the deployment's
 `BYOC_CALLER_SECRET`. Their refusals use the pre-stream body
 `{code, message, user_message}`. The flow, the sealing format and what is
 stored are in [byoc.md](byoc.md); the card format is in
-[eros-character-v1.1.md](eros-character-v1.1.md).
+[eros-character-v1.2.md](eros-character-v1.2.md).
 
 ### `POST /v2/comp/byoc/init`
 
@@ -3406,7 +3431,7 @@ curl -X POST -H "x-user-erase-secret: $USER_ERASE_SECRET" \
 
 ### `POST /svc/v1/genomes`
 
-Create a persona genome from an [eros-character](eros-character-v1.1.md) card, for a downstream server that authors personas, so that it need not write `engine.persona_genomes` itself. Requires `x-genome-write-secret: <GENOME_WRITE_SECRET>` (403 when missing or wrong). No user is on the request and the engine checks no ownership: the caller does its own.
+Create a persona genome from an [eros-character](eros-character-v1.2.md) card, for a downstream server that authors personas, so that it need not write `engine.persona_genomes` itself. Requires `x-genome-write-secret: <GENOME_WRITE_SECRET>` (403 when missing or wrong). No user is on the request and the engine checks no ownership: the caller does its own.
 
 ```bash
 curl -X POST -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: application/json" \
@@ -3414,14 +3439,14 @@ curl -X POST -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: 
         "id": "5b7e0c1a-3d2f-4a6b-9c8d-1e2f3a4b5c6d",
         "card": {
           "spec": "eros-character",
-          "spec_version": "1.1",
+          "spec_version": "1.2",
           "data": { "name": "Aria", "system_prompt": "You are Aria …", "tip_personality": null, "art_metadata": {} }
         }
       }' \
   "http://localhost:8080/svc/v1/genomes"
 ```
 
-`id` is optional. Without it the engine mints one; with it the genome is created under that id. `card` is the whole document, validated by the same function that opens a BYOC card, so `spec` is `"eros-character"`, `spec_version` is `"1"` or `"1.1"`, and `data` holds only `name`, `system_prompt`, `tip_personality` and `art_metadata`. Serialised, it is at most 64 KiB. Any other field in the body is a `400`.
+`id` is optional. Without it the engine mints one; with it the genome is created under that id. `card` is the whole document, validated by the same function that opens a BYOC card, so `spec` is `"eros-character"`, `spec_version` is `"1"`, `"1.1"` or `"1.2"`, and `data` holds only `name`, `system_prompt`, `tip_personality` and `art_metadata`. Serialised, it is at most 64 KiB. Any other field in the body is a `400`.
 
 | Status | Body | When |
 |---|---|---|
@@ -3438,7 +3463,7 @@ Overwrite a persona genome from a card. Requires `x-genome-write-secret: <GENOME
 
 ```bash
 curl -X PUT -H "x-genome-write-secret: $GENOME_WRITE_SECRET" -H "Content-Type: application/json" \
-  -d '{ "card": { "spec": "eros-character", "spec_version": "1.1", "data": { "name": "Aria", "system_prompt": "You are Aria …" } } }' \
+  -d '{ "card": { "spec": "eros-character", "spec_version": "1.2", "data": { "name": "Aria", "system_prompt": "You are Aria …" } } }' \
   "http://localhost:8080/svc/v1/genomes/5b7e0c1a-3d2f-4a6b-9c8d-1e2f3a4b5c6d"
 ```
 

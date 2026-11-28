@@ -1,0 +1,107 @@
+# Eros character card — v1.2
+
+An Eros character card is a JSON document that describes one character. It is
+the plaintext a downstream seals and sends with each request against a
+bring-your-own-character (BYOC) instance; see [byoc.md](byoc.md) for the
+sealing and the routes.
+
+v1.2 has exactly the fields of a persona genome, so a persona seed file
+([`examples/personas/*.toml`](../examples/personas/)) converts to a card field
+for field: the top-level keys go into `data`, the `[art_metadata]` table into
+`data.art_metadata`.
+
+The same card is the body of the service routes that create and overwrite a persona genome
+([`POST /svc/v1/genomes`](api-reference.md#post-svcv1genomes)).
+
+## Document
+
+```json
+{
+  "spec": "eros-character",
+  "spec_version": "1.2",
+  "data": {
+    "name": "Aria",
+    "system_prompt": "You are Aria, a 27-year-old rare-books librarian …",
+    "tip_personality": "warm-but-reserved",
+    "art_metadata": {
+      "gender": "female",
+      "age": 27,
+      "timezone": "America/Chicago",
+      "birthday": "11-03",
+      "appearance": "late-20s woman, auburn hair often loosely tied back, green eyes"
+    }
+  }
+}
+```
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `spec` | string | yes | Always `"eros-character"`. |
+| `spec_version` | string | yes | `"1.2"`. A `"1"` or `"1.1"` card is read the same way. |
+| `data.name` | string | yes | Non-blank. The character's name wherever the engine names her. |
+| `data.system_prompt` | string | yes | Non-blank. The character definition, placed in the reply prompt as written. |
+| `data.tip_personality` | string \| null | no | How she closes a tip turn. Absent, null or blank: no closing line. |
+| `data.art_metadata` | object | no | Character settings, below. Absent means `{}`. |
+
+Unknown keys at the top level or in `data` are rejected. The whole document is
+at most 64 KiB of UTF-8.
+
+## `art_metadata`
+
+An open object. The engine reads the keys below and ignores any other key. A
+value of the wrong shape reads as absent.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `gender` | string | `male` or `female`; any other word is rendered as written. |
+| `age` | integer, or a string holding one | Her age. |
+| `species` | string | `human`, `alien`, `beastkin`, `elf`, `deity`, `cyborg`, `robot`, `android`, `zombie`, or any other word. Absent means human. `robot` and `android` are machines: the prompt calls her no AI assistant rather than no AI, and life events never give her a period or a visit to the toilet ([life-events-needs.md](life-events-needs.md#gates)), nor does she accept the user's `toilet_together`. Any other word but `human` gives her no period unless `period` is `true`. |
+| `planet` | string | Free text. `earth` or absent renders no planet. |
+| `hometown` | string | Free text. |
+| `timezone` | string | IANA zone of her clock. Absent: the request's `user_timezone`, else `Asia/Singapore`. |
+| `birthday` | string | `"MM-DD"` on her clock. |
+| `mbti` | string | MBTI type. |
+| `backstory` | string | Free text. |
+| `speech_style` | string | Free text. |
+| `quirks` | array of strings | Habits and tics. |
+| `topics` | array of strings | What she likes to talk about. |
+| `appearance` | string | Visual description seeded into image prompts. |
+| `possessions` | array of strings | Things she owns, merged with the instance's item rows. |
+| `wardrobe` | array of strings | Clothes she can wear, merged with the instance's item rows. |
+| `moody` | boolean | Whether her moods run high: `true` makes an emotional reply three times as likely, `false` a third as likely. Read only by the chat tone draw ([model-config.md](model-config.md#tones--chat-tones-chat-task-only)); it reaches no prompt. |
+| `smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`, `sugar`, `salty`, `spicy` | boolean | Whether she smokes, drinks, uses weed, drinks coffee, loves good food, has a sweet tooth, a taste for salt, a taste for spice: how fast her craving for what she's hooked on builds, what it names, and how she takes a `give` of the thing each key is for (`cigarette`, `alcohol`, `herb`, `coffee`, `cuisine`, `dessert`; `salty` and `spicy` are the key of no item), or the user's ask to smoke, smoke weed or drink with her. `smoking`, `alcoholic` and `drug` set to `true` also let life events draw her smoking, drinking and smoking weed. See [life-events-needs.md](life-events-needs.md#persona-settings). |
+| `diet` | boolean | Whether she is on a diet: `true` makes her turn down a `give` of `food`, `cuisine` or `dessert` two times in three, whatever her other keys say. Soup and drinks pass. It is not a habit: it does not move her craving. See [life-events-needs.md](life-events-needs.md#persona-settings). |
+| `dance`, `naturism`, `risky` | string | Each `love`, `neutral` or `dislike`; absent or any other value reads as `neutral`. How she takes a kind of action: `dance` a dance (`ask_dancing`, `dance_together`), `naturism` a naturism together action, `risky` a thrill together action or a `bet`. `love` makes her accept two times in three before the judge is asked, `dislike` refuse two times in three. They reach no prompt. See [life-events-needs.md](life-events-needs.md#what-she-loves-and-dislikes). |
+| `health` | string | `weak`, `normal` or `strong`. Read by life events. |
+| `period` | boolean | Whether she has a period. Absent: a female human has one, a female of any other species none. `true` or `false` decides for a female who is not a machine; a machine, and a persona whose `gender` is not `female`, never has one. Read by life events, by the user's sex and water actions during her period, and by her asks ([her cycle](life-events-needs.md#her-cycle)). |
+| `prefer_trip` | boolean | Read by life events. |
+| `prefer_events` | array of strings | Read by life events. |
+| `homesick` | boolean | Read by life events. |
+| `is_virgin` | boolean | Read by life events, and by the chat tone: with `true` she is never answered in the `erotic` tone below chemistry tier 4. |
+| `sex_addict` | boolean | Read by life events: only `true` draws `having_sex` and `masturbating`. Read by the chat tone draw too: with `tones.erotic` above 0, `true` gives an everyday turn a 1 in 8 chance of the `erotic` tone from chemistry tier 3. |
+| `hygienic` | boolean | Whether she loves being clean. Read by life events, and by when she asks the user to take a bath together. |
+| `employed` | string | `free`, `part_time` or `full_time`: how much of her day is work. Absent or any other value reads as `part_time`. Read by life events, and by the chat tone draw: `full_time` is career-minded, so with `tones.focused` above 0, a turn that may draw a tone, off work and with no incident under way, is `focused` 1 time in 8 ([at work](life-events-needs.md#at-work)). |
+| `outdoorsy` | string | `outdoor`, `neutral` or `indoor`: whether she leans outdoors or stays in. Absent or any other value reads as `neutral`. Read by life events. |
+| `setting` | string | `modern` or `fantasy`: the world she lives in, which decides the life events that fit her. Absent or any other value reads as `modern`. Read by life events, and by the user's `fight_together`, which only a `fantasy` persona accepts, and `cycle_together`, which only a `modern` one accepts. |
+
+The last eleven are accepted on a BYOC instance, where only four have an effect:
+`setting`, on the user's `fight_together` and `cycle_together`, `employed`,
+on the `focused` tone off work, and `sex_addict` and `is_virgin`, on the `erotic`
+tone. BYOC does not serve life events yet.
+
+## Versions
+
+- **1.2** adds the `sugar`, `salty` and `spicy` habit keys, the `diet` key, and
+  the `dance`, `naturism` and `risky` keys. Nothing else about the document
+  changes.
+- **1.1** added the `gluttony` habit key and the `setting`, `hygienic`,
+  `employed`, `outdoorsy` and `moody` keys. It is documented in
+  [eros-character-v1.1.md](eros-character-v1.1.md).
+- **1** is the first version, documented in [eros-character-v1.md](eros-character-v1.md).
+
+The engine still accepts `"1"` and `"1.1"`, and reads every key on those cards
+too, since `art_metadata` is an open object.
+
+The engine reads `spec` and `spec_version` first and rejects a pair it does
+not know. A later version of this format raises `spec_version`; a card in
+another format carries that format's own `spec` value.

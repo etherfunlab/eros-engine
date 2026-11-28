@@ -51,9 +51,10 @@ model_name_display_override = true
 #   probability, times 3 for a persona whose art_metadata.moody is true (a
 #   third when false), times 3 when she is craving or wants to be cared
 #   about, times 2 when the pair is romantically compatible, capped at 1;
-# - a reply to french_kiss, tease, hug_from_behind, touch, strip,
+# - a reply to french_kiss, tease, hug_from_behind, touch, strip, ask_strip,
 #   shower_together, bath_together, streak_together, skinny_dip_together,
-#   ride_horse_naked_together, yoga_naked_together, hike_naked_together,
+#   free_dive_together, surf_naked_together, ride_horse_naked_together,
+#   yoga_naked_together, hike_naked_together, ski_naked_together,
 #   hot_spring_naked_together, dance_naked_together, massage_naked_together,
 #   sex_together, propose, break_up, threaten or tip, accepted or refused, and
 #   the start message of sixteen life-event kinds, are ALWAYS emotional,

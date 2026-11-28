@@ -101,7 +101,7 @@ allow_traits = ["tag_a"]                    # optional, overrides task-level all
 | `tasks.<name>.allow_traits` | `Array<String>` | 否 | 此任务的 prompt-trait allow-list（三态：缺失 = 不设门控；`[]` = 丢弃所有 trait；`["a","b"]` = 白名单）。找不到匹配的 tier 块时使用。 |
 | `tasks.<name>.tiers.<tier>` | 子表 | 否 | Per-tier 覆盖。可设置 `model`、`fallback`、`allow_traits` 和/或 `retry_depth`。不覆盖 `temperature`、`max_tokens`、`top_p`、`frequency_penalty`、`presence_penalty` 或 `repetition_penalty`——这六个都只在任务级生效。**`<name>` 只能是 `chat_companion` 或 `chat_output_filter`**——其余任务都按无 tier 解析，在它们下面写 tier 块会拒绝启动（见上）。 |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | 否 | 用户输入改写 filter 的全局 trigger。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。`false`/缺失 = 关闭，`true` = 每轮执行，`0.8` = 约 80% 的轮次执行（超出 `[0.0, 1.0]` 的数字会被拒绝）。参见“`input_filter`”。 |
-| `tasks.chat_companion.tones` | table | 否 | 聊天语气：`{ emotional = <f64>, focused = <f64>, erotic = <f64> }`，各为 `[0.0, 1.0]` 内的概率。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。哪个键缺失或为 `0`，哪种语气就关闭；超出范围的值、或 `emotional`、`focused`、`erotic` 以外的语气名会拒绝启动。参见“`tones`”。 |
+| `tasks.chat_companion.tones` | table | 否 | 聊天语气：`{ emotional = <f64>, focused = <f64>, erotic = <f64>, mean = <f64>, drowsy = <f64> }`，各为 `[0.0, 1.0]` 内的概率。仅可在 `chat_companion` 的任务级配置中设置（无 per-tier 覆盖）。哪个键缺失或为 `0`，哪种语气就关闭；超出范围的值、或这五个以外的语气名会拒绝启动。参见“`tones`”。 |
 | `tasks.<name>.description` | `String` | 否 | 文档字段，代码忽略。 |
 
 **`defaults.ignore_providers` 和 `defaults.provider_sort` 已移除。** 残留
@@ -521,17 +521,17 @@ BYOK hop 使用其请求中 `byok` 块的 `output_regex` 规则，而不是这�
 ### `tones` — 聊天语气（仅限 chat 任务）
 
 `[tasks.chat_companion]` 上的 `tones` 打开 engine 的聊天语气。它只在任务级设置，没有 per-tier
-覆盖。它有三个键，`emotional`、`focused` 和 `erotic`；每个键缺失或为 `0` 即关闭，三个键各管各的，互不依赖。
-三个都关（默认）时，每个 prompt、请求和落库的行都和没有这张表时一样。
-超出 `[0.0, 1.0]` 的值、或这三个以外的语气名，会拒绝启动。
+覆盖。它有五个键，`emotional`、`focused`、`erotic`、`mean` 和 `drowsy`；每个键缺失或为 `0` 即关闭，五个键各管各的，互不依赖。
+五个都关（默认）时，每个 prompt、请求和落库的行都和没有这张表时一样。
+超出 `[0.0, 1.0]` 的值、或这五个以外的语气名，会拒绝启动。
 
 ```toml
 [tasks.chat_companion]
-tones = { emotional = 0.05, focused = 1.0, erotic = 1.0 }
+tones = { emotional = 0.05, focused = 1.0, erotic = 1.0, mean = 1.0, drowsy = 1.0 }
 ```
 
 判官决定回复和用户这句话的关系（`reply_mode`），从不决定语气。语气由 engine 在这一轮定稿的计划上决定，
-只有带文字的回复才有语气。同时满足多种语气时，`erotic` 先于 `emotional`，`emotional` 先于 `focused`：
+只有带文字的回复才有语气。同时满足多种语气时，`mean` 先于 `drowsy`，`drowsy` 先于 `erotic`，`erotic` 先于 `emotional`，`emotional` 先于 `focused`：
 先掷赢的那一个定下这条消息的语气，后面的不再掷。
 
 - **不带用户动作的 1:1 文字回合**，以概率 `min(1, emotional × moody × needs × compatible)` 用 `emotional`：
@@ -553,8 +553,8 @@ tones = { emotional = 0.05, focused = 1.0, erotic = 1.0 }
 
   `focused = 1.0` 让上班时的这类回合全都用 `focused`；这个键只负责打开那个 1/8，不缩放它。见
   [life-events-needs.zh.md](life-events-needs.zh.md#上班时)。
-- **带二十种用户动作之一的 1:1 回合**（`french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`，天然组和激情组的一起做的动作
-  `shower_together`、`bath_together`、`streak_together`、`skinny_dip_together`、`ride_horse_naked_together`、`yoga_naked_together`、`hike_naked_together`、`hot_spring_naked_together`、`dance_naked_together`、`massage_naked_together` 和 `sex_together`，以及 `propose`、`break_up`、`threaten`、`tip`）在 `emotional` 大于 0 时一律用 `emotional`，接受、拒绝都一样。其余带动作的回合从不用 `emotional`，带动作的回合也从不用 `focused`。
+- **带二十四种用户动作之一的 1:1 回合**（`french_kiss`、`tease`、`hug_from_behind`、`touch`、`strip`、`ask_strip`，天然组和激情组的一起做的动作
+  `shower_together`、`bath_together`、`streak_together`、`skinny_dip_together`、`free_dive_together`、`surf_naked_together`、`ride_horse_naked_together`、`yoga_naked_together`、`hike_naked_together`、`ski_naked_together`、`hot_spring_naked_together`、`dance_naked_together`、`massage_naked_together` 和 `sex_together`，以及 `propose`、`break_up`、`threaten`、`tip`）在 `emotional` 大于 0 时一律用 `emotional`，接受、拒绝都一样。其余带动作的回合从不用 `emotional`，带动作的回合也从不用 `focused`。
 - **生活事件开始时发的那条消息**，在 `emotional` 大于 0 时有十六种事件用 `emotional`（[life-events-needs.zh.md](life-events-needs.zh.md#她怎么讲出来)）。
 - **四个时刻**以概率 `erotic` 用 `erotic`，各掷一次：
 
@@ -571,6 +571,14 @@ tones = { emotional = 0.05, focused = 1.0, erotic = 1.0 }
   及以上、并且没有插曲在进行（或进行中的是 `sudden_desire`、`strip`、`streaking`、`just_have_sex`、`masturbating`，
   或天然组、激情组的事件）时，有八分之一的机会用 `erotic`，`erotic` 大于 0 时不管取多少。这一掷排在 `emotional`
   抽签之前。这个键只负责打开那个 1/8，不缩放它。
+- **不带用户动作的 1:1 文字回合**，在会话的[冷战](affinity-model.zh.md#冷战)期间以概率 `mean` 用 `mean`。这一掷排在最前。
+  `mean = 1.0` 让这类回合全都用 `mean`。开启冷战的那一回合不算（冷战在它的回复之后才落），宣布冷战的那条消息也不算。
+  约会里的回合读发出邀请的那个会话的冷战，照样掷。她的回复是判官读到的内容之一，所以开着这个语气时冷战可能更久：
+  出口是连续三个判定回合的耐心高于最低档，嫌冷战太长的部署把这个键调低即可。
+- **不带用户动作的 1:1 文字回合**，在她刚在用户身边睡醒时以概率 `drowsy` 用 `drowsy`：这个会话写入的最新一条
+  `asleep_together` 或 `having_sex_together` 事件已经结束、结束不超过 12 小时、她此后在这个会话里还没写过带文字的话、
+  并且没有插曲在进行。这一掷排在 `mean` 之后、其余之前。事件结束后她的第一句话不管是什么（对动作的回复、主动消息、
+  没掷中的那条回复）都会把这个时刻用掉。被提前结束的事件算作已结束。没有性向条件，也没有 chemistry 门槛。
 
 不论是固定时刻还是掷出来的，每一条 `erotic` 消息还要同时满足下面几条；有一条不满足就不掷 `erotic`，
 消息和没有这个键时一样：
@@ -610,6 +618,15 @@ tones = { emotional = 0.05, focused = 1.0, erotic = 1.0 }
 
 她对被接受的邀请的回复也这样构造：system prompt 加上答复的提示作为唯一一条 user 消息。
 
+**`drowsy` 回复**照 `erotic` 回复的方式构造，换一行话：没有历史、没有画像、渲染 `[relationship]`、`[reply_length]` 在最低一档。
+`[this_turn]` 只放一行，由这一对的 chemistry 档位决定；这一行同时说明两人刚一起睡醒，因为 prompt 里别处不提：
+
+| chemistry 档位 | 这一行 |
+|---|---|
+| 档 1–2 | `- 你们一起睡了一觉，你刚醒，脑子还没转起来：说得含糊简短，想到什么说什么` |
+| 档 3 | `- 你刚在对方身边睡醒，人还迷糊：话少、慢半拍，带着没睡够的黏糊` |
+| 档 4–5 | `- 你刚醒，还赖在对方身边不想动：声音懒懒的，回得短，带一点撒娇` |
+
 **`focused` 回复**像手上有工作的人那样写：请求和 system prompt 都是默认的那一套，区别只有这些：
 
 - system prompt 去掉 `[feelings]` 和 `[emotional_context]`。`[reply_length]` 固定在最低一档
@@ -620,10 +637,20 @@ tones = { emotional = 0.05, focused = 1.0, erotic = 1.0 }
   `[character_state]`、`[relationship]`、`[mood]`、`[inner_state]`、`[quote]`、`[now]`、各条铁律、按 `reply_mode`
   写出的铁律 ①、`[output]` 和 `[reactions]`。
 
+**`mean` 回复**照 `focused` 回复的方式构造，换一行话：保留历史、画像、记忆和 `[relationship]`（它会写明正在冷战），
+去掉 `[feelings]` 和 `[emotional_context]`，`[reply_length]` 在最低一档，不掷 nudge。`[this_turn]` 只放一行，
+由这一对的 bond 档位决定。两人越亲近，她解释得越少：
+
+| bond 档位 | 这一行 |
+|---|---|
+| 档 1–2 | `- 你还在生对方的气：话里带刺，回得冷淡简短，不主动缓和` |
+| 档 3 | `- 你们在冷战，你不想好好说话：挑对方话里的毛病，冷言冷语，一句带过` |
+| 档 4–5 | `- 你心里憋着火：说话刻薄，不留情面，也不解释自己为什么生气` |
+
 post-process（记忆、insights、亲密度）照常跑；模型、采样、输出 filter 和各帧都和 chat 任务一样。
 
 **记录。** 只要为一条消息掷过一次，它的每一行 assistant 消息都带 `metadata.tone`：最终的语气，
-`"erotic"`、`"emotional"`、`"focused"` 或 `"default"`。她对被接受的邀请的回复没掷中 `erotic` 时带 `"default"`。`emotional` 大于 0 时，名单内动作回合的行、名单内事件消息的行也带 `"emotional"`；用户行的 `metadata.action`
+`"mean"`、`"drowsy"`、`"erotic"`、`"emotional"`、`"focused"` 或 `"default"`。`mean` 或 `drowsy` 掷了没中、后面也没有别的掷中时带 `"default"`。她对被接受的邀请的回复没掷中 `erotic` 时带 `"default"`。`emotional` 大于 0 时，名单内动作回合的行、名单内事件消息的行也带 `"emotional"`；用户行的 `metadata.action`
 和消息的 `metadata.proactive` 能把它们和抽签的回合区分开。只开 `focused` 时，名单内动作回合不抽签，它的行不带 `tone`。语气没碰到的回合没有 `tone` 这个键。
 语气不存别处：判官的决策行上没有，任何帧里也没有。
 
@@ -752,7 +779,7 @@ post-process（记忆、insights、亲密度）照常跑；模型、采样、输
 
 只要还有被接受的 give 在起作用（被接受的 `smoke_together`、`smoke_weed_together` 或 `drink_together` 算作给了 1 份 `cigarette`、`herb` 或 `alcohol`），引擎还会在 `[用户动作]` 之前加一行 `[身体状态]`，写明角色身上带着的余效（例如 `[身体状态] 3 杯「威士忌」，微醺，还在往上走`；见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)）；没有时这一行不出现。
 
-**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee` 或 `cuisine`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`）为 `false` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。键为 `true` 或不写时从不掷。`smoke_together`、`smoke_weed_together` 或 `drink_together` 按一次给 1 份 `cigarette`、`herb` 或 `alcohol` 的 give 来掷，拒绝时这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你一起去抽根烟，这次你不会答应`。这一轮 `affinity_scope` 性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。同一条件下的 `sex_together`（除非带 `ignore_orientation: true`）、同一条件下的 `french_kiss`、`tease`、`lick`、`touch` 或 `ask_massage`（带[激情属性](life-events-needs.zh.md#激情属性)的动作），以及机器角色（`art_metadata.species` 为 `"robot"` 或 `"android"`）收到的 `toilet_together`，也一样，这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你上床，这次你不会答应`；其余一起做的动作都不因这一对的 scope 被拒，天然组的（淋浴、泡澡、裸奔、裸泳、裸体骑马、裸体做瑜伽、裸体爬山、裸体泡温泉、裸舞、脱了衣服互相按摩）也一样。写明了做什么的 `sex_together` 读作 `[用户动作] 对方想和你上床：「{name}」`。写入的事件不属于角色那个世界的一起做的动作也一样：`art_metadata.setting` 不是 `"fantasy"` 的角色收到的 `fight_together`，以及是 `"fantasy"` 的角色收到的 `cycle_together`，末尾相同（`[用户动作] 对方想和你一起去战斗，这次你不会答应`、`[用户动作] 对方想和你一起骑单车，这次你不会答应`），这样的拒绝哪条线都不降。她的经期里（见[她的周期](life-events-needs.zh.md#她的周期)），上述规则没有拒掉的 `sex_together`，以及在水里做的一起做的动作（`swim_together`、`hot_spring_together`、`sauna_together`、`shower_together`、`bath_together`、`skinny_dip_together`、`hot_spring_naked_together`），也一样，由掷骰决定，三次里有两次，末尾相同（`[用户动作] 对方想和你一起游泳，这次你不会答应`）；这样的拒绝同样哪条线都不降，其余那一次照常交给判官。genome 实例上状态不是 `dating`、`fwb` 或 `situationship` 时的 `propose`（BYOC 实例上的 `propose` 照常交给判官），状态不可分手时的 `break_up`，以及 BYOC 实例上的任何 `break_up`（见 [affinity-model.zh.md](affinity-model.zh.md#迁移)）也一样：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方向你求婚，这次你不会答应`，这样的拒绝哪条线都不降，也不挪动状态。[门槛](activities.zh.md#门槛)不通过的 `date`（bond 不到第 2 档的 `mid` 约会，或她离线、正在另一场约会里时的任何约会）同样如此：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
+**give 时掷的那一次。** 一轮的 `give` 是 `cigarette`、`alcohol`、`herb`、`coffee`、`cuisine` 或 `dessert`，而角色对应的 `art_metadata` 键（`smoking`、`alcoholic`、`drug`、`coffee`、`gluttony`、`sugar`）为 `false` 时，或者 `give` 是 `food`、`cuisine` 或 `dessert` 而她的 `art_metadata.diet` 为 `true` 时，引擎在判官运行之前掷一次。三次里有一次什么都不变。其余情况 `[用户动作]` 一行末尾加上 `，这次你不会收下`（例如 `[用户动作] 对方递给你 1 支烟，这次你不会收下`），判官就按拒收来写 `inner_state`，而不管它的 `action_response` 怎么填，生效的回应都是 `refuse`；规则引擎的接受同样变成 `refuse`。这一行只陈述结果，不给理由。审计 payload 留的是判官自己的回答。习惯键为 `true` 或不写时从不掷，`diet` 为 `false` 或不写时也不掷。`smoke_together`、`smoke_weed_together` 或 `drink_together` 按一次给 1 份 `cigarette`、`herb` 或 `alcohol` 的 give 来掷，拒绝时这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你一起去抽根烟，这次你不会答应`。这一轮 `affinity_scope` 性向不相容的 `strip` 也这样处理，只是不掷：这一行末尾加上 `，这次你不会让对方这样做`，生效的回应是 `refuse`。同一条件下的 `sex_together`（除非带 `ignore_orientation: true`）、同一条件下的 `french_kiss`、`tease`、`lick`、`touch` 或 `ask_massage`（带[激情属性](life-events-needs.zh.md#激情属性)的动作），以及机器角色（`art_metadata.species` 为 `"robot"` 或 `"android"`）收到的 `toilet_together`，也一样，这一行末尾是 `，这次你不会答应`，例如 `[用户动作] 对方想和你上床，这次你不会答应`；其余一起做的动作都不因这一对的 scope 被拒，天然组的（淋浴、泡澡、裸奔、裸泳、裸体骑马、裸体做瑜伽、裸体爬山、裸体泡温泉、裸舞、脱了衣服互相按摩）也一样。写明了做什么的 `sex_together` 读作 `[用户动作] 对方想和你上床：「{name}」`。写入的事件不属于角色那个世界的一起做的动作也一样：`art_metadata.setting` 不是 `"fantasy"` 的角色收到的 `fight_together`，以及是 `"fantasy"` 的角色收到的 `cycle_together`，末尾相同（`[用户动作] 对方想和你一起去战斗，这次你不会答应`、`[用户动作] 对方想和你一起骑单车，这次你不会答应`），这样的拒绝哪条线都不降。她的经期里（见[她的周期](life-events-needs.zh.md#她的周期)），上述规则没有拒掉的 `sex_together`，以及在水里做的一起做的动作（`swim_together`、`scuba_dive_together`、`surf_together`、`hot_spring_together`、`sauna_together`、`shower_together`、`bath_together`、`skinny_dip_together`、`free_dive_together`、`surf_naked_together`、`hot_spring_naked_together`），也一样，由掷骰决定，三次里有两次，末尾相同（`[用户动作] 对方想和你一起游泳，这次你不会答应`）；这样的拒绝同样哪条线都不降，其余那一次照常交给判官。genome 实例上状态不是 `dating`、`fwb` 或 `situationship` 时的 `propose`（BYOC 实例上的 `propose` 照常交给判官），状态不可分手时的 `break_up`，以及 BYOC 实例上的任何 `break_up`（见 [affinity-model.zh.md](affinity-model.zh.md#迁移)）也一样：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方向你求婚，这次你不会答应`，这样的拒绝哪条线都不降，也不挪动状态。[门槛](activities.zh.md#门槛)不通过的 `date`（bond 不到第 2 档的 `mid` 约会，或她离线、正在另一场约会里时的任何约会）同样如此：这一行末尾加上 `，这次你不会答应`，例如 `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`。性向不相容的一对发来的 `ask_strip` 也一样，和 `strip` 相同，这一行以 `，这次你不会答应` 结尾；规则放行的 `ask_strip` 会写明在这一对的 chemistry 档位上答应意味着什么，例如 `[用户动作] 对方想让你把衣服脱了（accept：脱到只剩内衣；refuse：不脱）`（见[请她自己脱](life-events-needs.zh.md#请她自己脱)）。最后，以上规则都没有拒绝时，还有取向的那一掷：动作归角色的 `art_metadata.dance`、`naturism` 或 `risky` 键管时（一支舞、天然组的一起做的动作、刺激组的一起做的动作或 `bet`），掷一次。键为 `"dislike"` 时三次里有两次拒绝，这一行以 `，这次你不会答应` 结尾；键为 `"love"` 时三次里有两次接受，这一行以 `，这次你会答应` 结尾（例如 `[用户动作] 对方想和你一起跳探戈，这次你会答应`），生效的回应是 `accept`，不管判官怎么答。其余那一次，以及键为 `"neutral"` 或不写时，照常由判官决定（见[她爱什么、不爱什么](life-events-needs.zh.md#她爱什么不爱什么)）。带舞风的舞读作 `[用户动作] 对方想和你一起跳探戈`；自定义的舞把用户起的名字放进引号，`对方想和你一起跳「机械舞」`。判官的 `[角色人格]` 块不列这些键。见 [life-events-needs.zh.md](life-events-needs.zh.md#角色设置)。
 
 **需求上下文行。** 每个有判官的回合，上下文里都有一行 `[需求]`，位于 `[身体状态]` 之前：`[需求] 社交欲=低 情感需求=高 外出=中`，即上一次判定推算到本回合的结果；第一次判定之前为 `[需求] 尚未判定`。`外出` 每次都在；只有 `indulgence` 为 `high` 时才在末尾加上 ` 享受=高`（`[需求] 社交欲=低 情感需求=高 外出=中 享受=高`），没有它就读作“不高”，参考 prompt 里也这样告诉判官。严格模式下的判官每个回合仍然要评 `indulgence`，却看不出它原来是 `low` 还是 `mid`，所以连续聊天时它每一轮都在重新猜这一项，按习惯数目的漂移只在两次评定之间起作用。
 
@@ -859,7 +886,7 @@ PDE judge 不再写图片 prompt 种子——它只负责决定动作、`inner_s
 **没有肖像回退**——整条链失败直接返回一个带 provider 自己状态码的 HTTP 错误
 （该端点兼作合成器的调试面，报告失败而不是掩盖失败）。
 
-`[此刻穿着]` 是本轮穿着，取自请求的 `outfit` 或判官的 `clothing`，都没有时为 `（无）`；compose 端点固定发 `（无）`。图的状态里有天然组种类、`having_sex_together`、`swimming_together`、`hot_spring_together` 或 `sauna_together` 时由引擎来写，盖过两者：天然组种类和性写 `什么都没穿`（性的 1:1 聊天图改写动作里她那一方，见下）；游泳和泡温泉时写一件泳装，取自固定的阶梯，看角色的 `art_metadata.gender`、这一对是否性向相容、她是否处女和 chemistry 档位，以英文写入（性向不相容时女性角色是 `plain one-piece swimsuit`、男性角色是 `board shorts`；性向相容时 chemistry 到 0.95 起是 `什么都没穿`；其他性别游泳时不写）；蒸桑拿时性向相容的一对写 `身上只松松地裹着一条浴巾`，否则写 `身上只裹着一条浴巾`，角色性别既不是 `female` 也不是 `male` 时泡温泉也这样写（[表](life-events-needs.zh.md#她在水里穿什么)）。`[身体状态]` 是角色因被接受的 give 而带着的余效（见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)），没有时为 `（无）`；compose 端点固定发 `（无）`。
+`[此刻穿着]` 是本轮穿着，取自请求的 `outfit` 或判官的 `clothing`，都没有时为 `（无）`；compose 端点固定发 `（无）`。图的状态里有天然组种类、`having_sex_together`、`swimming_together`、`scuba_diving_together`、`surfing_together`、`hot_spring_together` 或 `sauna_together` 时由引擎来写，盖过两者：天然组种类和性写 `什么都没穿`（性的 1:1 聊天图改写动作里她那一方，见下）；游泳和泡温泉时写一件泳装，取自固定的阶梯，看角色的 `art_metadata.gender`、这一对是否性向相容、她是否处女和 chemistry 档位，以英文写入（性向不相容时女性角色是 `plain one-piece swimsuit`、男性角色是 `board shorts`；性向相容时 chemistry 到 0.95 起是 `什么都没穿`；其他性别游泳时不写）；蒸桑拿时性向相容的一对写 `身上只松松地裹着一条浴巾`，否则写 `身上只裹着一条浴巾`，角色性别既不是 `female` 也不是 `male` 时泡温泉也这样写（[表](life-events-needs.zh.md#她在水里穿什么)）。`[身体状态]` 是角色因被接受的 give 而带着的余效（见[接口参考](api-reference.zh.md#post-compchatsession_idmessagestream)），没有时为 `（无）`；compose 端点固定发 `（无）`。
 
 `[此刻状态]` 是有事件进行时她此刻在做什么：依次是背景、她的经期或月经推迟、进行中的插曲的标签（每种事件一个固定的中文名），用 `；` 连接，如 `短途旅游；在坐火车`；`custom_together` 读作 和对方一起：「{用户的话}」。它排在 `[身体状态]` 之后、`[最近场景]` 之前，出现在聊天流水线画的每一张图里：聊天回合的图（判官选的、强制的，或被接受的 `photo`、`strip`、`ask_dancing`、一起做的动作所出的图）、事件消息自己的图，以及群聊回合的图（写发言人自己的状态）。正在开始的事件即使还没落库也算进行中，所以事件消息的图，以及被接受的一起做的动作的图，画的就是它们开始的那个事件。约会中被接受的一起做的动作不开始事件，它的种类只作为那一张图里她的状态。没有进行中的事件时载荷里没有这一段。独立的 compose 端点和改图端点不发这一段。在这些种类之外引擎不改写 `[此刻穿着]`：内置提示词点出这一段，要求图里必须画出它，并说明状态与她的穿着冲突时以状态为准。自定义的 `filter_prompt` 应补一句相应的话；不补的话，模型仍会读到这一段，却没人告诉它怎么用。审计行的 `inputs` 以 `current_state` 记录它（[LLM audit → 图片链路事件表](llm-audit.zh.md#图片链路事件表)）。穿着要看这一对时，按请求自己的 scope 读（这一轮的 `affinity_scope`、群聊发言人的 `member_scopes`、事件请求的 `affinity_scope`；没带就按性向不相容读），审计行的 `inputs.clothing` 记下发出去的穿着（[规则](life-events-needs.zh.md#她在水里穿什么)）。
 

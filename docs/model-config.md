@@ -103,7 +103,7 @@ Field details:
 | `tasks.<name>.allow_traits` | `Array<String>` | no | Prompt-trait allow-list for this task (three-state: absent = no gating; `[]` = drop all traits; `["a","b"]` = whitelist). Used when no matching tier block is found. |
 | `tasks.<name>.tiers.<tier>` | sub-table | no | Per-tier overrides. May set `model`, `fallback`, `allow_traits`, and/or `retry_depth`. Does not override `temperature`, `max_tokens`, `top_p`, `frequency_penalty`, `presence_penalty`, or `repetition_penalty` — all six are task-level only. **`<name>` may only be `chat_companion` or `chat_output_filter`** — every other task resolves without a tier, and a tier block under one refuses to boot (see above). |
 | `tasks.chat_companion.input_filter` | `bool` \| `f64` | no | Global trigger for the user-input rewrite filter. Task-level only on `chat_companion` (no per-tier override). `false`/absent = off, `true` = every turn, `0.8` = ~80% of turns (a number outside `[0.0, 1.0]` is rejected). See "`input_filter`". |
-| `tasks.chat_companion.tones` | table | no | Chat tones: `{ emotional = <f64>, focused = <f64>, erotic = <f64> }`, each a probability in `[0.0, 1.0]`. Task-level only on `chat_companion` (no per-tier override). Each key absent or `0` = that tone off; a value out of range or a tone name other than `emotional`, `focused` and `erotic` refuses to boot. See "`tones`". |
+| `tasks.chat_companion.tones` | table | no | Chat tones: `{ emotional = <f64>, focused = <f64>, erotic = <f64>, mean = <f64>, drowsy = <f64> }`, each a probability in `[0.0, 1.0]`. Task-level only on `chat_companion` (no per-tier override). Each key absent or `0` = that tone off; a value out of range or a tone name other than those five refuses to boot. See "`tones`". |
 | `tasks.<name>.description` | `String` | no | Documentation field, ignored by code. |
 
 **`defaults.ignore_providers` and `defaults.provider_sort` are removed.** A
@@ -603,22 +603,23 @@ blocks are limited to `chat_companion` and `chat_output_filter`.
 ### `tones` — chat tones (chat task only)
 
 `tones` on `[tasks.chat_companion]` turns on the engine's chat tones. It is
-task-level only, with no per-tier override. It has three keys, `emotional`,
-`focused` and `erotic`; each is off when absent or `0`, and each works without
-the others. With all three off (the default) every prompt, request and stored
-row is what it is without the table. A value outside `[0.0, 1.0]`, or a tone
-name other than those three, refuses to boot.
+task-level only, with no per-tier override. It has five keys, `emotional`,
+`focused`, `erotic`, `mean` and `drowsy`; each is off when absent or `0`, and
+each works without the others. With all five off (the default) every prompt,
+request and stored row is what it is without the table. A value outside
+`[0.0, 1.0]`, or a tone name other than those five, refuses to boot.
 
 ```toml
 [tasks.chat_companion]
-tones = { emotional = 0.05, focused = 1.0, erotic = 1.0 }
+tones = { emotional = 0.05, focused = 1.0, erotic = 1.0, mean = 1.0, drowsy = 1.0 }
 ```
 
 The judge picks how a reply relates to the user's message (`reply_mode`); it
 never picks the tone. The engine decides the tone on the turn's final plan, and
 only a reply that bears text has one. When more than one tone could apply,
-`erotic` wins over `emotional`, and `emotional` over `focused`: the first roll
-to win names the message, and no later roll is made.
+`mean` wins over `drowsy`, `drowsy` over `erotic`, `erotic` over `emotional`,
+and `emotional` over `focused`: the first roll to win names the message, and no
+later roll is made.
 
 - **A 1:1 text turn without a user action** is `emotional` with probability
   `min(1, emotional × moody × needs × compatible)`:
@@ -643,10 +644,10 @@ to win names the message, and no later roll is made.
   `focused = 1.0` makes every such turn at work `focused`; the key switches
   the 1/8 on and does not scale it. See
   [life-events-needs.md](life-events-needs.md#at-work).
-- **A 1:1 turn carrying one of twenty user actions** (`french_kiss`, `tease`,
-  `hug_from_behind`, `touch`, `strip`, the naturism and passion together actions
-  `shower_together`, `bath_together`, `streak_together`, `skinny_dip_together`,
-  `ride_horse_naked_together`, `yoga_naked_together`, `hike_naked_together`,
+- **A 1:1 turn carrying one of twenty-four user actions** (`french_kiss`, `tease`,
+  `hug_from_behind`, `touch`, `strip`, `ask_strip`, the naturism and passion together actions
+  `shower_together`, `bath_together`, `streak_together`, `skinny_dip_together`, `free_dive_together`, `surf_naked_together`,
+  `ride_horse_naked_together`, `yoga_naked_together`, `hike_naked_together`, `ski_naked_together`,
   `hot_spring_naked_together`, `dance_naked_together`, `massage_naked_together`
   and `sex_together`, and `propose`, `break_up`, `threaten`, `tip`) is always
   `emotional`, accepted or refused, while `emotional` is above 0. Any other
@@ -673,6 +674,24 @@ to win names the message, and no later roll is made.
   `just_have_sex`, `masturbating`, or a naturism- or passion-group kind. This
   roll comes before the `emotional` draw. The key switches the 1/8 on and does
   not scale it.
+- **A 1:1 text turn without a user action** is `mean` with probability `mean`
+  while the session's [cold war](affinity-model.md#the-cold-war) is on. This
+  roll comes first. `mean = 1.0` makes every such turn `mean`. The turn that
+  starts a cold war is not one (the flag is set after its reply), nor is the
+  message that announces it. A date's turns read the inviting session's
+  cold war and roll the same way. Her replies are part of what the judge
+  reads, so a cold war may last longer with the tone on: the way out is three
+  judged turns above the lowest patience level, and a deployment that finds
+  cold wars too long lowers the key.
+- **A 1:1 text turn without a user action** is `drowsy` with probability
+  `drowsy` when she just woke beside the user: the newest `asleep_together` or
+  `having_sex_together` event the session placed has ended, no more than 12
+  hours ago, she has written no line with text in the session since, and no
+  incident is under way. This roll comes after `mean` and before the others.
+  Whatever her first line after the event is (a reply to an action, a
+  proactive message, a reply whose roll was lost) uses the moment up. An
+  event cut short counts as one that ended. There is no romance condition and
+  no chemistry floor.
 
 Every `erotic` message, at a moment or drawn, also needs all of these; when one
 fails no `erotic` roll is made and the message is what it would be without the
@@ -729,6 +748,17 @@ the three episodes, the lowest `[reply_length]`.
 Her reply to an accepted ask is built the same way: the system prompt and the
 answer's cue as the one user message.
 
+**A `drowsy` reply** is built as an `erotic` reply is, with another line: no
+history, no profile, `[relationship]` rendered, the lowest `[reply_length]`.
+`[this_turn]` holds one line, set by the pair's chemistry tier; the line also
+says that they just woke side by side, since nothing else in the prompt does:
+
+| chemistry tier | the line |
+|---|---|
+| 1–2 | `- 你们一起睡了一觉，你刚醒，脑子还没转起来：说得含糊简短，想到什么说什么` |
+| 3 | `- 你刚在对方身边睡醒，人还迷糊：话少、慢半拍，带着没睡够的黏糊` |
+| 4–5 | `- 你刚醒，还赖在对方身边不想动：声音懒懒的，回得短，带一点撒娇` |
+
 **A `focused` reply** is written like someone with work in hand: the default
 request and system prompt, with these differences:
 
@@ -744,11 +774,26 @@ request and system prompt, with these differences:
   `[now]`, the iron rules, rule ① as `reply_mode` writes it, `[output]` and
   `[reactions]`.
 
+**A `mean` reply** is built as a `focused` reply is, with another line: the
+history, the profile, the memories and `[relationship]` (which says the cold
+war is on) are kept, `[feelings]` and `[emotional_context]` are left out,
+`[reply_length]` is at its lowest tier and no nudge is rolled. `[this_turn]`
+holds one line, set by the pair's bond tier. The closer the pair, the less she
+explains:
+
+| bond tier | the line |
+|---|---|
+| 1–2 | `- 你还在生对方的气：话里带刺，回得冷淡简短，不主动缓和` |
+| 3 | `- 你们在冷战，你不想好好说话：挑对方话里的毛病，冷言冷语，一句带过` |
+| 4–5 | `- 你心里憋着火：说话刻薄，不留情面，也不解释自己为什么生气` |
+
 Post-processing (memory, insights, affinity) runs as on any turn, and the model,
 sampling, output filter and frames are those of the chat task.
 
 **The record.** Every assistant row of a message for which a roll was made carries
-`metadata.tone`: the final tone, `"erotic"`, `"emotional"`, `"focused"` or `"default"`.
+`metadata.tone`: the final tone, `"mean"`, `"drowsy"`, `"erotic"`, `"emotional"`,
+`"focused"` or `"default"`. A turn whose `mean` or `drowsy` roll was lost, and
+no later roll won, carries `"default"`.
 Her reply to an accepted ask that lost its `erotic` roll carries `"default"`. While
 `emotional` is above 0, the rows of a listed action turn and of a listed
 event message carry `"emotional"` too; the user row's `metadata.action` and the
@@ -893,7 +938,7 @@ By default the engine uses the built-in rule engine (`eros-engine-core/src/pde.r
 
 When any accepted `give` is still at work (an accepted `smoke_together`, `smoke_weed_together` or `drink_together` counts as a give of one `cigarette`, `herb` or `alcohol`), the engine also adds a `[身体状态]` line with the persona's lingering state (e.g. `[身体状态] 3 杯「威士忌」，微醺，还在往上走`; see [API reference](api-reference.md#post-compchatsession_idmessagestream)), before `[用户动作]`; the line is absent otherwise.
 
-**The habit roll on a give.** When a turn's `give` is `cigarette`, `alcohol`, `herb`, `coffee` or `cuisine` and the persona's matching `art_metadata` key (`smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`) is `false`, the engine rolls once before the judge runs. One time in three nothing changes. Otherwise the `[用户动作]` line ends with `，这次你不会收下` (e.g. `[用户动作] 对方递给你 1 支烟，这次你不会收下`), so the judge writes its `inner_state` for a refusal, and the response in effect is `refuse` whatever its `action_response` says; the rule engine's accept becomes `refuse` too. The line states the outcome, not a reason. The audit payload keeps the judge's own answer. A key that is `true` or absent never rolls. A `smoke_together`, `smoke_weed_together` or `drink_together` is rolled as a give of one `cigarette`, `herb` or `alcohol` is, and on a refusal its line ends with `，这次你不会答应`, as in `[用户动作] 对方想和你一起去抽根烟，这次你不会答应`. A `strip` whose turn `affinity_scope` is not romance-compatible is decided the same way, without a roll: the line ends with `，这次你不会让对方这样做` and the response in effect is `refuse`. So is a `sex_together` under the same condition, unless it says `ignore_orientation: true`, a `french_kiss`, `tease`, `lick`, `touch` or `ask_massage` under the same condition (the gestures with the [passion attribute](life-events-needs.md#the-passion-attribute)), and a `toilet_together` to a machine persona (`art_metadata.species` `"robot"` or `"android"`), with the line ending `，这次你不会答应`, as in `[用户动作] 对方想和你上床，这次你不会答应`; no other together action is refused for the pair's scopes, the naturism ones (a shower, a bath, a streak, a skinny dip, the naked ride, yoga, hike, hot spring, dance and massage) included. A `sex_together` that names its act reads `[用户动作] 对方想和你上床：「{name}」`. So is a together action whose event does not fit the persona's world: a `fight_together` to a persona whose `art_metadata.setting` is not `"fantasy"` and a `cycle_together` to one whose setting is, with the same ending (`[用户动作] 对方想和你一起去战斗，这次你不会答应`, `[用户动作] 对方想和你一起骑单车，这次你不会答应`); that refusal drops no line. So is, during her period ([her cycle](life-events-needs.md#her-cycle)), a `sex_together`, or a together action that happens in water (`swim_together`, `hot_spring_together`, `sauna_together`, `shower_together`, `bath_together`, `skinny_dip_together`, `hot_spring_naked_together`), that none of these rules refused, two times in three by a roll, with the same ending (`[用户动作] 对方想和你一起游泳，这次你不会答应`); that refusal drops no line either, and the other third goes to the judge as usual. So is a `propose` on a genome instance unless the pair's status is `dating`, `fwb` or `situationship` (on a BYOC instance it goes to the judge), and a `break_up` unless the status is breakable, or any `break_up` on a BYOC instance ([affinity-model.md](affinity-model.md#transitions)): the line ends with `，这次你不会答应`, as in `[用户动作] 对方向你求婚，这次你不会答应`, and the refusal drops no line and moves no status. So is a `date` the [gate](activities.md#the-gate) turns down (a `mid` date below bond tier 2, or any date while she is offline or on another date): the line ends with `，这次你不会答应`, as in `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`. The judge's `[角色人格]` block does not list these keys. See [life-events-needs.md](life-events-needs.md#persona-settings).
+**The habit roll on a give.** When a turn's `give` is `cigarette`, `alcohol`, `herb`, `coffee`, `cuisine` or `dessert` and the persona's matching `art_metadata` key (`smoking`, `alcoholic`, `drug`, `coffee`, `gluttony`, `sugar`) is `false`, or the `give` is `food`, `cuisine` or `dessert` and her `art_metadata.diet` is `true`, the engine rolls once before the judge runs. One time in three nothing changes. Otherwise the `[用户动作]` line ends with `，这次你不会收下` (e.g. `[用户动作] 对方递给你 1 支烟，这次你不会收下`), so the judge writes its `inner_state` for a refusal, and the response in effect is `refuse` whatever its `action_response` says; the rule engine's accept becomes `refuse` too. The line states the outcome, not a reason. The audit payload keeps the judge's own answer. A habit key that is `true` or absent never rolls, nor does a `diet` that is `false` or absent. A `smoke_together`, `smoke_weed_together` or `drink_together` is rolled as a give of one `cigarette`, `herb` or `alcohol` is, and on a refusal its line ends with `，这次你不会答应`, as in `[用户动作] 对方想和你一起去抽根烟，这次你不会答应`. A `strip` whose turn `affinity_scope` is not romance-compatible is decided the same way, without a roll: the line ends with `，这次你不会让对方这样做` and the response in effect is `refuse`. So is a `sex_together` under the same condition, unless it says `ignore_orientation: true`, a `french_kiss`, `tease`, `lick`, `touch` or `ask_massage` under the same condition (the gestures with the [passion attribute](life-events-needs.md#the-passion-attribute)), and a `toilet_together` to a machine persona (`art_metadata.species` `"robot"` or `"android"`), with the line ending `，这次你不会答应`, as in `[用户动作] 对方想和你上床，这次你不会答应`; no other together action is refused for the pair's scopes, the naturism ones (a shower, a bath, a streak, a skinny dip, the naked ride, yoga, hike, hot spring, dance and massage) included. A `sex_together` that names its act reads `[用户动作] 对方想和你上床：「{name}」`. So is a together action whose event does not fit the persona's world: a `fight_together` to a persona whose `art_metadata.setting` is not `"fantasy"` and a `cycle_together` to one whose setting is, with the same ending (`[用户动作] 对方想和你一起去战斗，这次你不会答应`, `[用户动作] 对方想和你一起骑单车，这次你不会答应`); that refusal drops no line. So is, during her period ([her cycle](life-events-needs.md#her-cycle)), a `sex_together`, or a together action that happens in water (`swim_together`, `scuba_dive_together`, `surf_together`, `hot_spring_together`, `sauna_together`, `shower_together`, `bath_together`, `skinny_dip_together`, `free_dive_together`, `surf_naked_together`, `hot_spring_naked_together`), that none of these rules refused, two times in three by a roll, with the same ending (`[用户动作] 对方想和你一起游泳，这次你不会答应`); that refusal drops no line either, and the other third goes to the judge as usual. So is a `propose` on a genome instance unless the pair's status is `dating`, `fwb` or `situationship` (on a BYOC instance it goes to the judge), and a `break_up` unless the status is breakable, or any `break_up` on a BYOC instance ([affinity-model.md](affinity-model.md#transitions)): the line ends with `，这次你不会答应`, as in `[用户动作] 对方向你求婚，这次你不会答应`, and the refusal drops no line and moves no status. So is a `date` the [gate](activities.md#the-gate) turns down (a `mid` date below bond tier 2, or any date while she is offline or on another date): the line ends with `，这次你不会答应`, as in `[用户动作] 对方邀请你去约会：地点「海边」，安排「看海」，大约 4 小时，这次你不会答应`. So is an `ask_strip` from a pair whose turn `affinity_scope` is not romance-compatible, as a `strip` is, with the line ending `，这次你不会答应`; an `ask_strip` the rules let through reads what a yes means at the pair's chemistry tier, as in `[用户动作] 对方想让你把衣服脱了（accept：脱到只剩内衣；refuse：不脱）` ([asking her to strip](life-events-needs.md#asking-her-to-strip)). Last, when none of these rules refused, the taste roll: an action one of the persona's `art_metadata.dance`, `naturism` or `risky` keys reads (a dance, a naturism together action, a thrill together action or a `bet`) is rolled once. A key that says `"dislike"` refuses it two times in three, with the line ending `，这次你不会答应`; one that says `"love"` accepts it two times in three, with the line ending `，这次你会答应` (as in `[用户动作] 对方想和你一起跳探戈，这次你会答应`) and the response in effect `accept` whatever the judge answers. The other third, and a `"neutral"` or absent key, go to the judge as usual ([what she loves and dislikes](life-events-needs.md#what-she-loves-and-dislikes)). A dance that names its style reads `[用户动作] 对方想和你一起跳探戈`; a custom one quotes the user's name for it, `对方想和你一起跳「机械舞」`. The judge's `[角色人格]` block does not list these keys. See [life-events-needs.md](life-events-needs.md#persona-settings).
 
 **Needs context line.** On every judged turn the context carries one `[需求]` line, before `[身体状态]`: `[需求] 社交欲=低 情感需求=高 外出=中`, the previous rating carried to this turn, or `[需求] 尚未判定` before the first rating. `外出` is always on it; ` 享受=高` is appended only when `indulgence` is `high` (`[需求] 社交欲=低 情感需求=高 外出=中 享受=高`), and its absence reads as "not high", as the reference prompt tells the judge. A strict judge still rates `indulgence` on every judged turn without seeing whether it was `low` or `mid`, so in continuous chat it re-guesses that level each turn, and the habit-count drift acts in the gaps between ratings.
 
@@ -1034,7 +1079,7 @@ conversation history, and there is **no portrait fallback** — a fully failed
 chain is an HTTP error carrying the provider's own status (the endpoint doubles
 as the composer's test surface, so it reports failure instead of masking it).
 
-`[此刻穿着]` is the turn's outfit, from the request's `outfit` or the judge's `clothing`; `（无）` when neither. While the picture's state holds a naturism kind, `having_sex_together`, `swimming_together`, `hot_spring_together` or `sauna_together`, the engine writes it instead, over both: `什么都没穿` for a naturism kind and for sex (on a 1:1 chat picture of sex, her side of the act, below); in a swim or a hot spring, a swimsuit from a fixed ladder by the persona's `art_metadata.gender`, the pair's romance compatibility, her virginity and the chemistry tier, written in English (for a pair that is not compatible, `plain one-piece swimsuit` for a female persona and `board shorts` for a male one; `什么都没穿` from chemistry 0.95 for a compatible one; for any other gender a swim writes nothing); in a sauna, `身上只松松地裹着一条浴巾` for a romance-compatible pair and `身上只裹着一条浴巾` otherwise, which a hot spring also wears when her gender is neither `female` nor `male` ([the table](life-events-needs.md#what-she-wears-in-the-water)). The compose endpoint always sends `（无）`. `[身体状态]` is the persona's lingering state from accepted gives (see [API reference](api-reference.md#post-compchatsession_idmessagestream)), `（无）` when none; the compose endpoint always sends `（无）`.
+`[此刻穿着]` is the turn's outfit, from the request's `outfit` or the judge's `clothing`; `（无）` when neither. While the picture's state holds a naturism kind, `having_sex_together`, `swimming_together`, `scuba_diving_together`, `surfing_together`, `hot_spring_together` or `sauna_together`, the engine writes it instead, over both: `什么都没穿` for a naturism kind and for sex (on a 1:1 chat picture of sex, her side of the act, below); in a swim or a hot spring, a swimsuit from a fixed ladder by the persona's `art_metadata.gender`, the pair's romance compatibility, her virginity and the chemistry tier, written in English (for a pair that is not compatible, `plain one-piece swimsuit` for a female persona and `board shorts` for a male one; `什么都没穿` from chemistry 0.95 for a compatible one; for any other gender a swim writes nothing); in a sauna, `身上只松松地裹着一条浴巾` for a romance-compatible pair and `身上只裹着一条浴巾` otherwise, which a hot spring also wears when her gender is neither `female` nor `male` ([the table](life-events-needs.md#what-she-wears-in-the-water)). The compose endpoint always sends `（无）`. `[身体状态]` is the persona's lingering state from accepted gives (see [API reference](api-reference.md#post-compchatsession_idmessagestream)), `（无）` when none; the compose endpoint always sends `（无）`.
 
 `[此刻状态]` is what she is doing while an event is live: the labels (a fixed Chinese name per kind) of the background, her period or a late period, and then the incident under way, joined by `；`, such as `短途旅游；在坐火车`; a `custom_together` reads 和对方一起：「{the user's words}」. It sits after `[身体状态]` and before `[最近场景]`, on every picture the chat pipeline draws: a chat turn's (chosen by the judge, forced, or the picture of an accepted `photo`, `strip`, `ask_dancing` or together action), an event message's own, and a group turn's, which names its speaker's state. An event being started counts as live though it is not stored yet, so an event message's picture and the picture of an accepted together action show the event they start. Inside a date, where an accepted together action starts no event, its kind is her state for that picture only. With nothing live the payload has no such section. The standalone compose endpoint and the image-edit endpoint send none. Outside those kinds the engine overrides nothing in `[此刻穿着]`: the built-in prompt names the section, says the picture must show it, and says that where the state and what she is wearing disagree the state wins. A custom `filter_prompt` should carry a line for it; without one the model still reads the section but is told nothing about it. The audit row's `inputs` carry it as `current_state` ([LLM audit → Image-path event tables](llm-audit.md#image-path-event-tables)). Where the clothing reads the pair, it is read from the request's own scopes (the turn's `affinity_scope`, a group speaker's `member_scopes`, an event request's `affinity_scope`; none named reads as not romance-compatible), and the audit row's `inputs.clothing` carries the clothing as sent ([the rule](life-events-needs.md#what-she-wears-in-the-water)).
 
