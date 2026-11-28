@@ -2650,4 +2650,75 @@ mod tests {
             (Some(f.a), "", true)
         );
     }
+
+    /// Spec 2026-11-28-wardrobe-steward-design.md §5.1: a cue without
+    /// clothing leaves the speaker's picture to the steward, asked once for
+    /// the speaker; the second person is not dressed.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_dresses_a_group_picture(pool: PgPool) {
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_image","inner_state":null,"reply_mode":null,"clothing":null,"with":"m2"}],"reason":null}"#;
+        let mut f = fixture_with(
+            pool,
+            Some(director_sse(verdict)),
+            200,
+            None,
+            &format!(
+                "{COMPOSE_TASK}[tasks.pde_wardrobe]\nmodel = \"steward-model\"\n\
+                 filter_prompt = \"DRESS\"\n"
+            ),
+            |_| {},
+        )
+        .await;
+        mount_composer(&f._server).await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"model": "steward-model"}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-steward",
+                "model": "steward-model",
+                "choices": [{"message": {"content": "米色开衫"}}],
+            })))
+            .mount(&f._server)
+            .await;
+        let (s, body) = send(
+            &mut f,
+            json!({"content":"拍张合照","client_msg_id":"01JGROUPSTEWARDIMAGESSSSSG","image":{}}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+
+        let bodies: Vec<Value> = f
+            ._server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+            .collect();
+        let steward = bodies
+            .iter()
+            .filter(|b| b["model"] == "steward-model")
+            .count();
+        assert_eq!(steward, 1, "one steward request, for the speaker");
+        let composer = bodies
+            .iter()
+            .find(|b| b["model"] == "composer-model")
+            .expect("the composer ran");
+        let payload = composer["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .and_then(|m| m["content"].as_str())
+            .expect("the composer's user message");
+        assert!(payload.contains("[此刻穿着]\n米色开衫\n"), "{payload}");
+        let (instance, inputs): (Uuid, Value) = sqlx::query_as(
+            "SELECT instance_id, inputs FROM engine.chat_images_events WHERE session_id = $1",
+        )
+        .bind(f.group)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(instance, instance_of(&f.pool, f.a).await);
+        assert_eq!(inputs["clothing_source"], "steward", "{inputs}");
+    }
 }

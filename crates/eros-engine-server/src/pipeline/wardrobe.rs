@@ -22,6 +22,14 @@ use crate::state::AppState;
 /// steward's `[上次穿着]`, and the outfit later reply prompts carry.
 pub(crate) const WINDOW_MINUTES: i32 = 45;
 
+/// The values of a picture row's `inputs.clothing_source`: who dressed her,
+/// in the order the picture entrance takes them (spec 2026-11-28-wardrobe-
+/// steward-design.md §5.1, §9): the engine's own clothing (the water,
+/// naturism, sex), the plan's clothing, the steward's answer.
+pub(crate) const BY_ENGINE: &str = "engine";
+pub(crate) const BY_PLAN: &str = "plan";
+pub(crate) const BY_STEWARD: &str = "steward";
+
 /// The body the payload writes for a section that has nothing.
 const NONE: &str = "（无）";
 
@@ -251,7 +259,7 @@ pub(crate) async fn carried_clothing(
     }
     last_worn(&state.pool, instance_id, driving_message, now)
         .await
-        .filter(|w| w.source.as_deref() == Some("steward"))
+        .filter(|w| w.source.as_deref() == Some(BY_STEWARD))
         .map(|w| w.clothing)
 }
 
