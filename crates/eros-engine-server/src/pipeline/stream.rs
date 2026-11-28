@@ -32717,8 +32717,9 @@ data: [DONE]\n\n"
     /// TOML `config` after `[tasks.chat_companion]` and the composer, which
     /// answers; each `(model, response)` of `models` mounted for that model;
     /// the judge answering `verdict` when given; the genome's `art_metadata`
-    /// set to `art` when given; a picture of hers the steward dressed in
-    /// `last_worn` 10 minutes before the user message when given; and
+    /// set to `art` when given; for `last_worn = (clothing, source)`, a
+    /// picture of hers wearing `clothing` 10 minutes before the user
+    /// message, its `inputs.clothing_source` `source` when given; and
     /// `tweak` applied to the turn's message. The user message is sent at
     /// [`steward_moment`]. Returns the frames, the mock and the session.
     async fn steward_turn(
@@ -32727,7 +32728,7 @@ data: [DONE]\n\n"
         models: Vec<(&str, wiremock::ResponseTemplate)>,
         verdict: Option<serde_json::Value>,
         art: Option<serde_json::Value>,
-        last_worn: Option<&str>,
+        last_worn: Option<(&str, Option<&str>)>,
         tweak: impl FnOnce(&mut PersistedUserMessage),
     ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
         use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
@@ -32815,7 +32816,11 @@ data: [DONE]\n\n"
             .execute(pool)
             .await
             .unwrap();
-        if let Some(clothing) = last_worn {
+        if let Some((clothing, source)) = last_worn {
+            let mut inputs = serde_json::json!({ "clothing": clothing });
+            if let Some(source) = source {
+                inputs["clothing_source"] = source.into();
+            }
             let id = eros_engine_store::image_events::ImageComposeEventRepo { pool }
                 .record(eros_engine_store::image_events::ImageComposeEventInsert {
                     source: "chat_reply_image",
@@ -32823,10 +32828,7 @@ data: [DONE]\n\n"
                     instance_id: Some(instance_id),
                     session_id: Some(session_id),
                     status: "ok",
-                    inputs: serde_json::json!({
-                        "clothing": clothing,
-                        "clothing_source": "steward",
-                    }),
+                    inputs,
                     subject: None,
                     caption: None,
                     composed_prompt: None,
@@ -33174,7 +33176,7 @@ data: [DONE]\n\n"
             vec![("steward", answers("gen_w", "米色开衫"))],
             None,
             None,
-            Some("毛衣"),
+            Some(("毛衣", None)),
             |_| {},
         )
         .await;
@@ -33392,7 +33394,7 @@ data: [DONE]\n\n"
             ],
             Some(serde_json::json!({ "action": "reply_text_image", "inner_state": "" })),
             None,
-            Some("毛衣"),
+            Some(("毛衣", Some("steward"))),
             |m| m.image = Some(Default::default()),
         )
         .await;

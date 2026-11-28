@@ -4659,8 +4659,9 @@ mod tests {
 
     /// A seeded instance and session, its user message `在干嘛` sent at
     /// [`outfit_moment`], and a picture of hers for each `(minutes, clothing,
-    /// source)` of `pictures`: created that many minutes before the moment,
-    /// its `inputs.clothing_source` `source` when given.
+    /// source)` of `pictures`: created that many minutes before the moment
+    /// (after it when negative), its `inputs.clothing_source` `source` when
+    /// given.
     async fn outfit_turn(pool: &PgPool, pictures: &[(i64, &str, Option<&str>)]) -> OutfitTurn {
         let owner = Uuid::new_v4();
         let instance_id = seed_persona_instance(pool, owner).await;
@@ -4752,6 +4753,16 @@ mod tests {
     async fn a_carried_outfit_lapses(pool: PgPool) {
         let state = outfit_state(pool.clone(), true);
         let turn = outfit_turn(&pool, &[(46, "毛衣", Some("steward"))]).await;
+        let p = outfit_prompt(&state, &turn, None, turn.user_message_id).await;
+        assert!(!p.contains("此刻的穿着"), "{p}");
+    }
+
+    /// The read stops at the turn's moment: a picture created after the
+    /// driving message was sent is not this turn's to carry.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_picture_after_the_moment_is_not_carried(pool: PgPool) {
+        let state = outfit_state(pool.clone(), true);
+        let turn = outfit_turn(&pool, &[(-1, "毛衣", Some("steward"))]).await;
         let p = outfit_prompt(&state, &turn, None, turn.user_message_id).await;
         assert!(!p.contains("此刻的穿着"), "{p}");
     }
