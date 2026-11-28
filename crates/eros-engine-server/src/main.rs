@@ -440,6 +440,13 @@ async fn build_state(cfg: &ServerConfig, with_auth: bool) -> Result<AppState> {
              ([tasks.pde_decision].filter_prompt) is disabled — product_qa is inert"
         );
     }
+    // The steward's answer is read only by the image prompt composer.
+    if model_config.wardrobe_prompt_set() && !model_config.wardrobe_enabled() {
+        tracing::warn!(
+            "model_config: [tasks.pde_wardrobe] is configured but \
+             [tasks.chat_image_prompt_compose] is not — the wardrobe steward is inert"
+        );
+    }
 
     let output_regex = match model_config.compile_output_regex() {
         Ok(rules) => Arc::new(rules),
