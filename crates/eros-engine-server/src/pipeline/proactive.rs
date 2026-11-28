@@ -747,6 +747,7 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
             &plan,
             g.user_id,
             g.instance_id,
+            None,
             &g.now,
             None,
             None,

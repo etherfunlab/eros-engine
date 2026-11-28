@@ -462,9 +462,12 @@ pub(crate) fn run_group_turn(
                 .filter(|s| !s.is_empty())
                 .into_iter()
                 .collect();
+            // With the wardrobe steward on, the cue's clothing stays out of
+            // the plan (spec 2026-11-28-wardrobe-steward-design.md §8).
             let clothing = cue
                 .clothing
                 .as_deref()
+                .filter(|_| !state.model_config.wardrobe_enabled())
                 .map(sanitize_inner_state)
                 .filter(|s| !s.is_empty());
             let mut plan = eros_engine_core::pde::plan_for(

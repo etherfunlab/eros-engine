@@ -2550,6 +2550,8 @@ pub(crate) struct PdeVerdict {
     aspect_ratio: Option<String>,
     /// Judge-decided outfit for this turn (free text; sanitized like
     /// inner_state before injection). `None` on old prompts / null verdicts.
+    /// Kept out of the plan while the wardrobe steward is on (spec
+    /// 2026-11-28-wardrobe-steward-design.md §8); the audit keeps it.
     #[serde(default)]
     clothing: Option<String>,
     /// Judge-decided response to this turn's user action (spec 2026-10-05
@@ -5882,9 +5884,13 @@ pub(crate) fn run_stream_with(
                                 if s.is_empty() { Vec::new() } else { vec![s] }
                             };
                             killswitch_hints = hints.clone();
+                            // With the wardrobe steward on, the verdict's
+                            // clothing stays out of the plan (spec
+                            // 2026-11-28-wardrobe-steward-design.md §8).
                             let clothing = v
                                 .clothing
                                 .as_deref()
+                                .filter(|_| !state.model_config.wardrobe_enabled())
                                 .map(sanitize_inner_state)
                                 .filter(|s| !s.is_empty());
                             // Only image actions carry the judge's image_ref /
@@ -12301,7 +12307,8 @@ data: [DONE]\n\n";
     }
 
     /// [`run_together_turn_tweaked`] with `tones` appended to
-    /// `[tasks.chat_companion]`.
+    /// `[tasks.chat_companion]`. A wardrobe steward on model `steward` in
+    /// `tones` answers `运动服`.
     #[allow(clippy::too_many_arguments)]
     async fn run_together_turn_toned(
         pool: &PgPool,
@@ -12325,6 +12332,11 @@ data: [DONE]\n\n";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("\"model\":\"composer\""))
             .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"steward\""))
+            .respond_with(answers("gen_w", "运动服"))
             .mount(&mock)
             .await;
         if let Some(response) = response {
@@ -32705,10 +32717,10 @@ data: [DONE]\n\n"
     /// TOML `config` after `[tasks.chat_companion]` and the composer, which
     /// answers; each `(model, response)` of `models` mounted for that model;
     /// the judge answering `verdict` when given; the genome's `art_metadata`
-    /// set to `art` when given; a picture of hers wearing `last_worn` 10
-    /// minutes before the user message when given; and `tweak` applied to
-    /// the turn's message. The user message is sent at [`steward_moment`].
-    /// Returns the frames, the mock and the session.
+    /// set to `art` when given; a picture of hers the steward dressed in
+    /// `last_worn` 10 minutes before the user message when given; and
+    /// `tweak` applied to the turn's message. The user message is sent at
+    /// [`steward_moment`]. Returns the frames, the mock and the session.
     async fn steward_turn(
         pool: &PgPool,
         config: &str,
@@ -32811,7 +32823,10 @@ data: [DONE]\n\n"
                     instance_id: Some(instance_id),
                     session_id: Some(session_id),
                     status: "ok",
-                    inputs: serde_json::json!({ "clothing": clothing }),
+                    inputs: serde_json::json!({
+                        "clothing": clothing,
+                        "clothing_source": "steward",
+                    }),
                     subject: None,
                     caption: None,
                     composed_prompt: None,
@@ -32914,9 +32929,9 @@ data: [DONE]\n\n"
     /// One together turn with the steward on, pictures available and the
     /// judge answering `response`. The steward block takes the place of
     /// `run_together_turn_toned`'s tones, as a table of its own after
-    /// `[tasks.chat_companion]`; no responder is mounted for it, so a call
-    /// is still counted. Returns the frames, the requests sent to the
-    /// steward and the `inputs` of the turn's picture, if one was composed.
+    /// `[tasks.chat_companion]`; the steward answers `运动服`. Returns the
+    /// frames, the requests sent to the steward and the `inputs` of the
+    /// turn's picture, if one was composed.
     async fn steward_together_turn(
         pool: &PgPool,
         action: eros_engine_core::types::UserAction,
@@ -33215,6 +33230,22 @@ data: [DONE]\n\n"
         .await
         .unwrap();
         assert!(named, "the row's failures name pde_wardrobe");
+        let (attempts, errors) = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Final {
+                    llm_attempts,
+                    gateway_errors,
+                    ..
+                } => Some((llm_attempts, gateway_errors)),
+                _ => None,
+            })
+            .expect("a final frame");
+        assert!(
+            attempts.iter().any(|a| a.task == "pde_wardrobe")
+                || errors.iter().any(|e| e.task == "pde_wardrobe"),
+            "the final frame's failures name pde_wardrobe: {attempts:?} {errors:?}"
+        );
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
@@ -33289,5 +33320,131 @@ data: [DONE]\n\n"
         .await
         .unwrap();
         assert_eq!(len, 200);
+    }
+
+    // ─── The judge's clothing dropped, the steward's carried (spec
+    // 2026-11-28-wardrobe-steward-design.md §6, §8) ───
+
+    /// The streamed reply `primary` answers.
+    fn primary_replies() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_raw(sse("好呀", "gen_reply", "primary"), "text/event-stream")
+    }
+
+    /// The system prompt of the turn's reply request, the streamed one sent
+    /// to `primary`.
+    async fn primary_system_prompt(mock: &wiremock::MockServer) -> String {
+        let body = mock
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("\"model\":\"primary\"") && b.contains("\"stream\":true"))
+            .expect("the reply request");
+        system_prompt_of(&serde_json::from_str(&body).unwrap())
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_on_drops_the_judge_clothing(pool: PgPool) {
+        let (frames, mock, session) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![
+                ("steward", answers("gen_w", "米色开衫")),
+                ("primary", primary_replies()),
+            ],
+            Some(serde_json::json!({
+                "action": "reply_text_image", "inner_state": "", "clothing": "运动背心"
+            })),
+            None,
+            None,
+            |m| m.image = Some(Default::default()),
+        )
+        .await;
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyTextImage);
+        let system = primary_system_prompt(&mock).await;
+        assert!(!system.contains("运动背心"), "{system}");
+        assert_eq!(payloads_to(&mock, "steward").await.len(), 1);
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            composer[0].contains("[此刻穿着]\n米色开衫\n"),
+            "{}",
+            composer[0]
+        );
+        assert!(!composer[0].contains("运动背心"), "{}", composer[0]);
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing_source"], "steward", "{inputs}");
+    }
+
+    /// A judge-chosen picture 10 minutes after one the steward dressed: the
+    /// reply carries the earlier outfit, and the new picture is still the
+    /// steward's to dress.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_second_picture_in_the_window_still_calls_the_steward(pool: PgPool) {
+        let (frames, mock, session) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![
+                ("steward", answers("gen_w", "米色开衫")),
+                ("primary", primary_replies()),
+            ],
+            Some(serde_json::json!({ "action": "reply_text_image", "inner_state": "" })),
+            None,
+            Some("毛衣"),
+            |m| m.image = Some(Default::default()),
+        )
+        .await;
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyTextImage);
+        assert_eq!(payloads_to(&mock, "steward").await.len(), 1);
+        let system = primary_system_prompt(&mock).await;
+        assert!(system.contains("- 此刻的穿着：毛衣"), "{system}");
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing"], "米色开衫", "{inputs}");
+        assert_eq!(inputs["clothing_source"], "steward", "{inputs}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_does_not_read_its_own_picture(pool: PgPool) {
+        let (frames, mock, session) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![
+                ("steward", answers("gen_w", "米色开衫")),
+                ("primary", primary_replies()),
+            ],
+            Some(serde_json::json!({ "action": "reply_text_image", "inner_state": "" })),
+            None,
+            None,
+            |m| m.image = Some(Default::default()),
+        )
+        .await;
+        assert_eq!(image_requests(&frames), 1);
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing_source"], "steward", "{inputs}");
+        let system = primary_system_prompt(&mock).await;
+        assert!(!system.contains("此刻的穿着"), "{system}");
+    }
+
+    /// The positive control of the action-turn steward tests: an accepted
+    /// together action that no engine clothing covers is the steward's to
+    /// dress.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_dresses_the_picture_of_an_accepted_action(pool: PgPool) {
+        let (frames, steward, inputs) = steward_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::JogTogether,
+            "accept",
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_eq!(steward, 1);
+        let inputs = inputs.expect("a picture");
+        assert_eq!(inputs["clothing"], "运动服", "{inputs}");
+        assert_eq!(inputs["clothing_source"], "steward", "{inputs}");
     }
 }

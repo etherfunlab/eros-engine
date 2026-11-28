@@ -2721,4 +2721,58 @@ mod tests {
         assert_eq!(instance, instance_of(&f.pool, f.a).await);
         assert_eq!(inputs["clothing_source"], "steward", "{inputs}");
     }
+
+    /// Spec 2026-11-28-wardrobe-steward-design.md §8: with the steward on, a
+    /// cue's clothing leaves no outfit line in the speaker's reply; with it
+    /// off, the line is the cue's.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_on_drops_the_director_clothing(pool: PgPool) {
+        let verdict = r#"{"speakers":[{"member":"m1","action":"reply_text","inner_state":null,"reply_mode":null,"clothing":"运动背心"}],"reason":null}"#;
+        for (steward, client_msg_id) in [
+            (false, "01JDIRECTORCLOTHINGOFFSSSG"),
+            (true, "01JDIRECTORCLOTHINGONSSSSG"),
+        ] {
+            let extra = if steward {
+                format!(
+                    "{COMPOSE_TASK}[tasks.pde_wardrobe]\nmodel = \"steward-model\"\n\
+                     filter_prompt = \"DRESS\"\n"
+                )
+            } else {
+                COMPOSE_TASK.to_string()
+            };
+            let mut f = fixture_with(
+                pool.clone(),
+                Some(director_sse(verdict)),
+                200,
+                None,
+                &extra,
+                |_| {},
+            )
+            .await;
+            let (s, body) = send(
+                &mut f,
+                json!({"content":"在干嘛","client_msg_id":client_msg_id}),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{body}");
+            let chat: Value = f
+                ._server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+                .find(|b| b["model"] == "chat-model")
+                .expect("the speaker's reply request");
+            let system = chat["messages"][0]["content"]
+                .as_str()
+                .expect("the reply's system prompt");
+            if steward {
+                assert!(!system.contains("此刻的穿着"), "{system}");
+                assert!(!system.contains("运动背心"), "{system}");
+            } else {
+                assert!(system.contains("- 此刻的穿着：运动背心"), "{system}");
+            }
+        }
+    }
 }
