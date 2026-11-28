@@ -4829,13 +4829,14 @@ pub(crate) fn compose_source(a: ActionType) -> &'static str {
 /// section.
 ///
 /// Her `[此刻穿着]`, and the audit's `clothing`, is the first of these that
-/// is not blank (spec 2026-11-28-wardrobe-steward-design.md §5.1):
+/// is set (spec 2026-11-28-wardrobe-steward-design.md §5.1):
 /// `clothing_override`, the engine's own; `plan.clothing`, which stays as it
 /// is; with `[tasks.pde_wardrobe]` on, the wardrobe steward's answer for
-/// `turn`. The steward is asked only when the first two are blank. The audit
-/// `inputs` record which one dressed her as `clothing_source`, and the
-/// steward's call as `wardrobe` (§9); its failed attempts lead the
-/// composer's in the row and in the returned `failures`.
+/// `turn`. The steward is asked only when the first two are `None`; a set
+/// value that is blank wins and reads `（无）`. The audit `inputs` record
+/// which one dressed her as `clothing_source`, absent when the slot is
+/// `（无）`, and the steward's call as `wardrobe` (§9); its failed attempts
+/// lead the composer's in the row and in the returned `failures`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_delegated_image_prompt_for(
     state: &AppState,
@@ -4856,9 +4857,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
     turn: &crate::pipeline::wardrobe::PictureTurn,
 ) -> DelegatedImagePrompt {
     use crate::pipeline::wardrobe;
-    let engine_clothing = clothing_override.filter(|s| !s.trim().is_empty());
-    let plan_clothing = plan.clothing.as_deref().filter(|s| !s.trim().is_empty());
-    let steward = (engine_clothing.is_none() && plan_clothing.is_none())
+    let steward = (clothing_override.is_none() && plan.clothing.is_none())
         .then(|| state.model_config.resolve_wardrobe())
         .flatten();
     let dressed = match steward {
@@ -4877,9 +4876,9 @@ pub(crate) async fn build_delegated_image_prompt_for(
         ),
         None => None,
     };
-    let (clothing, clothing_source) = [
-        (engine_clothing, wardrobe::BY_ENGINE),
-        (plan_clothing, wardrobe::BY_PLAN),
+    let (clothing, dressed_by) = [
+        (clothing_override, wardrobe::BY_ENGINE),
+        (plan.clothing.as_deref(), wardrobe::BY_PLAN),
         (
             dressed.as_ref().and_then(|d| d.clothing.as_deref()),
             wardrobe::BY_STEWARD,
@@ -4888,6 +4887,8 @@ pub(crate) async fn build_delegated_image_prompt_for(
     .into_iter()
     .find_map(|(clothing, by)| clothing.map(|c| (c, by)))
     .unzip();
+    // A blank winner is the slot's `（无）`, which names no source (§9).
+    let clothing_source = dressed_by.filter(|_| clothing.is_some_and(|c| !c.trim().is_empty()));
     let inputs = resolve_image_turn_inputs(plan, req_image);
     let style_str = serde_json::to_value(inputs.style)
         .ok()
@@ -33060,6 +33061,51 @@ data: [DONE]\n\n"
             let inputs = inputs.unwrap_or_else(|| panic!("{action:?}: no picture"));
             assert_eq!(inputs["clothing_source"], "engine", "{action:?}: {inputs}");
         }
+    }
+
+    /// A blank clothing the engine writes (a passion act's empty custom side
+    /// for her) wins because it is set: over a named outfit, the slot reads
+    /// `（无）`, with no source and no steward call.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_blank_engine_clothing_stays_empty(pool: PgPool) {
+        use eros_engine_core::types::{RemainClothing, SideClothing, UserAction};
+        let (frames, mock, umid) = run_together_turn_toned(
+            &pool,
+            UserAction::SexTogether {
+                name: Some("姿势甲".into()),
+                active: None,
+                remain_clothing: RemainClothing::Sides {
+                    active: Some(SideClothing::HalfNaked),
+                    passive: Some(SideClothing::Custom(String::new())),
+                },
+                ignore_orientation: false,
+            },
+            Some("accept"),
+            "reply_text",
+            true,
+            &[],
+            true,
+            Some(serde_json::json!({"gender": "female"})),
+            None,
+            STEWARD_ON,
+            |m| {
+                m.outfit = Some("红色旗袍".into());
+                m.user_gender = Some(crate::routes::companion_stream::UserGender::Male);
+            },
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(payloads_to(&mock, "steward").await.is_empty());
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            composer[0].contains("[此刻穿着]\n（无）\n"),
+            "{}",
+            composer[0]
+        );
+        let inputs = newest_inputs(&pool, session_of(&pool, umid).await).await;
+        assert_eq!(inputs["clothing"], "", "{inputs}");
+        assert!(inputs.get("clothing_source").is_none(), "{inputs}");
+        assert!(inputs.get("wardrobe").is_none(), "{inputs}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
