@@ -138,7 +138,7 @@ fn non_blank<'a>(data: &'a serde_json::Map<String, Value>, field: &str) -> Optio
 }
 
 /// Validate a card (docs/eros-character-v1.2.md; `spec_version` `"1"`,
-/// `"1.1"` or `"1.2"`, read the same) on a `serde_json::Value`.
+/// `"1.1"`, `"1.2"` or `"1.3"`, read the same) on a `serde_json::Value`.
 /// serde's own error text quotes the input, so it is never surfaced: every
 /// `Err` is one of the fixed messages below.
 pub(crate) fn parse_card_v1(plaintext: &[u8]) -> Result<Card, String> {
@@ -151,7 +151,7 @@ pub(crate) fn parse_card_v1(plaintext: &[u8]) -> Result<Card, String> {
     }
     if !matches!(
         top.get("spec_version").and_then(Value::as_str),
-        Some("1" | "1.1" | "1.2")
+        Some("1" | "1.1" | "1.2" | "1.3")
     ) {
         return Err("unsupported spec_version".into());
     }
@@ -501,8 +501,12 @@ mod tests {
             serde_json::json!({"spec":"eros-character","spec_version":"1.2","data":{"name":"A","system_prompt":"p"}})
         )
         .is_ok());
+        assert!(ok(
+            serde_json::json!({"spec":"eros-character","spec_version":"1.3","data":{"name":"A","system_prompt":"p"}})
+        )
+        .is_ok());
         assert_eq!(
-            ok(serde_json::json!({"spec":"eros-character","spec_version":"1.3","data":{"name":"A","system_prompt":"p"}}))
+            ok(serde_json::json!({"spec":"eros-character","spec_version":"1.4","data":{"name":"A","system_prompt":"p"}}))
                 .err()
                 .as_deref(),
             Some("unsupported spec_version")
@@ -525,6 +529,19 @@ mod tests {
             serde_json::json!({"name":"A","system_prompt":"p","tip_personality":3})
         ))
         .is_err());
+    }
+
+    #[test]
+    fn card_1_3_carries_art_metadata_clothing() {
+        let card = parse_card_v1(
+            serde_json::json!({"spec":"eros-character","spec_version":"1.3","data":{
+                "name":"A","system_prompt":"p",
+                "art_metadata":{"clothing":"平时穿白衬衫"}}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(card.art_metadata["clothing"], "平时穿白衬衫");
     }
 
     #[test]
