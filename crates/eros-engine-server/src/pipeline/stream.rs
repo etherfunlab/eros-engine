@@ -33170,6 +33170,35 @@ data: [DONE]\n\n"
         assert!(inputs.get("wardrobe").is_none(), "{inputs}");
     }
 
+    /// The turn [`steward_dresses_a_forced_picture`] dresses, with the task
+    /// unset: the steward is not called and the slot stays `（无）`, with no
+    /// source.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_off_leaves_an_undressed_picture_empty(pool: PgPool) {
+        let (frames, mock, session) = steward_turn(
+            &pool,
+            "",
+            vec![("steward", answers("gen_w", "米色开衫"))],
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+        assert_eq!(image_requests(&frames), 1);
+        assert!(payloads_to(&mock, "steward").await.is_empty());
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            composer[0].contains("[此刻穿着]\n（无）\n"),
+            "{}",
+            composer[0]
+        );
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing"], "", "{inputs}");
+        assert!(inputs.get("clothing_source").is_none(), "{inputs}");
+        assert!(inputs.get("wardrobe").is_none(), "{inputs}");
+    }
+
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]
     async fn steward_shows_the_last_picture(pool: PgPool) {
         let (_, mock, session) = steward_turn(
