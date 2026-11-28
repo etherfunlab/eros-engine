@@ -694,6 +694,7 @@ pub(crate) fn run_group_turn(
                 None,
                 Some(&view),
                 eros_engine_core::tone::Tone::Default,
+                true,
             )
             .await
             {

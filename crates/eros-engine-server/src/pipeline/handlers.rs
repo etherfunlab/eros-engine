@@ -1015,6 +1015,7 @@ pub(crate) async fn build_reply_request(
         event,
         None,
         eros_engine_core::tone::Tone::Default,
+        true,
     )
     .await
 }
@@ -1056,6 +1057,7 @@ pub(crate) async fn build_focused_reply_request(
         event,
         None,
         tone,
+        true,
     )
     .await
 }
@@ -1096,6 +1098,11 @@ pub(crate) async fn build_reply_request_with(
     event: Option<&crate::prompt::EventLines>,
     group: Option<&crate::pipeline::group::GroupSpeakerView>,
     tone: eros_engine_core::tone::Tone,
+    // Whether her outfit line, when the plan has no clothing, carries the
+    // steward's outfit from an earlier picture (spec
+    // 2026-11-28-wardrobe-steward-design.md §6). The image-edit endpoint's
+    // text reply passes false: its outfit is the plan's clothing only.
+    carry_outfit: bool,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let focused = tone.on_focused_template();
     let chat_repo = ChatRepo { pool: &state.pool };
@@ -1342,12 +1349,13 @@ pub(crate) async fn build_reply_request_with(
         character_state.as_ref()
     };
 
-    // Her outfit line: this turn's clothing, else the steward's from an
-    // earlier picture (spec 2026-11-28-wardrobe-steward-design.md §6). The
-    // carried outfit never joins the plan.
+    // Her outfit line: this turn's clothing, else, with `carry_outfit`, the
+    // steward's from an earlier picture (spec
+    // 2026-11-28-wardrobe-steward-design.md §6). The carried outfit never
+    // joins the plan.
     let outfit = match &plan.clothing {
         Some(c) => Some(c.clone()),
-        None => {
+        None if carry_outfit => {
             crate::pipeline::wardrobe::carried_clothing(
                 state,
                 instance_id,
@@ -1356,6 +1364,7 @@ pub(crate) async fn build_reply_request_with(
             )
             .await
         }
+        None => None,
     };
 
     let mut system_prompt = if focused {
@@ -4418,6 +4427,7 @@ mod tests {
             None,
             Some(&view),
             eros_engine_core::tone::Tone::Default,
+            true,
         )
         .await
         .expect("build_reply_request_with succeeds");
@@ -5444,6 +5454,7 @@ mod tests {
             None,
             view.as_ref(),
             eros_engine_core::tone::Tone::Default,
+            true,
         )
         .await
         .expect("build_reply_request_with succeeds");
