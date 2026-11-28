@@ -203,7 +203,7 @@ dresses the speaker.
 One read serves the steward's `[上次穿着]` and the reply prompt's carried
 line (§6).
 
-- **The turn's moment** is the `created_at` of the user message the turn
+- **The turn's moment** is the `sent_at` of the user message the turn
   answers, or the present on a turn that answers none (an event message,
   an opening).
 - **The window** is the 45 minutes before the turn's moment: one
