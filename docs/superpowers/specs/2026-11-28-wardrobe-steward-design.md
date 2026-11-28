@@ -71,8 +71,10 @@ is not the same thing and is allowed. *(Owner's ruling.)*
 - The steward's answer in the reply prompt of the turn that called it.
 - A stored "what she is wearing now". The last picture's clothing is read
   back from the picture audit rows (§5.3); nothing new is stored.
-- The standalone compose endpoint and the image-edit endpoint. Both keep
-  sending what they send today.
+- The standalone compose endpoint and the image-edit endpoint's composer.
+  Both keep sending what they send today: neither calls the steward, and
+  an edited picture records no clothing, so an edit does not change the
+  carried outfit.
 - A change to any engine-written clothing, to `[指定穿着]`, to
   `[你的衣柜]` in the judge's context and the reply prompt, or to the
   composer's built-in prompt.
@@ -244,9 +246,10 @@ the plan's clothing fills today, is filled by the first of:
   this change) is not the steward's.
 - The line has the wording and the place it has today. It says nothing
   of the picture or of the time.
-- It applies to every reply prompt that renders the outfit line today:
-  a 1:1 reply, a group member's reply, an event message. The judge's and
-  the director's contexts do not carry it.
+- It applies to every reply prompt the reply builders write: a 1:1
+  reply, a group member's reply, an event message, and the text reply
+  sent with an edited picture. The judge's and the director's contexts do
+  not carry it.
 - The carried clothing is **not** written into the plan's clothing. It
   joins only where the reply prompt is built. The plan's clothing is
   what the picture entrance reads as "already dressed" (§5.1); a carried
