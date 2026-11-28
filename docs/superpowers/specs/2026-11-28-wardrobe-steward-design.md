@@ -2,7 +2,7 @@
 
 - **Date:** 2026-11-28
 - **Status:** Approved
-- **Type:** Engine change. No migration. Config, additive: one task
+- **Type:** Engine change. One migration: an index. Config, additive: one task
   (`[tasks.pde_wardrobe]`). Card, additive: one `art_metadata` key
   (`clothing`), character card 1.3. Audit, additive: two keys in
   `chat_images_events.inputs`. No new route, frame, action or event kind.
@@ -16,7 +16,9 @@
   and `2026-11-27-passion-group-design.md` §7 (what the engine writes into
   the picture's clothing), `2026-10-26-event-message-image-design.md` and
   `2026-10-26-group-two-person-image-design.md` (the other two pictures),
-  `2026-08-14-image-audit-events-design.md` (the picture's audit row).
+  `2026-08-14-image-audit-events-design.md` (the picture's audit row),
+  `2026-10-16-byoc-design.md` §2.2 and §8 (what the audit tables keep of a
+  card, and that they do not feed generation; §5.4 below changes both).
 
 ## 1. Intent
 
@@ -71,10 +73,11 @@ is not the same thing and is allowed. *(Owner's ruling.)*
 - The steward's answer in the reply prompt of the turn that called it.
 - A stored "what she is wearing now". The last picture's clothing is read
   back from the picture audit rows (§5.3); nothing new is stored.
-- The standalone compose endpoint and the image-edit endpoint's composer.
-  Both keep sending what they send today: neither calls the steward, and
-  an edited picture records no clothing, so an edit does not change the
-  carried outfit.
+- The standalone compose endpoint and the image-edit endpoint. Both keep
+  sending what they send today: neither calls the steward, the text reply
+  sent with an edited picture carries no outfit from an earlier picture,
+  and an edited picture records no clothing, so an edit does not change
+  the carried outfit.
 - A change to any engine-written clothing, to `[指定穿着]`, to
   `[你的衣柜]` in the judge's context and the reply prompt, or to the
   composer's built-in prompt.
@@ -164,7 +167,7 @@ The task name joins the engine's list of known task names, so provider
 
 ### 5.1 Who dresses her
 
-At the picture entrance, the first of these that has something:
+At the picture entrance, the first of these that is set:
 
 | # | Source | Today |
 |---|---|---|
@@ -173,8 +176,11 @@ At the picture entrance, the first of these that has something:
 | 3 | The steward, when on | new |
 | 4 | Nothing: `（无）` | unchanged |
 
-The steward is called only when 1 and 2 are both empty. Nothing else
-decides whether it runs: no list of actions or event kinds.
+The steward is called only when 1 and 2 are both unset. Nothing else
+decides whether it runs: no list of actions or event kinds. A source that
+is set but blank still wins: the slot reads `（无）`, no source is
+recorded, and the steward is not asked, which is what keeps the picture
+the same as before when the task is unset.
 
 This covers every caller of the entrance: a 1:1 turn's picture (chosen by
 the judge, forced, or the picture of an accepted action, inside a date as
@@ -228,6 +234,23 @@ dresses her afresh.
 
 A failed read is warned and reads as no row.
 
+The read is served by an index on `(instance_id, created_at DESC)`, which
+replaces the single-column index on `instance_id` and still covers the
+foreign key. The query does not depend on it to run.
+*(Owner's ruling.)*
+
+### 5.4 The audit rows as a source
+
+This read makes `engine.chat_images_events` the one audit table the
+engine reads back to drive a request. It reads three things of a row: the
+clothing slot, its source and its time. The slot is the engine's own
+output or the caller's input; no field of the card is read back.
+
+The rows themselves now keep more of the card than `appearance`: the
+`clothing` brief and the wardrobe list, in `inputs.wardrobe` (§9), on a
+bring-your-own-character instance as on any other. The BYOC documents
+state both facts as they are. *(Owner's ruling.)*
+
 ## 6. The carried line
 
 The reply prompt's outfit line, the one inside `[character_state]` that
@@ -246,10 +269,10 @@ the plan's clothing fills today, is filled by the first of:
   this change) is not the steward's.
 - The line has the wording and the place it has today. It says nothing
   of the picture or of the time.
-- It applies to every reply prompt the reply builders write: a 1:1
-  reply, a group member's reply, an event message, and the text reply
-  sent with an edited picture. The judge's and the director's contexts do
-  not carry it.
+- It applies to every reply prompt that renders the outfit line today:
+  a 1:1 reply, a group member's reply, an event message. The text reply
+  sent with an edited picture does not carry it. The judge's and the
+  director's contexts do not carry it.
 - The carried clothing is **not** written into the plan's clothing. It
   joins only where the reply prompt is built. The plan's clothing is
   what the picture entrance reads as "already dressed" (§5.1); a carried
@@ -405,13 +428,14 @@ answers.
 
 1. Code, one PR: the task and its resolver, the entrance, the judge's and
    director's `clothing` dropped when on, the last-picture read and the
-   carried line, the audit keys, card 1.3 acceptance, the example config
-   blocks.
+   carried line, the index migration, the audit keys, card 1.3
+   acceptance, the example config blocks.
 2. Docs, a PR of their own after it: `model-config` (the task, the
    `[此刻穿着]` paragraph, the judge's `clothing` field, the outfit line
    in `[character_state]`), the character card 1.3 document, `llm-audit`
-   (the two `inputs` keys), `group-chat` (the director's `clothing`), in
-   both languages where a document has both.
+   (the two `inputs` keys), `group-chat` (the director's `clothing`),
+   `byoc` (what the image audit keeps of a card, and that its clothing
+   slot is read back), in both languages where a document has both.
 
 ## 13. Decisions
 
@@ -432,6 +456,10 @@ Owner's rulings:
   called it.
 - The carried outfit lasts 45 minutes, a fixed value, above a short
   event and below a mid one, so that clothing does not stick.
+- The picture audit rows are read back for the clothing slot, and keep
+  the card's `clothing` brief and wardrobe, BYOC included; the BYOC
+  documents are reworded to say so.
+- The read gets its index, by a migration.
 
 My calls, open to the owner:
 
