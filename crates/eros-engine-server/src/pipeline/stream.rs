@@ -6762,16 +6762,14 @@ pub(crate) fn run_stream_with(
                 // image paths carry its failed hops out to the `final` frame.
                 let mut compose_failures: Vec<eros_engine_llm::failure::AttemptFailure> =
                     Vec::new();
-                // The turn's `[now]`: the reply's, and the picture's as the
-                // wardrobe steward reads it, with the user message the turn
-                // answers (spec 2026-11-28-wardrobe-steward-design.md §5.2,
-                // §5.3).
-                let now_ctx = crate::prompt::NowContext::for_user(
-                    &user_msg.user_locale,
-                    chrono::Utc::now(),
-                );
+                // The picture's `[now]` as the wardrobe steward reads it, with
+                // the user message the turn answers (spec
+                // 2026-11-28-wardrobe-steward-design.md §5.2, §5.3).
                 let picture_of_turn = crate::pipeline::wardrobe::PictureTurn {
-                    now: now_ctx.clone(),
+                    now: crate::prompt::NowContext::for_user(
+                        &user_msg.user_locale,
+                        chrono::Utc::now(),
+                    ),
                     driving_message: Some(user_msg.user_message_id),
                 };
 
@@ -7184,6 +7182,10 @@ pub(crate) fn run_stream_with(
                     } else {
                         AbortOnDrop(None)
                     };
+                let now_ctx = crate::prompt::NowContext::for_user(
+                    &user_msg.user_locale,
+                    chrono::Utc::now(),
+                );
                 let req_res = if emotional {
                     crate::pipeline::handlers::build_emotional_reply_request(
                         &state, &input, &plan,
