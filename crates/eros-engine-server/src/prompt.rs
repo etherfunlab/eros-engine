@@ -254,6 +254,21 @@ fn now_context_at(
     )
 }
 
+/// Her local date, weekday, time and day-part on the persona clock `[now]`
+/// uses for her: 「2026-11-28（周六）21:05，傍晚」.
+pub(crate) fn persona_local_time(persona: &CompanionPersona, now: &NowContext) -> String {
+    let tz = persona_clock_tz(meta_str(persona, "timezone"), now.user_timezone);
+    let local = now.now.with_timezone(&tz);
+    format!(
+        "{date}（{wd}）{hh:02}:{mm:02}，{period}",
+        date = local.format("%Y-%m-%d"),
+        wd = weekday_cn(local.weekday()),
+        hh = local.hour(),
+        mm = local.minute(),
+        period = period_cn(local.hour()),
+    )
+}
+
 // Cold floors shared by the `[mood]` directives and the nudge veto. At or
 // below the floor the axis's cold directive renders — and a die whose
 // directive would fight that conclusion is not rolled.
@@ -2278,9 +2293,11 @@ fn render_prompt(
     // iron rule ① and the [reply_length] listen-downgrade. `None` ⇒ the
     // pre-mode default (byte-identical rule ① text, no downgrade).
     reply_mode: Option<ReplyMode>,
-    // The outfit for this turn (ActionPlan.clothing): the caller's named
-    // outfit, else the judge's. `None` or blank ⇒ no outfit line renders
-    // (folded into [character_state]).
+    // The outfit for this turn: ActionPlan.clothing (the caller's named
+    // outfit, else the judge's while the wardrobe steward is off), else the
+    // steward's carried outfit (spec 2026-11-28-wardrobe-steward-design.md
+    // §6). `None` or blank ⇒ no outfit line renders (folded into
+    // [character_state]).
     clothing: Option<&str>,
     prompt_traits: &[PromptTrait],
     affinity_scope: AffinityScope,
@@ -2515,7 +2532,7 @@ fn render_prompt(
     };
 
     // Volatile (per-turn) character state, read from `character_insights`,
-    // plus the persona's item lists and the outfit (ActionPlan.clothing) as further lines.
+    // plus the persona's item lists and the outfit (`clothing`) as further lines.
     //
     // ONLY these four `character_insights` fields. `habits` / `personal_values`
     // are facets of who she is, whose source of truth is `persona_genomes` —
@@ -2559,7 +2576,7 @@ fn render_prompt(
                 lines.push(format!("- {label}：{list}"));
             }
         }
-        // Judge-decided outfit (spec §3.5): a line of present-tense state,
+        // Her outfit (spec §3.5): a line of present-tense state,
         // not a section of its own. Renders alone when insights are empty.
         if let Some(c) = clothing.map(str::trim).filter(|c| !c.is_empty()) {
             lines.push(format!("- 此刻的穿着：{c}"));

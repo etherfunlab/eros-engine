@@ -52,7 +52,7 @@ use eros_engine_store::image_events::ImageComposeEventInsert;
 use crate::auth::middleware::AuthUser;
 use crate::error::AppError;
 use crate::pipeline::handlers::{
-    build_reply_request, compose_image_prompt, model_facing_assistant_text, CHAT_TASK,
+    build_reply_request_with, compose_image_prompt, model_facing_assistant_text, CHAT_TASK,
 };
 use crate::pipeline::post_process::ProducedMessage;
 use crate::pipeline::stream::{
@@ -421,7 +421,9 @@ async fn generate_reply_text(
             "你已经按对方的要求把照片改好，随这条回复一起发出——新照片里{c}。照片已经在对方眼前，直接说贴着它的话"
         )];
     }
-    let (chat_req, injected_tags) = match build_reply_request(
+    // No carried outfit: the reply sent with an edited picture carries none
+    // from an earlier picture (spec 2026-11-28-wardrobe-steward-design.md §6).
+    let (chat_req, injected_tags) = match build_reply_request_with(
         state,
         &input,
         &plan,
@@ -434,12 +436,15 @@ async fn generate_reply_text(
         None,
         None,
         None,
+        None,
+        eros_engine_core::tone::Tone::Default,
+        false,
     )
     .await
     {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("image_edit text half: build_reply_request failed: {e}");
+            tracing::warn!("image_edit text half: build_reply_request_with failed: {e}");
             return TextOutcome::default();
         }
     };
@@ -2424,6 +2429,88 @@ pattern = '\s*\[note:[^\]]*\]'
             !chat.contains("带点小傲娇"),
             "stored, undecayed tension leaked: {chat}"
         );
+    }
+
+    /// The text reply sent with an edited picture carries no outfit from an
+    /// earlier picture (spec 2026-11-28-wardrobe-steward-design.md §2, §6):
+    /// the steward is on and dressed her ten minutes before the edit, which a
+    /// text turn answering the instruction would carry, and the edit's reply
+    /// prompt has no outfit line.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_edit_reply_carries_no_outfit(pool: PgPool) {
+        let user_id = Uuid::new_v4();
+        let genome_id = seed_genome(&pool, "Aria").await;
+        let instance_id = seed_instance(&pool, genome_id, user_id).await;
+        let session_id = seed_session(&pool, user_id, instance_id).await;
+        let (_, mid) = seed_image_turn(&pool, session_id).await;
+        // The endpoint stamps the instruction with the present, so the earlier
+        // picture is placed against the database clock.
+        sqlx::query(
+            "INSERT INTO engine.chat_images_events \
+               (source, user_id, instance_id, session_id, status, inputs, attempts, created_at) \
+             VALUES ('chat_reply_image', $1, $2, $3, 'ok', $4, 1, now() - interval '10 minutes')",
+        )
+        .bind(user_id)
+        .bind(instance_id)
+        .bind(session_id)
+        .bind(json!({ "clothing": "毛衣", "clothing_source": "steward" }))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mock = MockServer::start().await;
+        mount_editor_and_judge(&mock).await;
+        mount_companion(&mock).await;
+        let toml = format!(
+            "{FULL_TURN_TOML}\
+             [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"COMPOSE\"\n\
+             [tasks.pde_wardrobe]\nmodel = \"steward\"\nfilter_prompt = \"DRESS\"\n"
+        );
+        let state = with_composer(test_state(pool.clone()), &mock.uri(), &toml);
+        let mut app = build_router(state.clone());
+        let token = mint_test_jwt(user_id);
+
+        let (status, body) = send_request(
+            &mut app,
+            edit_req(
+                session_id,
+                mid,
+                &token,
+                json!({"instruction": "换套衣服",
+                       "persist_instruction": true,
+                       "reply_with_text": 1.0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["action_type"], json!("reply_text_image"));
+        let instruction_id =
+            Uuid::parse_str(body["instruction_message_id"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            crate::pipeline::wardrobe::carried_clothing(
+                &state,
+                instance_id,
+                Some(instruction_id),
+                chrono::Utc::now(),
+            )
+            .await
+            .as_deref(),
+            Some("毛衣"),
+            "the picture is one a text turn at the instruction would carry"
+        );
+
+        let system = mock
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).unwrap())
+            .find(|b| b.to_string().contains("you are a companion"))
+            .expect("a chat companion call was made")["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!system.contains("此刻的穿着"), "{system}");
     }
 
     #[sqlx::test(migrations = "../eros-engine-store/migrations")]

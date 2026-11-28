@@ -1393,6 +1393,20 @@ pub struct ResolvedProductQa {
     pub sampling: Sampling,
 }
 
+/// Resolved wardrobe steward task (`pde_wardrobe`): the configured
+/// `filter_prompt` is the steward's system instruction; the engine builds the
+/// user payload. `fallback_model` is already truncated to `retry_depth`.
+#[derive(Debug, Clone)]
+pub struct ResolvedWardrobe {
+    pub model: String,
+    pub fallback_model: Vec<String>,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub steward_prompt: String,
+    pub retry_depth: u32,
+    pub sampling: Sampling,
+}
+
 /// Resolved extraction task (`insight_extraction` facts stage / `dreaming_scan`).
 /// The configured `filter_prompt` is the system instruction; the server assembles
 /// the conversation as a separate user message. Model selection mirrors the generic
@@ -2200,6 +2214,47 @@ impl ModelConfig {
             .and_then(|t| t.filter_prompt.as_ref())
             .and_then(PromptSpec::as_plain)
             .is_some_and(|p| !p.trim().is_empty())
+    }
+
+    /// Side-effect-free: true iff `[tasks.pde_wardrobe]` is present with a
+    /// non-blank plain `filter_prompt`. Boot checks read this; it never calls
+    /// `resolve()`, which advances the round-robin cursor.
+    pub fn wardrobe_prompt_set(&self) -> bool {
+        self.tasks
+            .get(WARDROBE_TASK)
+            .and_then(|t| t.filter_prompt.as_ref())
+            .and_then(PromptSpec::as_plain)
+            .is_some_and(|p| !p.trim().is_empty())
+    }
+
+    /// Side-effect-free: the steward runs iff its prompt is set and the image
+    /// prompt composer is configured, the composer being the only reader of
+    /// the steward's answer.
+    pub fn wardrobe_enabled(&self) -> bool {
+        self.wardrobe_prompt_set() && self.tasks.contains_key("chat_image_prompt_compose")
+    }
+
+    /// Resolve the wardrobe steward task. `None` unless `wardrobe_enabled()`.
+    /// Task-level only (no tier override), like `pde_decision`.
+    pub fn resolve_wardrobe(&self) -> Option<ResolvedWardrobe> {
+        if !self.wardrobe_enabled() {
+            return None;
+        }
+        let task_cfg = self.tasks.get(WARDROBE_TASK)?;
+        let steward_prompt = plain_or_empty(task_cfg.filter_prompt.as_ref());
+        let retry_depth = task_cfg.retry_depth.unwrap_or(1);
+        let m = self.resolve(WARDROBE_TASK, None);
+        let mut fallback_model = m.fallback_model;
+        fallback_model.truncate(retry_depth as usize);
+        Some(ResolvedWardrobe {
+            model: m.model,
+            fallback_model,
+            temperature: m.temperature,
+            max_tokens: m.max_tokens,
+            steward_prompt,
+            retry_depth,
+            sampling: m.sampling,
+        })
     }
 
     /// Boot-time validation for the product-QA task: a present section must
@@ -3097,6 +3152,10 @@ pub const ARC_REWRITE_TASK: &str = "arc_rewrite";
 /// `[tasks.affinity_evaluation]`'s parameters.
 pub const ACTIVITY_JUDGE_TASK: &str = "activity_judge";
 
+/// The wardrobe steward, which decides what a character wears in a picture.
+/// The prompt is the block's plain `filter_prompt`.
+pub const WARDROBE_TASK: &str = "pde_wardrobe";
+
 /// The least `max_tokens` the activity judge is given: its reply carries an
 /// episode and moments on top of the per-turn verdict, and a truncated reply
 /// parses as nothing.
@@ -3126,6 +3185,7 @@ pub const KNOWN_CHAT_TASKS: &[&str] = &[
     "chat_image_edit_compose",
     "chat_product_qa",
     "pde_decision",
+    WARDROBE_TASK,
     "insight_extraction",
     DREAMING_SCAN_TASK,
     ARC_REWRITE_TASK,
@@ -6256,6 +6316,47 @@ filter_prompt = "只根据产品资料作答。"
         )
         .unwrap();
         assert!(cfg.pde_enabled());
+    }
+
+    const COMPOSER: &str = "[tasks.chat_image_prompt_compose]\nmodel = \"c\"\n";
+
+    #[test]
+    fn wardrobe_on_with_a_prompt_and_the_composer() {
+        let cfg = ModelConfig::from_toml_str(&format!(
+            "{COMPOSER}[tasks.pde_wardrobe]\nmodel = \"w\"\nfallback = [\"w2\", \"w3\"]\nretry_depth = 1\nfilter_prompt = \"dress her\"\n"
+        ))
+        .unwrap();
+        assert!(cfg.wardrobe_prompt_set());
+        assert!(cfg.wardrobe_enabled());
+        let r = cfg.resolve_wardrobe().unwrap();
+        assert_eq!(r.model, "w");
+        assert_eq!(r.fallback_model, vec!["w2".to_string()]);
+        assert_eq!(r.steward_prompt, "dress her");
+    }
+
+    #[test]
+    fn wardrobe_off_without_block_prompt_or_composer() {
+        for toml in [
+            COMPOSER.to_string(),
+            format!("{COMPOSER}[tasks.pde_wardrobe]\nmodel = \"w\"\n"),
+            format!("{COMPOSER}[tasks.pde_wardrobe]\nmodel = \"w\"\nfilter_prompt = \"   \"\n"),
+            "[tasks.pde_wardrobe]\nmodel = \"w\"\nfilter_prompt = \"dress her\"\n".to_string(),
+        ] {
+            let cfg = ModelConfig::from_toml_str(&toml).unwrap();
+            assert!(!cfg.wardrobe_enabled(), "{toml}");
+            assert!(cfg.resolve_wardrobe().is_none(), "{toml}");
+        }
+        // The last case has a prompt but no composer: that is what the boot WARN reads.
+        let cfg = ModelConfig::from_toml_str(
+            "[tasks.pde_wardrobe]\nmodel = \"w\"\nfilter_prompt = \"dress her\"\n",
+        )
+        .unwrap();
+        assert!(cfg.wardrobe_prompt_set());
+    }
+
+    #[test]
+    fn wardrobe_is_a_known_chat_task() {
+        assert!(KNOWN_CHAT_TASKS.contains(&WARDROBE_TASK));
     }
 
     #[test]

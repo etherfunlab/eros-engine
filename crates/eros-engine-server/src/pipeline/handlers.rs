@@ -1015,6 +1015,7 @@ pub(crate) async fn build_reply_request(
         event,
         None,
         eros_engine_core::tone::Tone::Default,
+        true,
     )
     .await
 }
@@ -1056,6 +1057,7 @@ pub(crate) async fn build_focused_reply_request(
         event,
         None,
         tone,
+        true,
     )
     .await
 }
@@ -1096,6 +1098,11 @@ pub(crate) async fn build_reply_request_with(
     event: Option<&crate::prompt::EventLines>,
     group: Option<&crate::pipeline::group::GroupSpeakerView>,
     tone: eros_engine_core::tone::Tone,
+    // Whether her outfit line, when the plan has no clothing, carries the
+    // steward's outfit from an earlier picture (spec
+    // 2026-11-28-wardrobe-steward-design.md §6). The image-edit endpoint's
+    // text reply passes false: its outfit is the plan's clothing only.
+    carry_outfit: bool,
 ) -> Result<(ChatRequest, Vec<String>), AppError> {
     let focused = tone.on_focused_template();
     let chat_repo = ChatRepo { pool: &state.pool };
@@ -1342,6 +1349,24 @@ pub(crate) async fn build_reply_request_with(
         character_state.as_ref()
     };
 
+    // Her outfit line: this turn's clothing, else, with `carry_outfit`, the
+    // steward's from an earlier picture (spec
+    // 2026-11-28-wardrobe-steward-design.md §6). The carried outfit never
+    // joins the plan.
+    let outfit = match &plan.clothing {
+        Some(c) => Some(c.clone()),
+        None if carry_outfit => {
+            crate::pipeline::wardrobe::carried_clothing(
+                state,
+                instance_id,
+                (!user_message_id.is_nil()).then_some(user_message_id),
+                now.now,
+            )
+            .await
+        }
+        None => None,
+    };
+
     let mut system_prompt = if focused {
         let build = if tone == eros_engine_core::tone::Tone::Mean {
             crate::prompt::build_mean_prompt
@@ -1355,7 +1380,7 @@ pub(crate) async fn build_reply_request_with(
             Some(&input.affinity),
             &plan.context_hints,
             plan.reply_mode,
-            plan.clothing.as_deref(),
+            outfit.as_deref(),
             &kept_traits,
             affinity_scope,
             world.as_ref(),
@@ -1377,7 +1402,7 @@ pub(crate) async fn build_reply_request_with(
             Some(&input.affinity),
             &plan.context_hints,
             plan.reply_mode,
-            plan.clothing.as_deref(),
+            outfit.as_deref(),
             &kept_traits,
             affinity_scope,
             &emotional_context,
@@ -1527,6 +1552,9 @@ pub(crate) async fn build_reply_request_with(
 /// §7.2): the same, plus the `[relationship]` block and the chemistry tier's
 /// line, read from `input.affinity` and the event's affinity scope. Any other
 /// `tone` is the `emotional` prompt.
+///
+/// `driving_message` is the user message the turn answers, `None` for an
+/// event message: the moment the steward's carried outfit is read at.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_emotional_system_request(
     state: &AppState,
@@ -1534,6 +1562,7 @@ pub(crate) async fn build_emotional_system_request(
     plan: &ActionPlan,
     user_id: Uuid,
     instance_id: Uuid,
+    driving_message: Option<Uuid>,
     now: &crate::prompt::NowContext,
     body_state: Option<&str>,
     needs: Option<&str>,
@@ -1609,6 +1638,21 @@ pub(crate) async fn build_emotional_system_request(
             })
     };
 
+    // Her outfit line, as on the default path (spec
+    // 2026-11-28-wardrobe-steward-design.md §6).
+    let outfit = match &plan.clothing {
+        Some(c) => Some(c.clone()),
+        None => {
+            crate::pipeline::wardrobe::carried_clothing(
+                state,
+                instance_id,
+                driving_message,
+                now.now,
+            )
+            .await
+        }
+    };
+
     let system_prompt = if matches!(
         tone,
         eros_engine_core::tone::Tone::Erotic | eros_engine_core::tone::Tone::Drowsy
@@ -1621,7 +1665,7 @@ pub(crate) async fn build_emotional_system_request(
         build(
             &input.persona,
             plan.reply_mode,
-            plan.clothing.as_deref(),
+            outfit.as_deref(),
             &kept_traits,
             world.as_ref(),
             stories.as_ref(),
@@ -1639,7 +1683,7 @@ pub(crate) async fn build_emotional_system_request(
         crate::prompt::build_emotional_prompt(
             &input.persona,
             plan.reply_mode,
-            plan.clothing.as_deref(),
+            outfit.as_deref(),
             &kept_traits,
             world.as_ref(),
             stories.as_ref(),
@@ -1690,6 +1734,7 @@ pub(crate) async fn build_emotional_reply_request(
         plan,
         user_id,
         instance_id,
+        Some(user_message_id),
         now,
         body_state,
         needs,
@@ -4382,6 +4427,7 @@ mod tests {
             None,
             Some(&view),
             eros_engine_core::tone::Tone::Default,
+            true,
         )
         .await
         .expect("build_reply_request_with succeeds");
@@ -4579,6 +4625,223 @@ mod tests {
             "a plan-carried outfit line must survive \
              CHAT_NOISE_CANCELLATION_DISABLED: {system_prompt:?}",
         );
+    }
+
+    // ─── The carried outfit (spec 2026-11-28-wardrobe-steward-design.md
+    // §5.3, §6) ──
+
+    /// The reply prompt's outfit line, as it renders `clothing`.
+    fn outfit_line(clothing: &str) -> String {
+        format!("- 此刻的穿着：{clothing}")
+    }
+
+    /// The `sent_at` of a carried-outfit turn's user message.
+    fn outfit_moment() -> chrono::DateTime<chrono::Utc> {
+        "2026-11-01T12:00:00Z".parse().unwrap()
+    }
+
+    /// A test state with the image composer configured, and the wardrobe
+    /// steward on when `steward`.
+    fn outfit_state(pool: PgPool, steward: bool) -> AppState {
+        let mut state = crate::routes::companion::test_state(pool);
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel = \"m\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"COMPOSE\"\n{}",
+                if steward {
+                    "[tasks.pde_wardrobe]\nmodel = \"steward\"\nfilter_prompt = \"DRESS\"\n"
+                } else {
+                    ""
+                }
+            ))
+            .unwrap(),
+        );
+        state
+    }
+
+    /// The rows of a carried-outfit turn.
+    struct OutfitTurn {
+        owner: Uuid,
+        instance_id: Uuid,
+        session_id: Uuid,
+        user_message_id: Uuid,
+    }
+
+    /// A seeded instance and session, its user message `在干嘛` sent at
+    /// [`outfit_moment`], and a picture of hers for each `(minutes, clothing,
+    /// source)` of `pictures`: created that many minutes before the moment
+    /// (after it when negative), its `inputs.clothing_source` `source` when
+    /// given.
+    async fn outfit_turn(pool: &PgPool, pictures: &[(i64, &str, Option<&str>)]) -> OutfitTurn {
+        let owner = Uuid::new_v4();
+        let instance_id = seed_persona_instance(pool, owner).await;
+        let session_id = make_session(pool, owner, Some(instance_id)).await;
+        let user_message_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+             VALUES ($1, 'user', '在干嘛', $2) RETURNING id",
+        )
+        .bind(session_id)
+        .bind(outfit_moment())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        for &(minutes, clothing, source) in pictures {
+            let mut inputs = serde_json::json!({ "clothing": clothing });
+            if let Some(source) = source {
+                inputs["clothing_source"] = source.into();
+            }
+            sqlx::query(
+                "INSERT INTO engine.chat_images_events \
+                   (source, user_id, instance_id, session_id, status, inputs, attempts, created_at) \
+                 VALUES ('chat_reply_image', $1, $2, $3, 'ok', $4, 1, $5)",
+            )
+            .bind(owner)
+            .bind(instance_id)
+            .bind(session_id)
+            .bind(inputs)
+            .bind(outfit_moment() - chrono::Duration::minutes(minutes))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        OutfitTurn {
+            owner,
+            instance_id,
+            session_id,
+            user_message_id,
+        }
+    }
+
+    /// The system prompt of `turn`'s default reply request, the plan dressed
+    /// in `clothing`, answering `driving`, at [`outfit_moment`].
+    async fn outfit_prompt(
+        state: &AppState,
+        turn: &OutfitTurn,
+        clothing: Option<&str>,
+        driving: Uuid,
+    ) -> String {
+        let (mut plan, input) = anchored_window_input(
+            turn.session_id,
+            turn.owner,
+            turn.instance_id,
+            turn.user_message_id,
+            "在干嘛",
+        );
+        plan.clothing = clothing.map(str::to_string);
+        let now = crate::prompt::NowContext {
+            now: outfit_moment(),
+            ..Default::default()
+        };
+        let (req, _tags) = build_reply_request(
+            state,
+            &input,
+            &plan,
+            turn.session_id,
+            turn.owner,
+            turn.instance_id,
+            driving,
+            &now,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("build_reply_request succeeds");
+        req.messages[0].content.clone()
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_steward_outfit_is_carried_for_45_minutes(pool: PgPool) {
+        let state = outfit_state(pool.clone(), true);
+        let turn = outfit_turn(&pool, &[(10, "毛衣", Some("steward"))]).await;
+        let p = outfit_prompt(&state, &turn, None, turn.user_message_id).await;
+        assert!(p.contains(&outfit_line("毛衣")), "{p}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_carried_outfit_lapses(pool: PgPool) {
+        let state = outfit_state(pool.clone(), true);
+        let turn = outfit_turn(&pool, &[(46, "毛衣", Some("steward"))]).await;
+        let p = outfit_prompt(&state, &turn, None, turn.user_message_id).await;
+        assert!(!p.contains("此刻的穿着"), "{p}");
+    }
+
+    /// The read stops at the turn's moment: a picture created after the
+    /// driving message was sent is not this turn's to carry.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_picture_after_the_moment_is_not_carried(pool: PgPool) {
+        let state = outfit_state(pool.clone(), true);
+        let turn = outfit_turn(&pool, &[(-1, "毛衣", Some("steward"))]).await;
+        let p = outfit_prompt(&state, &turn, None, turn.user_message_id).await;
+        assert!(!p.contains("此刻的穿着"), "{p}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn only_the_newest_picture_is_carried(pool: PgPool) {
+        let state = outfit_state(pool.clone(), true);
+        let turn = outfit_turn(
+            &pool,
+            &[
+                (20, "毛衣", Some("steward")),
+                (5, "Bandeau bikini", Some("engine")),
+            ],
+        )
+        .await;
+        let p = outfit_prompt(&state, &turn, None, turn.user_message_id).await;
+        assert!(!p.contains("此刻的穿着"), "{p}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_row_without_source_is_not_carried(pool: PgPool) {
+        let state = outfit_state(pool.clone(), true);
+        let turn = outfit_turn(&pool, &[(10, "毛衣", None)]).await;
+        let p = outfit_prompt(&state, &turn, None, turn.user_message_id).await;
+        assert!(!p.contains("此刻的穿着"), "{p}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn this_turns_outfit_wins_over_the_carried_one(pool: PgPool) {
+        let state = outfit_state(pool.clone(), true);
+        let turn = outfit_turn(&pool, &[(10, "毛衣", Some("steward"))]).await;
+        let p = outfit_prompt(&state, &turn, Some("红色旗袍"), turn.user_message_id).await;
+        assert!(p.contains(&outfit_line("红色旗袍")), "{p}");
+        assert!(!p.contains("毛衣"), "{p}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn nothing_is_carried_with_the_steward_off(pool: PgPool) {
+        let state = outfit_state(pool.clone(), false);
+        let turn = outfit_turn(&pool, &[(10, "毛衣", Some("steward"))]).await;
+        let p = outfit_prompt(&state, &turn, None, turn.user_message_id).await;
+        assert!(!p.contains("此刻的穿着"), "{p}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn the_emotional_request_carries_it_too(pool: PgPool) {
+        let state = outfit_state(pool.clone(), true);
+        let turn = outfit_turn(&pool, &[(10, "毛衣", Some("steward"))]).await;
+        let req = emotional_request(
+            &state,
+            turn.session_id,
+            turn.owner,
+            turn.instance_id,
+            turn.user_message_id,
+            "在干嘛",
+            MemoryScope::default(),
+        )
+        .await;
+        let p = &req.messages[0].content;
+        assert!(p.contains(&outfit_line("毛衣")), "{p}");
+    }
+
+    /// An event message answers no user message: the moment is `now.now`.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn an_event_message_carries_it(pool: PgPool) {
+        let state = outfit_state(pool.clone(), true);
+        let turn = outfit_turn(&pool, &[(10, "毛衣", Some("steward"))]).await;
+        let p = outfit_prompt(&state, &turn, None, Uuid::nil()).await;
+        assert!(p.contains(&outfit_line("毛衣")), "{p}");
     }
 
     // ─── build_reply_request: window anchored at the driving row (#330) ──
@@ -5191,6 +5454,7 @@ mod tests {
             None,
             view.as_ref(),
             eros_engine_core::tone::Tone::Default,
+            true,
         )
         .await
         .expect("build_reply_request_with succeeds");
@@ -5829,6 +6093,7 @@ mod tests {
             &plan,
             owner,
             instance_id,
+            Some(driving),
             &crate::prompt::NowContext::default(),
             None,
             None,
@@ -6260,6 +6525,7 @@ mod tests {
             &erotic_plan(None),
             owner,
             instance_id,
+            Some(driving),
             &crate::prompt::NowContext::default(),
             None,
             None,

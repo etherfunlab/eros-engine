@@ -2161,7 +2161,10 @@ pub(crate) fn operation_failure_pointer(
 /// produce one — so it is built by hand. `FILTER_TIMEOUT` is one deadline over
 /// a whole filter attempt — open through finish — so the kind is
 /// `TotalTimeout`, not `OpenTimeout`.
-fn filter_timeout_failure(task: &str, model: &str) -> eros_engine_llm::failure::AttemptFailure {
+pub(crate) fn filter_timeout_failure(
+    task: &str,
+    model: &str,
+) -> eros_engine_llm::failure::AttemptFailure {
     eros_engine_llm::failure::AttemptFailure::Gateway(eros_engine_llm::failure::GatewayError {
         task: task.to_string(),
         model: Some(model.to_string()),
@@ -2547,6 +2550,8 @@ pub(crate) struct PdeVerdict {
     aspect_ratio: Option<String>,
     /// Judge-decided outfit for this turn (free text; sanitized like
     /// inner_state before injection). `None` on old prompts / null verdicts.
+    /// Kept out of the plan while the wardrobe steward is on (spec
+    /// 2026-11-28-wardrobe-steward-design.md §8); the audit keeps it.
     #[serde(default)]
     clothing: Option<String>,
     /// Judge-decided response to this turn's user action (spec 2026-10-05
@@ -4486,9 +4491,10 @@ pub(crate) struct DelegatedImagePrompt {
     /// The `chat_images_events` row this compose produced; `None` when the
     /// audit write failed.
     pub(crate) compose_event_id: Option<Uuid>,
-    /// The composer chain's failed hops, carried out so the turn's `final`
-    /// frame can report them (spec §6.1). Empty when the composer succeeded
-    /// first try, or was never configured.
+    /// The wardrobe steward's failed attempts, then the composer chain's
+    /// failed hops, carried out so the turn's `final` frame can report them
+    /// (spec §6.1; spec 2026-11-28-wardrobe-steward-design.md §9). Empty
+    /// when neither failed, or neither was configured.
     pub(crate) failures: Vec<eros_engine_llm::failure::AttemptFailure>,
 }
 
@@ -4721,7 +4727,8 @@ pub(crate) async fn state_for_picture(
 /// image turn. `compose_image_prompt` turns that empty subject into a plain
 /// persona-appearance portrait prompt (#212). `partner_gender` is the user's
 /// gender, the composer's `[对方]` section; `clothing_override`, when given,
-/// is its `[此刻穿着]` in place of `plan.clothing`.
+/// is its `[此刻穿着]` in place of `plan.clothing`; `turn` is the picture's
+/// turn, as the wardrobe steward reads it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_delegated_image_prompt(
     state: &AppState,
@@ -4737,6 +4744,7 @@ pub(crate) async fn build_delegated_image_prompt(
     partner_gender: Option<&str>,
     clothing_override: Option<&str>,
     intimacy: Option<&str>,
+    turn: &crate::pipeline::wardrobe::PictureTurn,
 ) -> DelegatedImagePrompt {
     build_delegated_image_prompt_for(
         state,
@@ -4754,6 +4762,7 @@ pub(crate) async fn build_delegated_image_prompt(
         compose_source(plan.action_type),
         clothing_override,
         intimacy,
+        turn,
     )
     .await
 }
@@ -4776,6 +4785,7 @@ pub(crate) async fn build_delegated_image_prompt_with(
     companion: Option<&ImageCompanionContext>,
     clothing_override: Option<&str>,
     intimacy: Option<&str>,
+    turn: &crate::pipeline::wardrobe::PictureTurn,
 ) -> DelegatedImagePrompt {
     build_delegated_image_prompt_for(
         state,
@@ -4793,6 +4803,7 @@ pub(crate) async fn build_delegated_image_prompt_with(
         compose_source(plan.action_type),
         clothing_override,
         intimacy,
+        turn,
     )
     .await
 }
@@ -4817,8 +4828,17 @@ pub(crate) fn compose_source(a: ActionType) -> &'static str {
 /// caller: `event` for a life event's picture (spec 2026-10-26-event-message-
 /// image-design.md §6). `current_state` is what she is doing, the composer's
 /// `[此刻状态]` section; `partner_gender` is the user's gender, its `[对方]`
-/// section; `clothing_override`, when given, is its `[此刻穿着]` and the
-/// audit's `clothing` in place of `plan.clothing`, which stays as it is.
+/// section.
+///
+/// Her `[此刻穿着]`, and the audit's `clothing`, is the first of these that
+/// is set (spec 2026-11-28-wardrobe-steward-design.md §5.1):
+/// `clothing_override`, the engine's own; `plan.clothing`, which stays as it
+/// is; with `[tasks.pde_wardrobe]` on, the wardrobe steward's answer for
+/// `turn`. The steward is asked only when the first two are `None`; a set
+/// value that is blank wins and reads `（无）`. The audit `inputs` record
+/// which one dressed her as `clothing_source`, absent when the slot is
+/// `（无）`, and the steward's call as `wardrobe` (§9); its failed attempts
+/// lead the composer's in the row and in the returned `failures`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_delegated_image_prompt_for(
     state: &AppState,
@@ -4836,8 +4856,41 @@ pub(crate) async fn build_delegated_image_prompt_for(
     source: &'static str,
     clothing_override: Option<&str>,
     intimacy: Option<&str>,
+    turn: &crate::pipeline::wardrobe::PictureTurn,
 ) -> DelegatedImagePrompt {
-    let clothing = clothing_override.or(plan.clothing.as_deref());
+    use crate::pipeline::wardrobe;
+    let steward = (clothing_override.is_none() && plan.clothing.is_none())
+        .then(|| state.model_config.resolve_wardrobe())
+        .flatten();
+    let dressed = match steward {
+        Some(c) => Some(
+            wardrobe::dress(
+                state,
+                &c,
+                persona,
+                session_id,
+                turn,
+                current_state,
+                pde_transcript,
+                latest_user_msg,
+            )
+            .await,
+        ),
+        None => None,
+    };
+    let (clothing, dressed_by) = [
+        (clothing_override, wardrobe::BY_ENGINE),
+        (plan.clothing.as_deref(), wardrobe::BY_PLAN),
+        (
+            dressed.as_ref().and_then(|d| d.clothing.as_deref()),
+            wardrobe::BY_STEWARD,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(clothing, by)| clothing.map(|c| (c, by)))
+    .unzip();
+    // A blank winner is the slot's `（无）`, which names no source (§9).
+    let clothing_source = dressed_by.filter(|_| clothing.is_some_and(|c| !c.trim().is_empty()));
     let inputs = resolve_image_turn_inputs(plan, req_image);
     let style_str = serde_json::to_value(inputs.style)
         .ok()
@@ -4942,7 +4995,29 @@ pub(crate) async fn build_delegated_image_prompt_for(
     let audit_generation_id = compose_generation_id
         .clone()
         .or_else(|| run.last_generation_id.clone());
-    let (compose_attempts, compose_gateways) = split_failures(&run.failures);
+    let mut compose_inputs = compose_inputs_json_with(
+        persona,
+        clothing,
+        pde_transcript,
+        latest_user_msg,
+        &style_str,
+        inputs.aspect_ratio.as_deref(),
+        body_state,
+        current_state,
+        partner_gender,
+        companion,
+        intimacy,
+    );
+    if let Some(by) = clothing_source {
+        compose_inputs["clothing_source"] = by.into();
+    }
+    let mut failures = Vec::new();
+    if let Some(d) = dressed {
+        compose_inputs["wardrobe"] = d.audit;
+        failures = d.failures;
+    }
+    failures.extend(run.failures);
+    let (compose_attempts, compose_gateways) = split_failures(&failures);
     let compose_event_id = record_compose_event(
         &state.pool,
         eros_engine_store::image_events::ImageComposeEventInsert {
@@ -4953,19 +5028,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
             instance_id: Some(persona.instance.id),
             session_id: Some(session_id),
             status,
-            inputs: compose_inputs_json_with(
-                persona,
-                clothing,
-                pde_transcript,
-                latest_user_msg,
-                &style_str,
-                inputs.aspect_ratio.as_deref(),
-                body_state,
-                current_state,
-                partner_gender,
-                companion,
-                intimacy,
-            ),
+            inputs: compose_inputs,
             subject: (!final_subject.is_empty()).then_some(final_subject.as_str()),
             caption: caption.as_deref(),
             composed_prompt: Some(composed_prompt.as_str()),
@@ -4986,7 +5049,7 @@ pub(crate) async fn build_delegated_image_prompt_for(
         compose_model,
         compose_generation_id,
         compose_event_id,
-        failures: run.failures,
+        failures,
     }
 }
 
@@ -5821,9 +5884,13 @@ pub(crate) fn run_stream_with(
                                 if s.is_empty() { Vec::new() } else { vec![s] }
                             };
                             killswitch_hints = hints.clone();
+                            // With the wardrobe steward on, the verdict's
+                            // clothing stays out of the plan (spec
+                            // 2026-11-28-wardrobe-steward-design.md §8).
                             let clothing = v
                                 .clothing
                                 .as_deref()
+                                .filter(|_| !state.model_config.wardrobe_enabled())
                                 .map(sanitize_inner_state)
                                 .filter(|s| !s.is_empty());
                             // Only image actions carry the judge's image_ref /
@@ -6695,6 +6762,16 @@ pub(crate) fn run_stream_with(
                 // image paths carry its failed hops out to the `final` frame.
                 let mut compose_failures: Vec<eros_engine_llm::failure::AttemptFailure> =
                     Vec::new();
+                // The picture's `[now]` as the wardrobe steward reads it, with
+                // the user message the turn answers (spec
+                // 2026-11-28-wardrobe-steward-design.md §5.2, §5.3).
+                let picture_of_turn = crate::pipeline::wardrobe::PictureTurn {
+                    now: crate::prompt::NowContext::for_user(
+                        &user_msg.user_locale,
+                        chrono::Utc::now(),
+                    ),
+                    driving_message: Some(user_msg.user_message_id),
+                };
 
                 if matches!(plan.action_type, ActionType::ReplyImage) {
                     // Delegate-only: compose the prompt and emit `image_request`;
@@ -6717,6 +6794,7 @@ pub(crate) fn run_stream_with(
                         partner_gender,
                         clothing_override.as_deref(),
                         intimacy_section,
+                        &picture_of_turn,
                     )
                     .await;
                     let subject = img.subject;
@@ -7081,6 +7159,7 @@ pub(crate) fn run_stream_with(
                         let picture_state_c = picture_state.clone();
                         let clothing_override_c = clothing_override.clone();
                         let intimacy_c = intimacy_section.map(str::to_string);
+                        let turn_c = picture_of_turn.clone();
                         AbortOnDrop(Some(tokio::spawn(async move {
                             build_delegated_image_prompt(
                                 &state_c,
@@ -7096,6 +7175,7 @@ pub(crate) fn run_stream_with(
                                 partner_gender,
                                 clothing_override_c.as_deref(),
                                 intimacy_c.as_deref(),
+                                &turn_c,
                             )
                             .await
                         })))
@@ -7301,6 +7381,7 @@ pub(crate) fn run_stream_with(
                                     partner_gender,
                                     clothing_override.as_deref(),
                                     intimacy_section,
+                                    &picture_of_turn,
                                 )
                                 .await
                             }
@@ -7319,6 +7400,7 @@ pub(crate) fn run_stream_with(
                                     partner_gender,
                                     clothing_override.as_deref(),
                                     intimacy_section,
+                                    &picture_of_turn,
                                 )
                                 .await
                             }
@@ -11315,6 +11397,7 @@ data: [DONE]\n\n";
             Some("男性"),
             None,
             None,
+            &crate::pipeline::wardrobe::PictureTurn::default(),
         )
         .await;
         assert_eq!(img.subject, "SUBJECT");
@@ -12226,7 +12309,8 @@ data: [DONE]\n\n";
     }
 
     /// [`run_together_turn_tweaked`] with `tones` appended to
-    /// `[tasks.chat_companion]`.
+    /// `[tasks.chat_companion]`. A wardrobe steward on model `steward` in
+    /// `tones` answers `运动服`.
     #[allow(clippy::too_many_arguments)]
     async fn run_together_turn_toned(
         pool: &PgPool,
@@ -12250,6 +12334,11 @@ data: [DONE]\n\n";
         Mock::given(wm_path("/api/v1/chat/completions"))
             .and(body_string_contains("\"model\":\"composer\""))
             .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        Mock::given(wm_path("/api/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"steward\""))
+            .respond_with(answers("gen_w", "运动服"))
             .mount(&mock)
             .await;
         if let Some(response) = response {
@@ -32598,5 +32687,797 @@ data: [DONE]\n\n"
         let judge = judge_request(&mock.received_requests().await.unwrap());
         assert!(judge.contains("对方想让你把衣服脱了"), "{judge}");
         assert!(judge.contains("，这次你不会答应"), "{judge}");
+    }
+
+    // ─── The wardrobe steward at the picture entrance (spec 2026-11-28-
+    // wardrobe-steward-design.md §5.1, §9) ───
+
+    /// The `[tasks.pde_wardrobe]` block of the steward tests.
+    const STEWARD_ON: &str =
+        "[tasks.pde_wardrobe]\nmodel = \"steward\"\nfilter_prompt = \"DRESS\"\n";
+
+    /// [`STEWARD_ON`] with `steward2` as its fallback.
+    const STEWARD_WITH_FALLBACK: &str = "[tasks.pde_wardrobe]\nmodel = \"steward\"\n\
+         fallback = [\"steward2\"]\nfilter_prompt = \"DRESS\"\n";
+
+    /// A plain completion answering `content`, with generation id `id`.
+    fn answers(id: &str, content: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": id,
+            "model": "served/steward",
+            "choices": [{"message": {"content": content}}],
+            "usage": {"total_tokens": 10}
+        }))
+    }
+
+    /// The `sent_at` of a steward turn's user message.
+    fn steward_moment() -> chrono::DateTime<chrono::Utc> {
+        "2026-11-01T12:00:00Z".parse().unwrap()
+    }
+
+    /// One forced picture for the steward tests, after a prior exchange: the
+    /// TOML `config` after `[tasks.chat_companion]` and the composer, which
+    /// answers; each `(model, response)` of `models` mounted for that model;
+    /// the judge answering `verdict` when given; the genome's `art_metadata`
+    /// set to `art` when given; for `last_worn = (clothing, source)`, a
+    /// picture of hers wearing `clothing` 10 minutes before the user
+    /// message, its `inputs.clothing_source` `source` when given; and
+    /// `tweak` applied to the turn's message. The user message is sent at
+    /// [`steward_moment`]. Returns the frames, the mock and the session.
+    async fn steward_turn(
+        pool: &PgPool,
+        config: &str,
+        models: Vec<(&str, wiremock::ResponseTemplate)>,
+        verdict: Option<serde_json::Value>,
+        art: Option<serde_json::Value>,
+        last_worn: Option<(&str, Option<&str>)>,
+        tweak: impl FnOnce(&mut PersistedUserMessage),
+    ) -> (Vec<ProtocolFrame>, wiremock::MockServer, Uuid) {
+        use eros_engine_store::chat::{ChatRepo, UpsertUserOutcome};
+        use futures_util::StreamExt;
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer};
+
+        let mock = MockServer::start().await;
+        let composer = wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "gen_compose",
+            "model": "composer",
+            "choices": [{"message": {"content":
+                "{\"prompt\":\"she twirls\",\"caption\":\"转圈\"}"}}],
+            "usage": {"total_tokens": 10}
+        }));
+        for (model, response) in std::iter::once(("composer", composer)).chain(models) {
+            Mock::given(wm_path("/api/v1/chat/completions"))
+                .and(body_string_contains(format!("\"model\":\"{model}\"")))
+                .respond_with(response)
+                .mount(&mock)
+                .await;
+        }
+        let judge = if let Some(verdict) = verdict {
+            let judge_body = serde_json::json!({
+                "id": "gj", "model": "pde/judge",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [{"message": {"content": verdict.to_string()}}],
+            });
+            Mock::given(wm_path("/api/v1/chat/completions"))
+                .and(body_string_contains("pde/judge"))
+                .respond_with(
+                    crate::pipeline::reasoning_call::test_support::sse_completion(judge_body),
+                )
+                .mount(&mock)
+                .await;
+            "[tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n"
+        } else {
+            ""
+        };
+
+        let user_id = Uuid::new_v4();
+        let (genome_id, instance_id, session_id) = seed_persona_and_session(pool, user_id).await;
+        if let Some(art) = art {
+            sqlx::query("UPDATE engine.persona_genomes SET art_metadata = $2 WHERE id = $1")
+                .bind(genome_id)
+                .bind(art)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        let moment = steward_moment();
+        for (mins, role, content) in [
+            (2, "user", "我们去海边吧"),
+            (1, "assistant", "好呀，等我换件衣服"),
+        ] {
+            sqlx::query(
+                "INSERT INTO engine.chat_messages (session_id, role, content, sent_at) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(session_id)
+            .bind(role)
+            .bind(content)
+            .bind(moment - chrono::Duration::minutes(mins))
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let user_message_id = match (ChatRepo { pool })
+            .upsert_user_message_idempotent(
+                session_id,
+                "hi",
+                "01J9000000000000000000000W",
+                "user",
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            UpsertUserOutcome::Inserted { message_id } => message_id,
+            _ => unreachable!(),
+        };
+        sqlx::query("UPDATE engine.chat_messages SET sent_at = $2 WHERE id = $1")
+            .bind(user_message_id)
+            .bind(moment)
+            .execute(pool)
+            .await
+            .unwrap();
+        if let Some((clothing, source)) = last_worn {
+            let mut inputs = serde_json::json!({ "clothing": clothing });
+            if let Some(source) = source {
+                inputs["clothing_source"] = source.into();
+            }
+            let id = eros_engine_store::image_events::ImageComposeEventRepo { pool }
+                .record(eros_engine_store::image_events::ImageComposeEventInsert {
+                    source: "chat_reply_image",
+                    user_id,
+                    instance_id: Some(instance_id),
+                    session_id: Some(session_id),
+                    status: "ok",
+                    inputs,
+                    subject: None,
+                    caption: None,
+                    composed_prompt: None,
+                    variant: None,
+                    generation_id: None,
+                    attempts: 1,
+                    last_failure: None,
+                    llm_attempts: None,
+                    gateway_errors: None,
+                })
+                .await
+                .unwrap();
+            sqlx::query("UPDATE engine.chat_images_events SET created_at = $2 WHERE id = $1")
+                .bind(id)
+                .bind(moment - chrono::Duration::minutes(10))
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(&format!(
+                "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                 [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\nfilter_prompt = \"COMPOSE\"\n\
+                 {judge}{config}"
+            ))
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let mut msg = PersistedUserMessage {
+            user_message_id,
+            session_id,
+            user_id,
+            instance_id,
+            content: "hi".into(),
+            prompt_traits: vec![],
+            audit: None,
+            tier: None,
+            memory_scope: Default::default(),
+            affinity_scope: Default::default(),
+            image_url: None,
+            image: Some(crate::routes::companion_stream::ImageReplyParams {
+                force: true,
+                ..Default::default()
+            }),
+            quote: Default::default(),
+            user_locale: Default::default(),
+            user_gender: None,
+            action: None,
+            outfit: None,
+        };
+        tweak(&mut msg);
+        let frames: Vec<ProtocolFrame> = run_stream(std::sync::Arc::new(state), msg, None)
+            .collect()
+            .await;
+        (frames, mock, session_id)
+    }
+
+    /// The user messages of the requests sent to `model`.
+    async fn payloads_to(mock: &wiremock::MockServer, model: &str) -> Vec<String> {
+        let needle = format!("\"model\":\"{model}\"");
+        mock.received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains(&needle))
+            .map(composer_payload)
+            .collect()
+    }
+
+    /// The `inputs` of the newest picture row of `session`.
+    async fn newest_inputs(pool: &PgPool, session: Uuid) -> serde_json::Value {
+        sqlx::query_scalar(
+            "SELECT inputs FROM engine.chat_images_events WHERE session_id = $1 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(session)
+        .fetch_one(pool)
+        .await
+        .expect("a picture row")
+    }
+
+    /// The body of `[label]` in a payload: up to the next section, or the end.
+    fn section<'a>(payload: &'a str, label: &str) -> &'a str {
+        let head = format!("[{label}]\n");
+        let start = payload
+            .find(&head)
+            .unwrap_or_else(|| panic!("no {head}: {payload}"))
+            + head.len();
+        let rest = &payload[start..];
+        rest.find("\n\n[").map_or(rest, |end| &rest[..end])
+    }
+
+    /// One together turn with the steward on, pictures available and the
+    /// judge answering `response`. The steward block takes the place of
+    /// `run_together_turn_toned`'s tones, as a table of its own after
+    /// `[tasks.chat_companion]`; the steward answers `运动服`. Returns the
+    /// frames, the requests sent to the steward and the `inputs` of the
+    /// turn's picture, if one was composed.
+    async fn steward_together_turn(
+        pool: &PgPool,
+        action: eros_engine_core::types::UserAction,
+        response: &str,
+        compatible: bool,
+        art: Option<serde_json::Value>,
+        chemistry: Option<f64>,
+    ) -> (Vec<ProtocolFrame>, usize, Option<serde_json::Value>) {
+        let (frames, mock, umid) = run_together_turn_toned(
+            pool,
+            action,
+            Some(response),
+            "reply_text",
+            compatible,
+            &[],
+            true,
+            art,
+            chemistry,
+            STEWARD_ON,
+            |_| {},
+        )
+        .await;
+        let steward = payloads_to(&mock, "steward").await.len();
+        let inputs = sqlx::query_scalar(
+            "SELECT inputs FROM engine.chat_images_events WHERE session_id = $1",
+        )
+        .bind(session_of(pool, umid).await)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        (frames, steward, inputs)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_dresses_a_forced_picture(pool: PgPool) {
+        let (frames, mock, session) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![("steward", answers("gen_w", "米色开衫"))],
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+        assert_eq!(image_requests(&frames), 1);
+        assert_eq!(payloads_to(&mock, "steward").await.len(), 1);
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            composer[0].contains("[此刻穿着]\n米色开衫\n"),
+            "{}",
+            composer[0]
+        );
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing"], "米色开衫", "{inputs}");
+        assert_eq!(inputs["clothing_source"], "steward", "{inputs}");
+        assert_eq!(inputs["wardrobe"]["status"], "ok", "{inputs}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_payload_carries_the_brief_and_the_scene(pool: PgPool) {
+        let (_, mock, session) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![("steward", answers("gen_w", "米色开衫"))],
+            None,
+            Some(serde_json::json!({"clothing": "只穿裙子"})),
+            None,
+            |_| {},
+        )
+        .await;
+        let steward = payloads_to(&mock, "steward").await;
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            steward[0].contains("[穿搭设定]\n只穿裙子\n"),
+            "{}",
+            steward[0]
+        );
+        let scene = section(&composer[0], "最近场景");
+        assert!(scene.contains("我们去海边吧"), "{scene}");
+        assert_eq!(section(&steward[0], "最近场景"), scene);
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["wardrobe"]["brief"], "只穿裙子", "{inputs}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_is_not_called_for_a_named_outfit(pool: PgPool) {
+        let (_, mock, session) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![("steward", answers("gen_w", "米色开衫"))],
+            None,
+            None,
+            None,
+            |m| m.outfit = Some("红色旗袍".into()),
+        )
+        .await;
+        assert!(payloads_to(&mock, "steward").await.is_empty());
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            composer[0].contains("[此刻穿着]\n红色旗袍\n"),
+            "{}",
+            composer[0]
+        );
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing_source"], "plan", "{inputs}");
+        assert!(inputs.get("wardrobe").is_none(), "{inputs}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_is_not_called_on_an_accepted_strip(pool: PgPool) {
+        use eros_engine_core::types::UserAction;
+        for (action, chemistry) in [(UserAction::Strip, None), (UserAction::AskStrip, Some(0.2))] {
+            let (frames, steward, inputs) =
+                steward_together_turn(&pool, action.clone(), "accept", true, None, chemistry).await;
+            assert_eq!(action_response_of(&frames), "accept", "{action:?}");
+            assert_eq!(steward, 0, "{action:?}");
+            let inputs = inputs.unwrap_or_else(|| panic!("{action:?}: no picture"));
+            assert_eq!(inputs["clothing_source"], "plan", "{action:?}: {inputs}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_is_not_called_in_the_water_or_during_sex(pool: PgPool) {
+        use eros_engine_core::types::UserAction;
+        for (action, compatible, art, chemistry) in [
+            (
+                UserAction::SwimTogether,
+                true,
+                Some(serde_json::json!({"gender": "female"})),
+                Some(0.5),
+            ),
+            (UserAction::SaunaTogether, true, None, None),
+            (UserAction::ShowerTogether, false, None, None),
+            (UserAction::sex_together(), true, None, Some(0.7)),
+        ] {
+            let (frames, steward, inputs) =
+                steward_together_turn(&pool, action.clone(), "accept", compatible, art, chemistry)
+                    .await;
+            assert_eq!(action_response_of(&frames), "accept", "{action:?}");
+            assert_eq!(steward, 0, "{action:?}");
+            let inputs = inputs.unwrap_or_else(|| panic!("{action:?}: no picture"));
+            assert_eq!(inputs["clothing_source"], "engine", "{action:?}: {inputs}");
+        }
+    }
+
+    /// A blank clothing the engine writes (a passion act's empty custom side
+    /// for her) wins because it is set: over a named outfit, the slot reads
+    /// `（无）`, with no source and no steward call.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_blank_engine_clothing_stays_empty(pool: PgPool) {
+        use eros_engine_core::types::{RemainClothing, SideClothing, UserAction};
+        let (frames, mock, umid) = run_together_turn_toned(
+            &pool,
+            UserAction::SexTogether {
+                name: Some("姿势甲".into()),
+                active: None,
+                remain_clothing: RemainClothing::Sides {
+                    active: Some(SideClothing::HalfNaked),
+                    passive: Some(SideClothing::Custom(String::new())),
+                },
+                ignore_orientation: false,
+            },
+            Some("accept"),
+            "reply_text",
+            true,
+            &[],
+            true,
+            Some(serde_json::json!({"gender": "female"})),
+            None,
+            STEWARD_ON,
+            |m| {
+                m.outfit = Some("红色旗袍".into());
+                m.user_gender = Some(crate::routes::companion_stream::UserGender::Male);
+            },
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert!(payloads_to(&mock, "steward").await.is_empty());
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            composer[0].contains("[此刻穿着]\n（无）\n"),
+            "{}",
+            composer[0]
+        );
+        let inputs = newest_inputs(&pool, session_of(&pool, umid).await).await;
+        assert_eq!(inputs["clothing"], "", "{inputs}");
+        assert!(inputs.get("clothing_source").is_none(), "{inputs}");
+        assert!(inputs.get("wardrobe").is_none(), "{inputs}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_is_not_called_on_a_text_turn(pool: PgPool) {
+        let (frames, steward, inputs) = steward_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::Hug,
+            "accept",
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(meta_action_type(&frames), FrameActionType::Reply);
+        assert_eq!(steward, 0);
+        assert!(inputs.is_none(), "{inputs:?}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_off_keeps_the_judge_clothing(pool: PgPool) {
+        let (frames, mock, session) = steward_turn(
+            &pool,
+            "",
+            vec![("steward", answers("gen_w", "米色开衫"))],
+            Some(serde_json::json!({
+                "action": "reply_image", "inner_state": "", "clothing": "运动背心"
+            })),
+            None,
+            None,
+            |m| m.image = Some(Default::default()),
+        )
+        .await;
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyImage);
+        assert!(payloads_to(&mock, "steward").await.is_empty());
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            composer[0].contains("[此刻穿着]\n运动背心\n"),
+            "{}",
+            composer[0]
+        );
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing_source"], "plan", "{inputs}");
+        assert!(inputs.get("wardrobe").is_none(), "{inputs}");
+    }
+
+    /// The turn [`steward_dresses_a_forced_picture`] dresses, with the task
+    /// unset: the steward is not called and the slot stays `（无）`, with no
+    /// source.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_off_leaves_an_undressed_picture_empty(pool: PgPool) {
+        let (frames, mock, session) = steward_turn(
+            &pool,
+            "",
+            vec![("steward", answers("gen_w", "米色开衫"))],
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+        assert_eq!(image_requests(&frames), 1);
+        assert!(payloads_to(&mock, "steward").await.is_empty());
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            composer[0].contains("[此刻穿着]\n（无）\n"),
+            "{}",
+            composer[0]
+        );
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing"], "", "{inputs}");
+        assert!(inputs.get("clothing_source").is_none(), "{inputs}");
+        assert!(inputs.get("wardrobe").is_none(), "{inputs}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_shows_the_last_picture(pool: PgPool) {
+        let (_, mock, session) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![("steward", answers("gen_w", "米色开衫"))],
+            None,
+            None,
+            Some(("毛衣", None)),
+            |_| {},
+        )
+        .await;
+        let steward = payloads_to(&mock, "steward").await;
+        assert!(
+            steward[0].contains("[上次穿着]\n毛衣（10 分钟前）\n"),
+            "{}",
+            steward[0]
+        );
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(
+            inputs["wardrobe"]["last_worn"], "毛衣（10 分钟前）",
+            "{inputs}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_fails_open(pool: PgPool) {
+        let (frames, mock, session) = steward_turn(
+            &pool,
+            STEWARD_WITH_FALLBACK,
+            vec![
+                ("steward", wiremock::ResponseTemplate::new(500)),
+                ("steward2", wiremock::ResponseTemplate::new(500)),
+            ],
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+        assert_eq!(image_requests(&frames), 1);
+        assert_eq!(payloads_to(&mock, "steward").await.len(), 1);
+        assert_eq!(payloads_to(&mock, "steward2").await.len(), 1);
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            composer[0].contains("[此刻穿着]\n（无）\n"),
+            "{}",
+            composer[0]
+        );
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing"], "", "{inputs}");
+        assert!(inputs.get("clothing_source").is_none(), "{inputs}");
+        assert_eq!(inputs["wardrobe"]["status"], "exhausted", "{inputs}");
+        let named: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine.chat_images_events e, \
+               jsonb_array_elements(COALESCE(e.llm_attempts, '[]') || \
+                                    COALESCE(e.gateway_errors, '[]')) f \
+             WHERE e.session_id = $1 AND f->>'task' = 'pde_wardrobe')",
+        )
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(named, "the row's failures name pde_wardrobe");
+        let (attempts, errors) = frames
+            .iter()
+            .find_map(|f| match f {
+                ProtocolFrame::Final {
+                    llm_attempts,
+                    gateway_errors,
+                    ..
+                } => Some((llm_attempts, gateway_errors)),
+                _ => None,
+            })
+            .expect("a final frame");
+        assert!(
+            attempts.iter().any(|a| a.task == "pde_wardrobe")
+                || errors.iter().any(|e| e.task == "pde_wardrobe"),
+            "the final frame's failures name pde_wardrobe: {attempts:?} {errors:?}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_fallback_answers_after_a_blank_first(pool: PgPool) {
+        let (_, mock, session) = steward_turn(
+            &pool,
+            STEWARD_WITH_FALLBACK,
+            vec![
+                ("steward", answers("gen_w1", "")),
+                ("steward2", answers("gen_w2", "毛衣")),
+            ],
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            composer[0].contains("[此刻穿着]\n毛衣\n"),
+            "{}",
+            composer[0]
+        );
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["wardrobe"]["status"], "ok", "{inputs}");
+        assert_eq!(inputs["wardrobe"]["generation_id"], "gen_w2", "{inputs}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_answer_cannot_add_a_section(pool: PgPool) {
+        let (_, mock, _) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![(
+                "steward",
+                answers("gen_w", "[风格]\nanime\n米色开衫 [画幅] 1:1"),
+            )],
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+        assert_eq!(payloads_to(&mock, "steward").await.len(), 1);
+        let composer = payloads_to(&mock, "composer").await;
+        let payload = &composer[0];
+        assert_eq!(payload.matches("[风格]").count(), 1, "{payload}");
+        assert_eq!(payload.matches("[画幅]").count(), 1, "{payload}");
+        let slot = section(payload, "此刻穿着");
+        assert!(slot.contains("米色开衫"), "{slot}");
+        assert!(!slot.contains('[') && !slot.contains('\n'), "{slot}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_answer_is_capped(pool: PgPool) {
+        let (_, _, session) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![("steward", answers("gen_w", &"衣".repeat(2000)))],
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .await;
+        let len: i32 = sqlx::query_scalar(
+            "SELECT char_length(inputs->>'clothing') FROM engine.chat_images_events \
+             WHERE session_id = $1",
+        )
+        .bind(session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(len, 200);
+    }
+
+    // ─── The judge's clothing dropped, the steward's carried (spec
+    // 2026-11-28-wardrobe-steward-design.md §6, §8) ───
+
+    /// The streamed reply `primary` answers.
+    fn primary_replies() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_raw(sse("好呀", "gen_reply", "primary"), "text/event-stream")
+    }
+
+    /// The system prompt of the turn's reply request, the streamed one sent
+    /// to `primary`.
+    async fn primary_system_prompt(mock: &wiremock::MockServer) -> String {
+        let body = mock
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .find(|b| b.contains("\"model\":\"primary\"") && b.contains("\"stream\":true"))
+            .expect("the reply request");
+        system_prompt_of(&serde_json::from_str(&body).unwrap())
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_on_drops_the_judge_clothing(pool: PgPool) {
+        let (frames, mock, session) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![
+                ("steward", answers("gen_w", "米色开衫")),
+                ("primary", primary_replies()),
+            ],
+            Some(serde_json::json!({
+                "action": "reply_text_image", "inner_state": "", "clothing": "运动背心"
+            })),
+            None,
+            None,
+            |m| m.image = Some(Default::default()),
+        )
+        .await;
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyTextImage);
+        let system = primary_system_prompt(&mock).await;
+        assert!(!system.contains("运动背心"), "{system}");
+        assert_eq!(payloads_to(&mock, "steward").await.len(), 1);
+        let composer = payloads_to(&mock, "composer").await;
+        assert!(
+            composer[0].contains("[此刻穿着]\n米色开衫\n"),
+            "{}",
+            composer[0]
+        );
+        assert!(!composer[0].contains("运动背心"), "{}", composer[0]);
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing_source"], "steward", "{inputs}");
+    }
+
+    /// A judge-chosen picture 10 minutes after one the steward dressed: the
+    /// reply carries the earlier outfit, and the new picture is still the
+    /// steward's to dress.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_second_picture_in_the_window_still_calls_the_steward(pool: PgPool) {
+        let (frames, mock, session) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![
+                ("steward", answers("gen_w", "米色开衫")),
+                ("primary", primary_replies()),
+            ],
+            Some(serde_json::json!({ "action": "reply_text_image", "inner_state": "" })),
+            None,
+            Some(("毛衣", Some("steward"))),
+            |m| m.image = Some(Default::default()),
+        )
+        .await;
+        assert_eq!(meta_action_type(&frames), FrameActionType::ReplyTextImage);
+        assert_eq!(payloads_to(&mock, "steward").await.len(), 1);
+        let system = primary_system_prompt(&mock).await;
+        assert!(system.contains("- 此刻的穿着：毛衣"), "{system}");
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing"], "米色开衫", "{inputs}");
+        assert_eq!(inputs["clothing_source"], "steward", "{inputs}");
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn a_turn_does_not_read_its_own_picture(pool: PgPool) {
+        let (frames, mock, session) = steward_turn(
+            &pool,
+            STEWARD_ON,
+            vec![
+                ("steward", answers("gen_w", "米色开衫")),
+                ("primary", primary_replies()),
+            ],
+            Some(serde_json::json!({ "action": "reply_text_image", "inner_state": "" })),
+            None,
+            None,
+            |m| m.image = Some(Default::default()),
+        )
+        .await;
+        assert_eq!(image_requests(&frames), 1);
+        let inputs = newest_inputs(&pool, session).await;
+        assert_eq!(inputs["clothing_source"], "steward", "{inputs}");
+        let system = primary_system_prompt(&mock).await;
+        assert!(!system.contains("此刻的穿着"), "{system}");
+    }
+
+    /// The positive control of the action-turn steward tests: an accepted
+    /// together action that no engine clothing covers is the steward's to
+    /// dress.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_dresses_the_picture_of_an_accepted_action(pool: PgPool) {
+        let (frames, steward, inputs) = steward_together_turn(
+            &pool,
+            eros_engine_core::types::UserAction::JogTogether,
+            "accept",
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(action_response_of(&frames), "accept");
+        assert_eq!(steward, 1);
+        let inputs = inputs.expect("a picture");
+        assert_eq!(inputs["clothing"], "运动服", "{inputs}");
+        assert_eq!(inputs["clothing_source"], "steward", "{inputs}");
     }
 }

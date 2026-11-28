@@ -34,8 +34,8 @@ pub struct CreateGenomeRequest {
     /// request writes nothing and answers `200`, so a retried create leaves
     /// one row. Omitted: the engine mints one.
     pub id: Option<Uuid>,
-    /// An `eros-character` card (`spec`, `spec_version` `"1"`, `"1.1"` or
-    /// `"1.2"`, `data`), at most 64 KiB once serialised.
+    /// An `eros-character` card (`spec`, `spec_version` `"1"`, `"1.1"`,
+    /// `"1.2"` or `"1.3"`, `data`), at most 64 KiB once serialised.
     #[schema(value_type = Object)]
     pub card: serde_json::Value,
 }
@@ -43,8 +43,8 @@ pub struct CreateGenomeRequest {
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateGenomeRequest {
-    /// An `eros-character` card (`spec`, `spec_version` `"1"`, `"1.1"` or
-    /// `"1.2"`, `data`), at most 64 KiB once serialised.
+    /// An `eros-character` card (`spec`, `spec_version` `"1"`, `"1.1"`,
+    /// `"1.2"` or `"1.3"`, `data`), at most 64 KiB once serialised.
     #[schema(value_type = Object)]
     pub card: serde_json::Value,
 }

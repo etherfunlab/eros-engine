@@ -436,6 +436,13 @@ pub(crate) fn run_group_turn(
 
         // ── relay ──
         let now_ctx = crate::prompt::NowContext::for_user(&turn.user_locale, chrono::Utc::now());
+        // A speaker's picture, as the wardrobe steward reads it: the turn's
+        // `[now]` and the user message it answers (spec 2026-11-28-wardrobe-
+        // steward-design.md §5.3).
+        let picture_of_turn = crate::pipeline::wardrobe::PictureTurn {
+            now: now_ctx.clone(),
+            driving_message: Some(turn.user_message_id),
+        };
         let latest = crate::prompt::composer_user_text(None, None, &turn.content);
         let mut spoken: Vec<GroupSpoken> = Vec::new();
         let (mut any_filtered, mut retries_chat, mut retries_filter) = (false, 0u32, 0u32);
@@ -455,9 +462,12 @@ pub(crate) fn run_group_turn(
                 .filter(|s| !s.is_empty())
                 .into_iter()
                 .collect();
+            // With the wardrobe steward on, the cue's clothing stays out of
+            // the plan (spec 2026-11-28-wardrobe-steward-design.md §8).
             let clothing = cue
                 .clothing
                 .as_deref()
+                .filter(|_| !state.model_config.wardrobe_enabled())
                 .map(sanitize_inner_state)
                 .filter(|s| !s.is_empty());
             let mut plan = eros_engine_core::pde::plan_for(
@@ -537,6 +547,7 @@ pub(crate) fn run_group_turn(
                     companion_ctx.as_ref(),
                     picture.clothing_override,
                     None,
+                    &picture_of_turn,
                 )
                 .await;
                 turn_failures.extend(img.failures.iter().cloned());
@@ -628,6 +639,7 @@ pub(crate) fn run_group_turn(
                 );
                 let (uid, gid) = (turn.user_id, turn.group_session_id);
                 let clothing_override = picture.clothing_override;
+                let turn_c = picture_of_turn.clone();
                 AbortOnDrop(Some(tokio::spawn(async move {
                     build_delegated_image_prompt_with(
                         &st,
@@ -643,6 +655,7 @@ pub(crate) fn run_group_turn(
                         ctx_c.as_ref(),
                         clothing_override,
                         None,
+                        &turn_c,
                     )
                     .await
                 })))
@@ -681,6 +694,7 @@ pub(crate) fn run_group_turn(
                 None,
                 Some(&view),
                 eros_engine_core::tone::Tone::Default,
+                true,
             )
             .await
             {
@@ -797,6 +811,7 @@ pub(crate) fn run_group_turn(
                                 companion_ctx.as_ref(),
                                 picture.clothing_override,
                                 None,
+                                &picture_of_turn,
                             )
                             .await
                         }

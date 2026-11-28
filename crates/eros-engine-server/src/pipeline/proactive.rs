@@ -747,6 +747,7 @@ async fn prepare(state: &AppState, g: &Greeting) -> Result<Prepared, AppError> {
             &plan,
             g.user_id,
             g.instance_id,
+            None,
             &g.now,
             None,
             None,
@@ -875,6 +876,13 @@ async fn store(
             "event",
             shown.clothing_override,
             None,
+            // No user message asked for it: the steward counts back from
+            // the request's moment (spec 2026-11-28-wardrobe-steward-
+            // design.md §5.3).
+            &crate::pipeline::wardrobe::PictureTurn {
+                now: g.now.clone(),
+                driving_message: None,
+            },
         )
         .await;
         metadata.insert(
@@ -2455,6 +2463,81 @@ mod stream_tests {
         assert_eq!(&kinds[kinds.len() - 2..], ["done", "final"]);
         assert_eq!(deltas(&frames), "想你了");
         assert_eq!(proactive_rows(&pool, session_id).await[0].1, "想你了");
+    }
+
+    /// Spec 2026-11-28-wardrobe-steward-design.md §5.1: the steward dresses
+    /// an event's picture that nothing else has dressed; an outfit, or a
+    /// strip event, dresses her without it.
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn steward_dresses_an_event_picture(pool: PgPool) {
+        let answer = |content: &str| {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-x", "model": "served",
+                "choices": [{"message": {"content": content}}],
+            }))
+        };
+        for (kind, outfit, steward_calls) in [
+            (EventKind::TakingSelfie, None, 1),
+            (EventKind::TakingSelfie, Some("红色旗袍"), 0),
+            (EventKind::Strip, None, 0),
+        ] {
+            let mock = MockServer::start().await;
+            mount(&mock, "primary", streamed(sse(&["刚拍的，好看吗"]))).await;
+            mount(
+                &mock,
+                "composer",
+                answer(r#"{"prompt":"she smiles at the camera","caption":"自拍"}"#),
+            )
+            .await;
+            mount(&mock, "steward", answer("米色开衫")).await;
+            let mut state = state_for(pool.clone(), &mock.uri());
+            state.model_config = Arc::new(
+                eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                    "[tasks.chat_companion]\nmodel = \"primary\"\n\
+                     [tasks.chat_image_prompt_compose]\nmodel = \"composer\"\n\
+                     filter_prompt = \"COMPOSE\"\n\
+                     [tasks.pde_wardrobe]\nmodel = \"steward\"\nfilter_prompt = \"DRESS\"\n",
+                )
+                .unwrap(),
+            );
+            let g = Greeting {
+                occasion: Occasion::Event {
+                    event_key: "k1".into(),
+                    kind,
+                    lasts: chrono::Duration::minutes(30),
+                    background: None,
+                    on_period: false,
+                    image: Some(ImageReplyParams::default()),
+                    outfit: outfit.map(String::from),
+                },
+                ..greeting(&state).await
+            };
+
+            let frames = run(&state, g, None).await;
+            assert!(
+                types(&frames).contains(&"image_request"),
+                "{kind:?} {outfit:?}: {frames:?}"
+            );
+            let bodies: Vec<Value> = mock
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| serde_json::from_slice(&r.body).unwrap())
+                .collect();
+            let steward = bodies.iter().filter(|b| b["model"] == "steward").count();
+            assert_eq!(steward, steward_calls, "{kind:?} {outfit:?}");
+            if steward_calls == 1 {
+                let composer = bodies
+                    .iter()
+                    .find(|b| b["model"] == "composer")
+                    .expect("the composer ran");
+                let payload = composer["messages"].as_array().unwrap().last().unwrap()["content"]
+                    .as_str()
+                    .unwrap();
+                assert!(payload.contains("[此刻穿着]\n米色开衫\n"), "{payload}");
+            }
+        }
     }
 
     #[test]
